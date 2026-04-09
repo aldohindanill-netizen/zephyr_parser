@@ -270,9 +270,30 @@ def normalize_status(status_raw: str | None) -> str:
         return "other"
     value = status_raw.strip().lower()
 
-    passed = {"pass", "passed", "success", "ok", "пройден", "пройдено"}
-    failed = {"fail", "failed", "error", "провален", "не пройден", "непройден"}
-    blocked = {"blocked", "заблокирован", "on hold"}
+    passed = {
+        "pass",
+        "passed",
+        "success",
+        "ok",
+        "пройден",
+        "пройдено",
+    }
+    failed = {
+        "fail",
+        "failed",
+        "error",
+        "провален",
+        "не пройден",
+        "непройден",
+    }
+    blocked = {
+        "blocked",
+        "заблокирован",
+        "on hold",
+        "can't test",
+        "cant test",
+        "cannot test",
+    }
     not_executed = {
         "not executed",
         "not_executed",
@@ -283,6 +304,13 @@ def normalize_status(status_raw: str | None) -> str:
         "in progress",
         "не выполнен",
         "не запускался",
+        "not tested in this pi",
+    }
+    other = {
+        "danger",
+        "can't reproduce",
+        "cant reproduce",
+        "false positive",
     }
 
     if value in passed:
@@ -293,6 +321,8 @@ def normalize_status(status_raw: str | None) -> str:
         return "blocked"
     if value in not_executed:
         return "not_executed"
+    if value in other:
+        return "other"
     return "other"
 
 
