@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
 import sys
 import urllib.error
 import urllib.parse
@@ -78,8 +79,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--token",
-        required=True,
-        help="API token value",
+        default=None,
+        help="API token value (optional; otherwise ZEPHYR_API_TOKEN env var is used)",
     )
     parser.add_argument(
         "--token-header",
@@ -450,12 +451,17 @@ def print_table(weekly: dict[date, WeeklyStat]) -> None:
 def main() -> int:
     args = parse_args()
     try:
+        token = args.token or os.getenv("ZEPHYR_API_TOKEN")
+        if not token:
+            raise ValueError(
+                "Missing API token. Pass --token or set ZEPHYR_API_TOKEN environment variable."
+            )
         from_date = parse_date(args.from_date)
         to_date = parse_date(args.to_date)
         if from_date and to_date and from_date > to_date:
             raise ValueError("--from-date must be less or equal to --to-date")
 
-        headers = build_headers(args.token_header, args.token_prefix, args.token)
+        headers = build_headers(args.token_header, args.token_prefix, token)
         extra_params = parse_extra_params(args.extra_param)
         date_fields = args.date_field or DEFAULT_DATE_FIELDS
         status_fields = args.status_field or DEFAULT_STATUS_FIELDS

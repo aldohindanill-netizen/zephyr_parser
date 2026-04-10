@@ -11,35 +11,35 @@ CLI utility to fetch Zephyr test executions and build a weekly summary table.
 
 ## Usage
 
+Create a local config file from the template:
+
 ```bash
-python3 zephyr_weekly_report.py \
-  --base-url "https://api.zephyrscale.smartbear.com" \
-  --endpoint "/v2/testexecutions" \
-  --token "$ZEPHYR_TOKEN" \
-  --extra-param "projectKey=DEMO" \
-  --extra-param "testCycleKey=DEMO-R1" \
-  --from-date "2026-01-01" \
-  --to-date "2026-12-31" \
-  --output "weekly_zephyr_report.csv"
+cp .env.example .env
 ```
 
-### Bash launcher
-
-You can run the report with a wrapper script:
+Set your real token in `.env`:
 
 ```bash
-export ZEPHYR_TOKEN="your_token"
-export ZEPHYR_EXTRA_PARAMS="projectKey=DEMO,testCycleKey=DEMO-R1"
-export ZEPHYR_FROM_DATE="2026-01-01"
-export ZEPHYR_TO_DATE="2026-12-31"
-
-./run_zephyr_weekly_report.sh
+ZEPHYR_API_TOKEN=your_real_token
 ```
 
-Check launcher options:
+Run report only via launcher:
 
-```bash
-./run_zephyr_weekly_report.sh --help
+./run_navio_folder_report.sh
+```
+
+## Token storage
+
+Use local `.env` plus environment variable `ZEPHYR_API_TOKEN` loaded by launcher.
+
+- Do not pass token via CLI argument (`--token`) in normal usage.
+- Do not commit `.env` into git.
+- Keep `.env.example` in repo as a safe template.
+
+Windows tip (for manual session export, if needed):
+
+```powershell
+[System.Environment]::SetEnvironmentVariable("ZEPHYR_API_TOKEN", "your_token", "User")
 ```
 
 ## Notes
