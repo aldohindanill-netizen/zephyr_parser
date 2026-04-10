@@ -36,6 +36,28 @@ Outputs:
 
 - summary CSV: `ZEPHYR_OUTPUT` (default `weekly_zephyr_report.csv`)
 - per-folder CSV files: `ZEPHYR_PER_FOLDER_DIR` (default `reports/by_folder`)
+- optional detailed CSV `folder -> cycle -> test case`:
+  - `ZEPHYR_EXPORT_CYCLES_CASES=true`
+  - `ZEPHYR_CYCLES_CASES_OUTPUT=reports/cycles_and_cases.csv`
+  - `ZEPHYR_TESTCASE_ENDPOINT_TEMPLATE=rest/tests/1.0/testrun/{cycle_id}/testcase/search`
+  - `ZEPHYR_SYNTHETIC_CYCLE_IDS=true` (fills `cycle_id` as `v:{folder_id}:{yyyy-mm-dd}` when API does not return real cycle id)
+  - synthetic `cycle_id` is used only in CSV for analytics and is not sent to Zephyr API endpoints
+- optional step-level CSV `test case -> steps -> status`:
+  - `ZEPHYR_EXPORT_CASE_STEPS=true`
+  - `ZEPHYR_CASE_STEPS_OUTPUT=reports/case_steps.csv`
+  - uses Zephyr endpoints discovered from HAR:
+    - `rest/tests/1.0/testrun/{test_run_id}/testrunitems`
+    - `rest/tests/1.0/testrun/{test_run_id}/testresults?itemId=...`
+    - `rest/tests/1.0/project/{project_id}/testresultstatus`
+- readable daily reports for Confluence (one file per folder/day):
+  - `ZEPHYR_EXPORT_DAILY_READABLE=true`
+  - `ZEPHYR_DAILY_READABLE_DIR=reports/daily_readable`
+  - `ZEPHYR_DAILY_READABLE_FORMATS=html,wiki`
+  - enabling daily readable also fetches step-level data internally (same API calls as case steps); set `ZEPHYR_EXPORT_CASE_STEPS=true` if you also want `reports/case_steps.csv`
+  - each test cycle section lists real test case keys (`QA-T...`) with result (step/execution status), execution date, and comment from the first non-empty step comment
+  - output files:
+    - `<folder_name>_<folder_id>.html` (copy/paste into Confluence editor)
+    - `<folder_name>_<folder_id>.confluence.txt` (wiki-markup format)
 - keep `ZEPHYR_QUERY_TEMPLATE` in quotes in `.env` (contains spaces and parentheses)
 - tree-first config for 2026 folders:
   - `ZEPHYR_DISCOVERY_MODE=tree`

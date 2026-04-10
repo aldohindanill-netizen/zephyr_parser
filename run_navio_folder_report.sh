@@ -60,6 +60,15 @@ TREE_SOURCE_ENDPOINT="${ZEPHYR_TREE_SOURCE_ENDPOINT:-}"
 TREE_SOURCE_METHOD="${ZEPHYR_TREE_SOURCE_METHOD:-GET}"
 TREE_SOURCE_QUERY_JSON="${ZEPHYR_TREE_SOURCE_QUERY_JSON:-}"
 TREE_SOURCE_BODY_JSON="${ZEPHYR_TREE_SOURCE_BODY_JSON:-}"
+EXPORT_CYCLES_CASES="${ZEPHYR_EXPORT_CYCLES_CASES:-false}"
+CYCLES_CASES_OUTPUT="${ZEPHYR_CYCLES_CASES_OUTPUT:-reports/cycles_and_cases.csv}"
+TESTCASE_ENDPOINT_TEMPLATE="${ZEPHYR_TESTCASE_ENDPOINT_TEMPLATE:-}"
+SYNTHETIC_CYCLE_IDS="${ZEPHYR_SYNTHETIC_CYCLE_IDS:-false}"
+EXPORT_CASE_STEPS="${ZEPHYR_EXPORT_CASE_STEPS:-false}"
+CASE_STEPS_OUTPUT="${ZEPHYR_CASE_STEPS_OUTPUT:-reports/case_steps.csv}"
+EXPORT_DAILY_READABLE="${ZEPHYR_EXPORT_DAILY_READABLE:-false}"
+DAILY_READABLE_DIR="${ZEPHYR_DAILY_READABLE_DIR:-reports/daily_readable}"
+DAILY_READABLE_FORMATS="${ZEPHYR_DAILY_READABLE_FORMATS:-html,wiki}"
 
 BASE_URL="$(strip_cr "$BASE_URL")"
 ENDPOINT="$(strip_cr "$ENDPOINT")"
@@ -94,6 +103,15 @@ TREE_SOURCE_ENDPOINT="$(strip_cr "$TREE_SOURCE_ENDPOINT")"
 TREE_SOURCE_METHOD="$(strip_cr "$TREE_SOURCE_METHOD")"
 TREE_SOURCE_QUERY_JSON="$(strip_cr "$TREE_SOURCE_QUERY_JSON")"
 TREE_SOURCE_BODY_JSON="$(strip_cr "$TREE_SOURCE_BODY_JSON")"
+EXPORT_CYCLES_CASES="$(strip_cr "$EXPORT_CYCLES_CASES")"
+CYCLES_CASES_OUTPUT="$(strip_cr "$CYCLES_CASES_OUTPUT")"
+TESTCASE_ENDPOINT_TEMPLATE="$(strip_cr "$TESTCASE_ENDPOINT_TEMPLATE")"
+SYNTHETIC_CYCLE_IDS="$(strip_cr "$SYNTHETIC_CYCLE_IDS")"
+EXPORT_CASE_STEPS="$(strip_cr "$EXPORT_CASE_STEPS")"
+CASE_STEPS_OUTPUT="$(strip_cr "$CASE_STEPS_OUTPUT")"
+EXPORT_DAILY_READABLE="$(strip_cr "$EXPORT_DAILY_READABLE")"
+DAILY_READABLE_DIR="$(strip_cr "$DAILY_READABLE_DIR")"
+DAILY_READABLE_FORMATS="$(strip_cr "$DAILY_READABLE_FORMATS")"
 
 : "${ZEPHYR_API_TOKEN:?Set ZEPHYR_API_TOKEN before running}"
 echo "[zephyr] Token is set via ZEPHYR_API_TOKEN"
@@ -160,6 +178,11 @@ if [[ -n "$TREE_SOURCE_BODY_JSON" ]]; then
   cmd+=(--tree-source-body-json "$TREE_SOURCE_BODY_JSON")
 fi
 
+if [[ "$EXPORT_CYCLES_CASES" == "true" ]]; then
+  cmd+=(--export-cycles-cases)
+  cmd+=(--cycles-cases-output "$CYCLES_CASES_OUTPUT")
+fi
+
 if [[ "$PYTHON_BIN" == "py" ]]; then
   cmd=("$PYTHON_BIN" -3 "${cmd[@]:1}")
 fi
@@ -184,6 +207,29 @@ fi
 
 if [[ -n "$FOLDER_NAME_ENDPOINT_TEMPLATE" ]]; then
   cmd+=(--folder-name-endpoint-template "$FOLDER_NAME_ENDPOINT_TEMPLATE")
+fi
+
+if [[ -n "$TESTCASE_ENDPOINT_TEMPLATE" ]]; then
+  cmd+=(--testcase-endpoint-template "$TESTCASE_ENDPOINT_TEMPLATE")
+fi
+
+if [[ "$SYNTHETIC_CYCLE_IDS" == "true" ]]; then
+  cmd+=(--synthetic-cycle-ids)
+fi
+
+if [[ "$EXPORT_CASE_STEPS" == "true" ]]; then
+  cmd+=(--export-case-steps)
+  cmd+=(--case-steps-output "$CASE_STEPS_OUTPUT")
+fi
+
+if [[ "$EXPORT_DAILY_READABLE" == "true" ]]; then
+  cmd+=(--export-daily-readable)
+  cmd+=(--daily-readable-dir "$DAILY_READABLE_DIR")
+  IFS=',' read -r -a readable_formats <<<"$DAILY_READABLE_FORMATS"
+  for fmt in "${readable_formats[@]}"; do
+    trimmed="${fmt//[[:space:]]/}"
+    [[ -n "$trimmed" ]] && cmd+=(--daily-readable-format "$trimmed")
+  done
 fi
 
 if [[ -n "$FOLDER_PATH_REGEX" ]]; then

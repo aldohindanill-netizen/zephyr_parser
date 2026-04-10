@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import html
 import json
 import os
 import re
@@ -279,6 +280,57 @@ def parse_args() -> argparse.Namespace:
         "--tree-source-body-json",
         default=None,
         help="Optional JSON object body for custom tree source (POST).",
+    )
+    parser.add_argument(
+        "--export-cycles-cases",
+        action="store_true",
+        help="Export detailed rows: folder -> test cycle -> test case.",
+    )
+    parser.add_argument(
+        "--cycles-cases-output",
+        default="reports/cycles_and_cases.csv",
+        help="CSV path for detailed cycle/case export.",
+    )
+    parser.add_argument(
+        "--testcase-endpoint-template",
+        action="append",
+        default=[],
+        help=(
+            "Endpoint template to fetch test cases per cycle, e.g. "
+            "'rest/tests/1.0/testrun/{cycle_id}/testcase/search'. Can repeat."
+        ),
+    )
+    parser.add_argument(
+        "--synthetic-cycle-ids",
+        action="store_true",
+        help="Generate deterministic synthetic cycle_id when API does not provide one.",
+    )
+    parser.add_argument(
+        "--export-case-steps",
+        action="store_true",
+        help="Export detailed step-level statuses for test cases.",
+    )
+    parser.add_argument(
+        "--case-steps-output",
+        default="reports/case_steps.csv",
+        help="CSV path for case step export.",
+    )
+    parser.add_argument(
+        "--export-daily-readable",
+        action="store_true",
+        help="Export one readable daily report per folder/day.",
+    )
+    parser.add_argument(
+        "--daily-readable-dir",
+        default="reports/daily_readable",
+        help="Directory for daily readable reports.",
+    )
+    parser.add_argument(
+        "--daily-readable-format",
+        action="append",
+        choices=("html", "wiki"),
+        default=[],
+        help="Readable report format. Can repeat; default is both html and wiki.",
     )
     return parser.parse_args()
 
@@ -1079,6 +1131,384 @@ def extract_first_str(item: dict[str, Any], field_paths: list[str]) -> str | Non
     return None
 
 
+def extract_first_scalar_as_str(item: dict[str, Any], field_paths: list[str]) -> str | None:
+    for path in field_paths:
+        value = get_by_path(item, path)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+        if isinstance(value, (int, float)):
+            return str(value)
+    return None
+
+
+def _extract_test_case_rows(payload: Any) -> list[dict[str, Any]]:
+    if isinstance(payload, dict):
+        rows = extract_items(payload)
+        if rows:
+            return rows
+        for key in ("testCases", "testcases", "cases"):
+            nested = payload.get(key)
+            if isinstance(nested, list):
+                return [entry for entry in nested if isinstance(entry, dict)]
+    if isinstance(payload, list):
+        return [entry for entry in payload if isinstance(entry, dict)]
+    return []
+
+
+def _read_cycle_field(cycle: dict[str, Any], paths: list[str], default: str = "") -> str:
+    value = extract_first_scalar_as_str(cycle, paths)
+    return value or default
+
+
+def _read_case_field(case: dict[str, Any], paths: list[str], default: str = "") -> str:
+    value = extract_first_scalar_as_str(case, paths)
+    return value or default
+
+
+def build_cycle_case_rows(
+    folder: FolderNode,
+    cycles: list[dict[str, Any]],
+    testcase_endpoint_templates: list[str],
+    base_url: str,
+    headers: dict[str, str],
+    synthetic_cycle_ids: bool = False,
+) -> list[list[str]]:
+    rows: list[list[str]] = []
+    for cycle in cycles:
+        real_cycle_id = _read_cycle_field(
+            cycle, ["iterationId", "iteration.id", "id", "testRunId"], ""
+        )
+        cycle_key = _read_cycle_field(cycle, ["iteration.key", "testRunKey", "key"], "")
+        cycle_name = _read_cycle_field(cycle, ["iteration.name", "testRunName", "name"], "")
+        cycle_status = _read_cycle_field(cycle, ["status.name", "status", "result"], "")
+        cycle_updated_on = _read_cycle_field(cycle, ["updatedOn", "executedOn", "executionDate"], "")
+        cycle_id = real_cycle_id
+        if not cycle_id and synthetic_cycle_ids:
+            synthetic_date = "unknown_date"
+            if cycle_updated_on:
+                try:
+                    synthetic_date = parse_datetime(cycle_updated_on).date().isoformat()
+                except ValueError:
+                    synthetic_date = "unknown_date"
+            cycle_id = f"v:{folder.folder_id}:{synthetic_date}"
+        cycle_case_id = _read_case_field(cycle, ["id", "testCase.id", "testCaseId", "key"], "")
+        cycle_case_key = _read_case_field(cycle, ["key", "testCase.key", "testCaseKey"], "")
+        cycle_case_name = _read_case_field(cycle, ["name", "testCase.name", "testCaseName"], "")
+        cycle_case_status = _read_case_field(
+            cycle,
+            ["status.name", "status", "testExecutionStatus.name", "result"],
+            "",
+        )
+
+        if not real_cycle_id and not cycle_id:
+            rows.append(
+                [
+                    folder.folder_id,
+                    folder.folder_name,
+                    cycle_id,
+                    cycle_key,
+                    cycle_name,
+                    cycle_status,
+                    cycle_updated_on,
+                    cycle_case_id,
+                    cycle_case_key,
+                    cycle_case_name,
+                    cycle_case_status,
+                ]
+            )
+            continue
+
+        test_cases: list[dict[str, Any]] = []
+        if real_cycle_id:
+            for template in testcase_endpoint_templates:
+                endpoint = template.replace("{cycle_id}", real_cycle_id)
+                try:
+                    payload = request_json(base_url, endpoint, headers, method="GET")
+                except Exception:  # pylint: disable=broad-except
+                    continue
+                test_cases = _extract_test_case_rows(payload)
+                if test_cases:
+                    break
+
+        if not test_cases:
+            rows.append(
+                [
+                    folder.folder_id,
+                    folder.folder_name,
+                    cycle_id,
+                    cycle_key,
+                    cycle_name,
+                    cycle_status,
+                    cycle_updated_on,
+                    cycle_case_id,
+                    cycle_case_key,
+                    cycle_case_name,
+                    cycle_case_status,
+                ]
+            )
+            continue
+
+        for case in test_cases:
+            case_id = _read_case_field(case, ["id", "testCase.id", "testCaseId", "key"], "")
+            case_key = _read_case_field(case, ["key", "testCase.key", "testCaseKey"], "")
+            case_name = _read_case_field(case, ["name", "testCase.name", "testCaseName"], "")
+            case_status = _read_case_field(
+                case,
+                ["status.name", "status", "testExecutionStatus.name", "result"],
+                "",
+            )
+            rows.append(
+                [
+                    folder.folder_id,
+                    folder.folder_name,
+                    cycle_id,
+                    cycle_key,
+                    cycle_name,
+                    cycle_status,
+                    cycle_updated_on,
+                    case_id,
+                    case_key,
+                    case_name,
+                    case_status,
+                ]
+            )
+    return rows
+
+
+def fetch_test_result_status_names(
+    base_url: str,
+    headers: dict[str, str],
+    project_id: str | None,
+) -> dict[str, str]:
+    if not project_id:
+        return {}
+    endpoint = f"rest/tests/1.0/project/{project_id}/testresultstatus"
+    try:
+        payload = request_json(base_url, endpoint, headers, method="GET")
+    except Exception:  # pylint: disable=broad-except
+        return {}
+    statuses = payload if isinstance(payload, list) else []
+    resolved: dict[str, str] = {}
+    for status in statuses:
+        if not isinstance(status, dict):
+            continue
+        status_id = status.get("id")
+        status_name = status.get("name")
+        if status_id is None or not isinstance(status_name, str):
+            continue
+        resolved[str(status_id)] = status_name
+    return resolved
+
+
+def fetch_testrun_items(
+    base_url: str, headers: dict[str, str], test_run_id: str
+) -> list[dict[str, Any]]:
+    endpoint = f"rest/tests/1.0/testrun/{test_run_id}/testrunitems"
+    params = {"fields": "id,index,issueCount,$lastTestResult"}
+    payload = request_json(base_url, endpoint, headers, params=params, method="GET")
+    if isinstance(payload, dict):
+        items = payload.get("testRunItems")
+        if isinstance(items, list):
+            return [item for item in items if isinstance(item, dict)]
+    return []
+
+
+def fetch_test_results_for_item(
+    base_url: str,
+    headers: dict[str, str],
+    test_run_id: str,
+    item_id: str,
+) -> list[dict[str, Any]]:
+    endpoint = f"rest/tests/1.0/testrun/{test_run_id}/testresults"
+    params = {
+        "fields": (
+            "id,testResultStatusId,executionDate,comment,"
+            "traceLinks,"
+            "testScriptResults(id,testResultStatusId,executionDate,comment,index,description,expectedResult,testData,traceLinks)"
+        ),
+        "itemId": item_id,
+    }
+    payload = request_json(base_url, endpoint, headers, params=params, method="GET")
+    if isinstance(payload, list):
+        return [item for item in payload if isinstance(item, dict)]
+    if isinstance(payload, dict):
+        extracted = extract_items(payload)
+        if extracted:
+            return extracted
+    return []
+
+
+def _collect_task_links(raw_links: Any) -> list[str]:
+    links: list[str] = []
+    if not isinstance(raw_links, list):
+        return links
+    for entry in raw_links:
+        if isinstance(entry, str) and entry.strip():
+            links.append(entry.strip())
+            continue
+        if not isinstance(entry, dict):
+            continue
+        key = str(entry.get("key") or "").strip()
+        url = str(entry.get("url") or entry.get("href") or "").strip()
+        text = key or url
+        if text:
+            links.append(text)
+    return links
+
+
+def _join_unique(values: list[str]) -> str:
+    out: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        cleaned = value.strip()
+        if not cleaned or cleaned in seen:
+            continue
+        seen.add(cleaned)
+        out.append(cleaned)
+    return ", ".join(out)
+
+
+def build_case_step_rows(
+    folder: FolderNode,
+    cycles: list[dict[str, Any]],
+    base_url: str,
+    headers: dict[str, str],
+    status_names: dict[str, str],
+    synthetic_cycle_ids: bool = False,
+) -> list[list[str]]:
+    rows: list[list[str]] = []
+    for cycle in cycles:
+        test_run_id = _read_cycle_field(cycle, ["id", "testRunId"], "")
+        if not test_run_id:
+            continue
+        cycle_real_id = _read_cycle_field(cycle, ["iterationId", "iteration.id"], "")
+        cycle_key = _read_cycle_field(cycle, ["iteration.key", "testRunKey", "key"], "")
+        cycle_name = _read_cycle_field(cycle, ["iteration.name", "testRunName", "name"], "")
+        cycle_status = _read_cycle_field(cycle, ["status.name", "status", "result"], "")
+        cycle_objective = _read_cycle_objective(cycle)
+        cycle_updated_on = _read_cycle_field(
+            cycle, ["updatedOn", "executedOn", "executionDate"], ""
+        )
+        cycle_id = cycle_real_id
+        if not cycle_id and synthetic_cycle_ids:
+            synthetic_date = "unknown_date"
+            if cycle_updated_on:
+                try:
+                    synthetic_date = parse_datetime(cycle_updated_on).date().isoformat()
+                except ValueError:
+                    synthetic_date = "unknown_date"
+            cycle_id = f"v:{folder.folder_id}:{synthetic_date}"
+
+        try:
+            run_items = fetch_testrun_items(base_url, headers, test_run_id)
+        except Exception:  # pylint: disable=broad-except
+            continue
+
+        for run_item in run_items:
+            item_id_raw = run_item.get("id")
+            if item_id_raw is None:
+                continue
+            item_id = str(item_id_raw)
+            last_result = run_item.get("$lastTestResult")
+            case_id = ""
+            case_key = ""
+            case_name = ""
+            case_objective = ""
+            if isinstance(last_result, dict):
+                nested_case = last_result.get("testCase")
+                if isinstance(nested_case, dict):
+                    case_id = str(nested_case.get("id") or "")
+                    case_key = str(nested_case.get("key") or "")
+                    case_name = str(nested_case.get("name") or "")
+                    case_objective = str(nested_case.get("objective") or "")
+
+            try:
+                test_results = fetch_test_results_for_item(
+                    base_url=base_url,
+                    headers=headers,
+                    test_run_id=test_run_id,
+                    item_id=item_id,
+                )
+            except Exception:  # pylint: disable=broad-except
+                continue
+
+            for test_result in test_results:
+                test_result_id = str(test_result.get("id") or "")
+                test_result_status_id = str(test_result.get("testResultStatusId") or "")
+                test_result_status = status_names.get(
+                    test_result_status_id, test_result_status_id
+                )
+                result_execution_date = str(test_result.get("executionDate") or "")
+                test_result_links = _collect_task_links(test_result.get("traceLinks"))
+                script_results = test_result.get("testScriptResults")
+
+                if isinstance(script_results, list) and script_results:
+                    for step in script_results:
+                        if not isinstance(step, dict):
+                            continue
+                        step_status_id = str(step.get("testResultStatusId") or "")
+                        step_status = status_names.get(step_status_id, step_status_id)
+                        step_links = _collect_task_links(step.get("traceLinks"))
+                        task_links = _join_unique(test_result_links + step_links)
+                        rows.append(
+                            [
+                                folder.folder_id,
+                                folder.folder_name,
+                                cycle_id,
+                                cycle_key,
+                                cycle_name,
+                                test_run_id,
+                                case_id,
+                                case_key,
+                                case_name,
+                                item_id,
+                                test_result_id,
+                                str(step.get("index") if step.get("index") is not None else ""),
+                                str(step.get("description") or ""),
+                                str(step.get("expectedResult") or ""),
+                                str(step.get("comment") or ""),
+                                step_status_id,
+                                step_status,
+                                str(step.get("executionDate") or result_execution_date),
+                                cycle_status,
+                                test_result_status,
+                                cycle_objective,
+                                case_objective,
+                                task_links,
+                            ]
+                        )
+                else:
+                    task_links = _join_unique(test_result_links)
+                    rows.append(
+                        [
+                            folder.folder_id,
+                            folder.folder_name,
+                            cycle_id,
+                            cycle_key,
+                            cycle_name,
+                            test_run_id,
+                            case_id,
+                            case_key,
+                            case_name,
+                            item_id,
+                            test_result_id,
+                            "",
+                            "",
+                            "",
+                            str(test_result.get("comment") or ""),
+                            test_result_status_id,
+                            test_result_status,
+                            result_execution_date,
+                            cycle_status,
+                            test_result_status,
+                            cycle_objective,
+                            case_objective,
+                            task_links,
+                        ]
+                    )
+    return rows
+
+
 def week_start(d: date) -> date:
     return d.fromordinal(d.toordinal() - d.weekday())
 
@@ -1172,6 +1602,558 @@ def write_folder_summary_csv(
                 writer.writerow([folder.folder_id, folder.folder_name, *row])
 
 
+def write_cycles_cases_csv(path: str, rows: list[list[str]]) -> None:
+    header = [
+        "folder_id",
+        "folder_name",
+        "cycle_id",
+        "cycle_key",
+        "cycle_name",
+        "cycle_status",
+        "cycle_updated_on",
+        "test_case_id",
+        "test_case_key",
+        "test_case_name",
+        "test_case_status",
+    ]
+    output_dir = os.path.dirname(path)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(header)
+        writer.writerows(rows)
+
+
+def write_case_steps_csv(path: str, rows: list[list[str]]) -> None:
+    header = [
+        "folder_id",
+        "folder_name",
+        "cycle_id",
+        "cycle_key",
+        "cycle_name",
+        "test_run_id",
+        "test_case_id",
+        "test_case_key",
+        "test_case_name",
+        "test_run_item_id",
+        "test_result_id",
+        "step_index",
+        "step_description",
+        "step_expected_result",
+        "step_comment",
+        "step_status_id",
+        "step_status_name",
+        "step_execution_date",
+        "cycle_status",
+        "test_result_status_name",
+        "cycle_objective",
+        "objective",
+        "task_links",
+    ]
+    output_dir = os.path.dirname(path)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(header)
+        writer.writerows(rows)
+
+
+def build_cycle_run_fallback_status(
+    cycles_cases_rows: list[list[str]],
+) -> dict[tuple[str, str], str]:
+    """Map (folder_id, test_run_id) -> cycle-level status for fallback when step data lacks status."""
+    out: dict[tuple[str, str], str] = {}
+    for row in cycles_cases_rows:
+        if len(row) < 11:
+            continue
+        folder_id, cycle_id, status = row[0], row[2], row[10]
+        if not folder_id or not cycle_id or not status:
+            continue
+        if str(cycle_id).startswith("v:"):
+            continue
+        out[(folder_id, str(cycle_id))] = status
+    return out
+
+
+def aggregate_readable_daily_reports_from_steps(
+    case_steps_rows: list[list[str]],
+    cycles_cases_rows: list[list[str]],
+) -> dict[tuple[str, str], dict[str, Any]]:
+    """
+    Group folder -> test cycle (test_run_id) -> real test cases with result and comment from steps.
+    Result priority: step_status_name, then test_result_status_name, then cycles CSV fallback.
+    """
+    fallback_status = build_cycle_run_fallback_status(cycles_cases_rows)
+    case_merge: dict[tuple[str, str, str, str], dict[str, Any]] = {}
+
+    for row in case_steps_rows:
+        if len(row) < 20:
+            continue
+        folder_id = row[0]
+        folder_name = row[1]
+        cycle_key_disp = row[3]
+        cycle_name_disp = row[4]
+        test_run_id = str(row[5]).strip() if row[5] else ""
+        test_case_key = row[7]
+        test_case_name = row[8]
+        step_comment = row[14] if len(row) > 14 else ""
+        step_status_name = row[16] if len(row) > 16 else ""
+        step_execution_date = row[17] if len(row) > 17 else ""
+        test_result_status_name = row[19] if len(row) > 19 else ""
+        cycle_objective = row[20] if len(row) > 20 else ""
+        objective = row[21] if len(row) > 21 else ""
+        task_links = row[22] if len(row) > 22 else ""
+
+        if not folder_id or not folder_name or not test_run_id or not test_case_key:
+            continue
+
+        mkey = (folder_id, folder_name, test_run_id, test_case_key)
+        if mkey not in case_merge:
+            case_merge[mkey] = {
+                "test_case_name": test_case_name or "",
+                "cycle_key": cycle_key_disp or "",
+                "cycle_name": cycle_name_disp or "",
+                "cycle_objective": cycle_objective or "",
+                "step_status_name": step_status_name or "",
+                "test_result_status_name": test_result_status_name or "",
+                "step_comment": step_comment.strip() if step_comment else "",
+                "step_execution_date": step_execution_date or "",
+                "objective": objective or "",
+                "task_links": task_links or "",
+            }
+        else:
+            m = case_merge[mkey]
+            if test_case_name and not m["test_case_name"]:
+                m["test_case_name"] = test_case_name
+            if cycle_key_disp and not m["cycle_key"]:
+                m["cycle_key"] = cycle_key_disp
+            if cycle_name_disp and not m["cycle_name"]:
+                m["cycle_name"] = cycle_name_disp
+            if cycle_objective and not m["cycle_objective"]:
+                m["cycle_objective"] = cycle_objective
+            if step_status_name and not m["step_status_name"]:
+                m["step_status_name"] = step_status_name
+            if test_result_status_name and not m["test_result_status_name"]:
+                m["test_result_status_name"] = test_result_status_name
+            if step_comment.strip() and not m["step_comment"]:
+                m["step_comment"] = step_comment.strip()
+            if step_execution_date and step_execution_date > (m["step_execution_date"] or ""):
+                m["step_execution_date"] = step_execution_date
+            if objective and not m["objective"]:
+                m["objective"] = objective
+            if task_links:
+                merged_links = _join_unique(
+                    [item.strip() for item in f"{m['task_links']}, {task_links}".split(",")]
+                )
+                m["task_links"] = merged_links
+
+    reports: dict[tuple[str, str], dict[str, Any]] = {}
+    for (folder_id, folder_name, test_run_id, test_case_key), m in case_merge.items():
+        report_key = (folder_id, folder_name)
+        report = reports.setdefault(report_key, {"cycles": {}})
+        cycle_bucket = report["cycles"].setdefault(
+            test_run_id,
+            {
+                "cycle_id": test_run_id,
+                "cycle_key": "",
+                "cycle_name": "",
+                "cycle_objective": "",
+                "cases": {},
+            },
+        )
+        if m["cycle_key"]:
+            cycle_bucket["cycle_key"] = m["cycle_key"]
+        if m["cycle_name"]:
+            cycle_bucket["cycle_name"] = m["cycle_name"]
+        if m["cycle_objective"]:
+            cycle_bucket["cycle_objective"] = m["cycle_objective"]
+
+        result = (
+            m["step_status_name"]
+            or m["test_result_status_name"]
+            or fallback_status.get((folder_id, test_run_id), "")
+        )
+        cycle_bucket["cases"][test_case_key] = {
+            "test_case_key": test_case_key,
+            "test_case_name": m["test_case_name"],
+            "result": result,
+            "execution_date": m["step_execution_date"],
+            "comment": m["step_comment"],
+            "objective": m["objective"],
+            "tasks": m["task_links"],
+        }
+
+    return reports
+
+
+def aggregate_readable_daily_reports_legacy(
+    cycles_cases_rows: list[list[str]],
+) -> dict[tuple[str, str], dict[str, Any]]:
+    """Fallback when case_steps_rows is empty: one row per cycle-run as in cycles CSV."""
+    reports: dict[tuple[str, str], dict[str, Any]] = {}
+    for row in cycles_cases_rows:
+        if len(row) < 11:
+            continue
+        folder_id, folder_name = row[0], row[1]
+        cycle_id, cycle_key, cycle_name = row[2], row[3], row[4]
+        cycle_updated_on = row[6]
+        case_key, case_name, case_status = row[8], row[9], row[10]
+
+        if not folder_id or not folder_name:
+            continue
+        report_key = (folder_id, folder_name)
+        report = reports.setdefault(report_key, {"cycles": {}})
+        cycle_bucket = report["cycles"].setdefault(
+            cycle_id or cycle_key or cycle_name or "unknown_cycle",
+            {
+                "cycle_id": cycle_id,
+                "cycle_key": cycle_key,
+                "cycle_name": cycle_name,
+                "cycle_objective": "",
+                "cases": {},
+            },
+        )
+        case_bucket_key = case_key or case_name or "unknown_case"
+        existing = cycle_bucket["cases"].get(case_bucket_key)
+        candidate = {
+            "test_case_key": case_key,
+            "test_case_name": case_name,
+            "result": case_status,
+            "execution_date": cycle_updated_on,
+            "comment": "",
+            "objective": "",
+            "tasks": "",
+        }
+        if existing is None:
+            cycle_bucket["cases"][case_bucket_key] = candidate
+        else:
+            prev_dt = existing["execution_date"] or ""
+            next_dt = candidate["execution_date"] or ""
+            if next_dt > prev_dt:
+                cycle_bucket["cases"][case_bucket_key] = candidate
+    return reports
+
+
+def _wiki_escape(value: str) -> str:
+    return value.replace("|", "\\|").replace("\n", "\\\\")
+
+
+_URL_PATTERN = re.compile(r"(https?://[^\s<>'\"|]+)")
+
+
+def _render_html_with_links(text: str) -> str:
+    if not text:
+        return ""
+    parts = _URL_PATTERN.split(text)
+    rendered: list[str] = []
+    for part in parts:
+        if not part:
+            continue
+        if _URL_PATTERN.fullmatch(part):
+            safe_url = html.escape(part, quote=True)
+            safe_text = html.escape(part)
+            rendered.append(
+                f"<a href='{safe_url}' target='_blank' rel='noopener'>{safe_text}</a>"
+            )
+        else:
+            rendered.append(html.escape(part))
+    return "".join(rendered)
+
+
+def _html_comment_cell(text: str) -> str:
+    """Escape comment but allow line breaks from Zephyr <br> tags."""
+    if not text:
+        return ""
+    chunks = re.split(r"(?i)<br\s*/?>", text)
+    return "<br/>".join(_render_html_with_links(chunk) for chunk in chunks)
+
+
+def _wiki_text_with_links(text: str) -> str:
+    if not text:
+        return ""
+    with_breaks = re.sub(r"(?i)<br\s*/?>", "\n", text)
+    parts = _URL_PATTERN.split(with_breaks)
+    rendered: list[str] = []
+    for part in parts:
+        if not part:
+            continue
+        if _URL_PATTERN.fullmatch(part):
+            rendered.append(f"[{part}|{part}]")
+        else:
+            rendered.append(_wiki_escape(part))
+    return "".join(rendered)
+
+
+def _jira_cycle_url(cycle_key: str) -> str:
+    base_url = os.getenv("ZEPHYR_BASE_URL", "https://jira.navio.auto").rstrip("/")
+    return f"{base_url}/secure/Tests.jspa#/testCycle/{urllib.parse.quote(cycle_key)}"
+
+
+def _read_cycle_objective(cycle: dict[str, Any]) -> str:
+    # Use only cycle-level fields; do not reuse case objective as cycle criterion.
+    return _read_cycle_field(
+        cycle,
+        [
+            "objective",
+            "iteration.objective",
+            "testRun.objective",
+            "description",
+            "iteration.description",
+            "testRun.description",
+        ],
+        "",
+    )
+
+
+def _plain_from_html_like(text: str) -> str:
+    """Convert stored HTML-ish text to readable plain text with line breaks."""
+    if not text:
+        return ""
+    with_breaks = re.sub(r"(?i)<br\s*/?>", "\n", text)
+    no_tags = re.sub(r"<[^>]+>", "", with_breaks)
+    return html.unescape(no_tags).strip()
+
+
+def _status_badge_html(status: str) -> str:
+    normalized = (status or "").strip().lower()
+    status_to_class = {
+        "not executed": "st-not-executed",
+        "not_executed": "st-not-executed",
+        "untested": "st-not-executed",
+        "in progress": "st-in-progress",
+        "in_progress": "st-in-progress",
+        "pass": "st-pass",
+        "passed": "st-pass",
+        "done": "st-pass",
+        "fail": "st-fail",
+        "failed": "st-fail",
+        "blocked": "st-blocked",
+        "can't test": "st-cant-test",
+        "cant test": "st-cant-test",
+        "not tested in this pi": "st-not-tested-pi",
+        "danger": "st-danger",
+        "can't reproduce": "st-cant-reproduce",
+        "cant reproduce": "st-cant-reproduce",
+        "false positive": "st-false-positive",
+    }
+    cls = status_to_class.get(normalized, "st-unknown")
+    return f"<span class='status-badge {cls}'>{html.escape(status or '')}</span>"
+
+
+def _render_cycle_info_html(cycle: dict[str, Any]) -> str:
+    cycle_key_value = str(cycle.get("cycle_key") or "")
+    cycle_objective = _plain_from_html_like(str(cycle.get("cycle_objective") or ""))
+    cycle_link_html = html.escape(cycle_key_value)
+    if cycle_key_value:
+        cycle_url = _jira_cycle_url(cycle_key_value)
+        cycle_link_html = (
+            f"<a href='{html.escape(cycle_url, quote=True)}' target='_blank' rel='noopener'>"
+            f"{html.escape(cycle_key_value)}</a>"
+        )
+    parts = [f"<div><strong>Прогон:</strong> {cycle_link_html or '-'}</div>"]
+    if cycle_objective:
+        parts.append(
+            f"<div style='margin-top:6px;'><strong>Критерий:</strong><br/>{_html_comment_cell(cycle_objective)}</div>"
+        )
+    return "".join(parts)
+
+
+def _render_cycle_info_wiki(cycle: dict[str, Any]) -> str:
+    cycle_key_value = str(cycle.get("cycle_key") or "")
+    cycle_objective = _plain_from_html_like(str(cycle.get("cycle_objective") or ""))
+    cycle_ref = _wiki_escape(cycle_key_value)
+    if cycle_key_value:
+        cycle_url = _jira_cycle_url(cycle_key_value)
+        cycle_ref = f"[{cycle_key_value}|{cycle_url}]"
+    if cycle_objective:
+        return f"Прогон: {cycle_ref}\\\\Критерий: {_wiki_escape(cycle_objective)}"
+    return f"Прогон: {cycle_ref}"
+
+
+def _normalize_criterion_key(text: str) -> str:
+    plain = _plain_from_html_like(text or "")
+    collapsed = re.sub(r"\s+", " ", plain).strip().lower()
+    return collapsed
+
+
+def _prepare_cycle_cases_with_groups(cycle: dict[str, Any]) -> tuple[list[dict[str, Any]], list[int]]:
+    cases = list(cycle["cases"].values())
+    prepared: list[dict[str, Any]] = []
+    for case in cases:
+        criterion_display = _plain_from_html_like(str(case.get("objective", "")))
+        prepared.append(
+            {
+                **case,
+                "_criterion_display": criterion_display,
+                "_criterion_key": _normalize_criterion_key(criterion_display),
+            }
+        )
+    prepared.sort(
+        key=lambda item: (
+            item["_criterion_key"],
+            item.get("test_case_name", ""),
+            item.get("test_case_key", ""),
+        )
+    )
+    spans: list[int] = [0] * len(prepared)
+    i = 0
+    while i < len(prepared):
+        j = i + 1
+        while j < len(prepared) and prepared[j]["_criterion_key"] == prepared[i]["_criterion_key"]:
+            j += 1
+        spans[i] = j - i
+        i = j
+    return prepared, spans
+
+
+def render_daily_html_report(folder_name: str, cycles: dict[str, Any]) -> str:
+    sections = [
+        "<!doctype html>",
+        "<html><head><meta charset='utf-8'>",
+        f"<title>Daily report: {html.escape(folder_name)}</title>",
+        (
+            "<style>"
+            "body{font-family:Arial,sans-serif;margin:24px;}"
+            "h1{margin-bottom:8px;}h2{margin-top:24px;margin-bottom:8px;}"
+            "table{border-collapse:collapse;width:100%;margin-bottom:16px;table-layout:fixed;}"
+            "th,td{border:1px solid #d6d6d6;padding:6px 8px;text-align:left;vertical-align:top;overflow-wrap:anywhere;word-wrap:break-word;}"
+            "th{background:#f0f2f5;font-weight:600;}"
+            ".status-badge{display:inline-block;padding:2px 8px;border-radius:10px;font-size:12px;font-weight:700;line-height:1.4;}"
+            ".st-pass{background:#33c24d;color:#ffffff;}"
+            ".st-fail{background:#e53935;color:#ffffff;}"
+            ".st-not-executed{background:#c9c9c2;color:#2f2f2f;}"
+            ".st-in-progress{background:#f0ad4e;color:#2f2f2f;}"
+            ".st-blocked{background:#4a90e2;color:#ffffff;}"
+            ".st-cant-test{background:#9c27ff;color:#ffffff;}"
+            ".st-not-tested-pi{background:#8d7cc3;color:#ffffff;}"
+            ".st-danger{background:#4f6078;color:#ffffff;}"
+            ".st-cant-reproduce{background:#f08f78;color:#2f2f2f;}"
+            ".st-false-positive{background:#ecd96b;color:#2f2f2f;}"
+            ".st-unknown{background:#f4f5f7;color:#172b4d;}"
+            "</style>"
+        ),
+        "</head><body>",
+        f"<h1>Daily report: {html.escape(folder_name)}</h1>",
+    ]
+    for cycle in sorted(cycles.values(), key=lambda item: (item["cycle_key"], item["cycle_name"])):
+        cycle_title = cycle["cycle_name"] or cycle["cycle_key"] or cycle["cycle_id"] or "Unnamed cycle"
+        cycle_cell_html = _render_cycle_info_html(cycle)
+        sections.append(f"<h2>Test cycle: {html.escape(cycle_title)}</h2>")
+        sections.append(
+            "<table>"
+            "<colgroup>"
+            "<col style='width:20%'>"
+            "<col style='width:30%'>"
+            "<col style='width:10%'>"
+            "<col style='width:10%'>"
+            "<col style='width:10%'>"
+            "<col style='width:15%'>"
+            "<col style='width:5%'>"
+            "</colgroup>"
+            "<thead><tr>"
+            "<th>Название</th><th>Критерий валидации</th><th>Тестовый прогон</th>"
+            "<th>Статус</th><th>Дата</th><th>Комментарий</th><th>Задачи</th>"
+            "</tr></thead><tbody>"
+        )
+        sorted_cases, criterion_spans = _prepare_cycle_cases_with_groups(cycle)
+        cycle_key_value = str(cycle.get("cycle_key") or "")
+        cycle_cell_html = html.escape(cycle_key_value)
+        if cycle_key_value:
+            cycle_url = _jira_cycle_url(cycle_key_value)
+            cycle_cell_html = (
+                f"<a href='{html.escape(cycle_url, quote=True)}' target='_blank' rel='noopener'>"
+                f"{html.escape(cycle_key_value)}</a>"
+            )
+        for idx, case in enumerate(sorted_cases):
+            result_value = case.get("result", case.get("test_case_status", ""))
+            criterion_cell = ""
+            if criterion_spans[idx] > 0:
+                criterion_text = case.get("_criterion_display", "")
+                criterion_cell = (
+                    f"<td rowspan='{criterion_spans[idx]}'>{_html_comment_cell(criterion_text)}</td>"
+                )
+            sections.append(
+                "<tr>"
+                f"<td>{html.escape(case['test_case_name'])}</td>"
+                f"{criterion_cell}"
+                f"<td>{cycle_cell_html}</td>"
+                f"<td>{_status_badge_html(result_value)}</td>"
+                f"<td>{html.escape(case.get('execution_date', case.get('cycle_updated_on', '')))}</td>"
+                f"<td>{_html_comment_cell(case.get('comment', ''))}</td>"
+                f"<td>{_html_comment_cell(case.get('tasks', ''))}</td>"
+                "</tr>"
+            )
+        sections.append("</tbody></table>")
+    sections.append("</body></html>")
+    return "\n".join(sections)
+
+
+def render_daily_wiki_report(folder_name: str, cycles: dict[str, Any]) -> str:
+    lines = [f"h1. Daily report: {_wiki_escape(folder_name)}", ""]
+    for cycle in sorted(cycles.values(), key=lambda item: (item["cycle_key"], item["cycle_name"])):
+        cycle_title = cycle["cycle_name"] or cycle["cycle_key"] or cycle["cycle_id"] or "Unnamed cycle"
+        cycle_key_value = str(cycle.get("cycle_key") or "")
+        cycle_cell_wiki = _wiki_escape(cycle_key_value)
+        if cycle_key_value:
+            cycle_url = _jira_cycle_url(cycle_key_value)
+            cycle_cell_wiki = f"[{cycle_key_value}|{cycle_url}]"
+        lines.append(f"h2. Test cycle: {_wiki_escape(cycle_title)}")
+        lines.append(
+            "|| Название || Критерий валидации || Тестовый прогон || Статус || Дата || Комментарий || Задачи ||"
+        )
+        sorted_cases, criterion_spans = _prepare_cycle_cases_with_groups(cycle)
+        for idx, case in enumerate(sorted_cases):
+            res = case.get("result", case.get("test_case_status", ""))
+            exd = case.get("execution_date", case.get("cycle_updated_on", ""))
+            cmt = _wiki_text_with_links(case.get("comment", ""))
+            tasks = _wiki_text_with_links(case.get("tasks", ""))
+            criterion_cell_wiki = ""
+            if criterion_spans[idx] > 0:
+                criterion_cell_wiki = _wiki_escape(case.get("_criterion_display", ""))
+            lines.append(
+                "| "
+                + " | ".join(
+                    [
+                        _wiki_escape(case["test_case_name"]),
+                        criterion_cell_wiki,
+                        cycle_cell_wiki,
+                        _wiki_escape(res),
+                        _wiki_escape(exd),
+                        cmt,
+                        tasks,
+                    ]
+                )
+                + " |"
+            )
+        lines.append("")
+    return "\n".join(lines)
+
+
+def write_daily_readable_reports(
+    output_dir: str,
+    report_data: dict[tuple[str, str], dict[str, Any]],
+    formats: set[str],
+) -> int:
+    os.makedirs(output_dir, exist_ok=True)
+    written = 0
+    for (folder_id, folder_name), payload in sorted(report_data.items(), key=lambda item: item[0][1]):
+        base_name = f"{slugify(folder_name)}_{folder_id}"
+        cycles = payload["cycles"]
+        if "html" in formats:
+            html_path = os.path.join(output_dir, f"{base_name}.html")
+            with open(html_path, "w", encoding="utf-8") as f:
+                f.write(render_daily_html_report(folder_name, cycles))
+            written += 1
+        if "wiki" in formats:
+            wiki_path = os.path.join(output_dir, f"{base_name}.confluence.txt")
+            with open(wiki_path, "w", encoding="utf-8") as f:
+                f.write(render_daily_wiki_report(folder_name, cycles))
+            written += 1
+    return written
+
+
 def print_table(weekly: dict[date, WeeklyStat]) -> None:
     if not weekly:
         print("No executions found for selected filters.")
@@ -1251,9 +2233,18 @@ def main() -> int:
 
         if args.discover_folders:
             folder_rows: list[tuple[FolderNode, dict[date, WeeklyStat]]] = []
+            cycles_cases_rows: list[list[str]] = []
+            case_steps_rows: list[list[str]] = []
+            need_cycles_cases_data = args.export_cycles_cases or args.export_daily_readable
+            collect_case_steps = args.export_case_steps or args.export_daily_readable
             total_executions = 0
             total_skipped = Counter()
             errors: list[str] = []
+            status_names = (
+                fetch_test_result_status_names(args.base_url, headers, args.project_id)
+                if collect_case_steps
+                else {}
+            )
 
             if args.discovery_mode == "executions" or args.discover_from_executions:
                 if not args.project_id:
@@ -1309,6 +2300,47 @@ def main() -> int:
                     resolved_folder_paths=resolved_folder_paths,
                 )
                 total_executions = len(executions)
+                if need_cycles_cases_data:
+                    grouped_cycles: dict[str, list[dict[str, Any]]] = defaultdict(list)
+                    grouped_folder_names: dict[str, str] = {}
+                    for item in executions:
+                        folder_id, folder_name = _extract_folder_info(item)
+                        if not folder_id:
+                            continue
+                        grouped_cycles[folder_id].append(item)
+                        grouped_folder_names.setdefault(
+                            folder_id, folder_name or f"folder_{folder_id}"
+                        )
+                    for folder_id, folder_cycles in grouped_cycles.items():
+                        folder = FolderNode(
+                            folder_id=folder_id,
+                            folder_name=(
+                                resolved_folder_names.get(folder_id)
+                                or grouped_folder_names.get(folder_id, f"folder_{folder_id}")
+                            ),
+                            parent_id=None,
+                        )
+                        cycles_cases_rows.extend(
+                            build_cycle_case_rows(
+                                folder=folder,
+                                cycles=folder_cycles,
+                                testcase_endpoint_templates=args.testcase_endpoint_template,
+                                base_url=args.base_url,
+                                headers=headers,
+                                synthetic_cycle_ids=args.synthetic_cycle_ids,
+                            )
+                        )
+                        if collect_case_steps:
+                            case_steps_rows.extend(
+                                build_case_step_rows(
+                                    folder=folder,
+                                    cycles=folder_cycles,
+                                    base_url=args.base_url,
+                                    headers=headers,
+                                    status_names=status_names,
+                                    synthetic_cycle_ids=args.synthetic_cycle_ids,
+                                )
+                            )
                 if filter_stats:
                     print(f"Execution discovery filter stats: {dict(filter_stats)}")
                 if name_resolution_stats:
@@ -1394,6 +2426,28 @@ def main() -> int:
                         folder_rows.append((folder, weekly))
                         total_executions += len(executions)
                         total_skipped.update(skipped)
+                        if need_cycles_cases_data:
+                            cycles_cases_rows.extend(
+                                build_cycle_case_rows(
+                                    folder=folder,
+                                    cycles=executions,
+                                    testcase_endpoint_templates=args.testcase_endpoint_template,
+                                    base_url=args.base_url,
+                                    headers=headers,
+                                    synthetic_cycle_ids=args.synthetic_cycle_ids,
+                                )
+                            )
+                        if collect_case_steps:
+                            case_steps_rows.extend(
+                                build_case_step_rows(
+                                    folder=folder,
+                                    cycles=executions,
+                                    base_url=args.base_url,
+                                    headers=headers,
+                                    status_names=status_names,
+                                    synthetic_cycle_ids=args.synthetic_cycle_ids,
+                                )
+                            )
                     except Exception as exc:  # pylint: disable=broad-except
                         message = f"Folder {folder.folder_id} ({folder.folder_name}) failed: {exc}"
                         if args.continue_on_folder_error:
@@ -1408,8 +2462,32 @@ def main() -> int:
                 write_csv(path, weekly)
 
             write_folder_summary_csv(args.output, folder_rows)
+            if args.export_cycles_cases:
+                write_cycles_cases_csv(args.cycles_cases_output, cycles_cases_rows)
+            if args.export_case_steps:
+                write_case_steps_csv(args.case_steps_output, case_steps_rows)
+            if args.export_daily_readable:
+                selected_formats = set(args.daily_readable_format or ["html", "wiki"])
+                if case_steps_rows:
+                    report_data = aggregate_readable_daily_reports_from_steps(
+                        case_steps_rows, cycles_cases_rows
+                    )
+                else:
+                    report_data = aggregate_readable_daily_reports_legacy(cycles_cases_rows)
+                written_reports = write_daily_readable_reports(
+                    output_dir=args.daily_readable_dir,
+                    report_data=report_data,
+                    formats=selected_formats,
+                )
             print(f"Saved summary CSV: {args.output}")
             print(f"Saved per-folder CSV directory: {args.per_folder_dir}")
+            if args.export_cycles_cases:
+                print(f"Saved cycles/cases CSV: {args.cycles_cases_output}")
+            if args.export_case_steps:
+                print(f"Saved case steps CSV: {args.case_steps_output}")
+            if args.export_daily_readable:
+                print(f"Saved daily readable reports: {args.daily_readable_dir}")
+                print(f"Readable files written: {written_reports}")
             print(f"Processed folders: {len(folder_rows)}")
             print(f"Fetched executions: {total_executions}")
             if total_skipped:
