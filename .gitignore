@@ -1,3 +1,4 @@
 .env
 .env.local
 !.env.example
+weekly_zephyr_report.csv
