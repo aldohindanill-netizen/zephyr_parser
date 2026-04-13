@@ -1244,7 +1244,7 @@ def _resolve_case_display_date(case: dict[str, Any]) -> str:
     )
 
 
-def _resolve_daily_title_date(folder_name: str, cycles: dict[str, Any]) -> str:
+def _resolve_daily_title_date(cycles: dict[str, Any]) -> str:
     date_counter: Counter[str] = Counter()
     for cycle in cycles.values():
         if not isinstance(cycle, dict):
@@ -1256,11 +1256,23 @@ def _resolve_daily_title_date(folder_name: str, cycles: dict[str, Any]) -> str:
             if display_date:
                 date_counter[display_date] += 1
     if not date_counter:
-        return folder_name
+        return ""
     # "Most common" as requested; for ties use earliest date for deterministic output.
     top_count = max(date_counter.values())
     candidates = sorted(value for value, count in date_counter.items() if count == top_count)
     return candidates[0]
+
+
+def _build_daily_report_title(folder_name: str, cycles: dict[str, Any]) -> str:
+    report_date = _resolve_daily_title_date(cycles)
+    if report_date:
+        return f"nightly-dev-{folder_name} ({report_date})"
+    return f"nightly-dev-{folder_name} (unknown-date)"
+
+
+def _build_daily_report_base_name(folder_id: str, folder_name: str, cycles: dict[str, Any]) -> str:
+    report_date = _resolve_daily_title_date(cycles) or "unknown-date"
+    return f"nightly-dev-{slugify(folder_name)}_{report_date}_{folder_id}"
 
 
 def build_cycle_case_rows(
@@ -2553,7 +2565,7 @@ def _weekly_cycle_sort_key_from_cycle(cycle: dict[str, Any]) -> tuple[int, int |
 
 
 def _default_weekday_labels() -> list[str]:
-    return ["Пн", "Вт", "Ср", "Чт", "Пт"]
+    return ["База", "Вт", "Ср", "Чт", "Пт"]
 
 
 def _parse_report_day_from_folder_name(folder_name: str) -> date | None:
@@ -2587,79 +2599,152 @@ def _resolve_folder_dominant_actual_date(cycles: dict[str, Any]) -> date | None:
     return candidates[0]
 
 
+def _resolve_daily_title_day(cycles: dict[str, Any]) -> date | None:
+    title_date = _resolve_daily_title_date(cycles)
+    if not title_date:
+        return None
+    return _parse_display_date(title_date)
+
+
+def _normalize_weekly_cycle_label(label: str) -> tuple[str, bool]:
+    raw = _prettify_group_title(str(label or "").strip())
+    if not raw:
+        return "", False
+    normalized = re.sub(r"\s*\((?:cloned|клонированный)\)\s*$", "", raw, flags=re.IGNORECASE).strip()
+    if not normalized:
+        normalized = raw
+    is_cloned = normalized != raw
+    return normalized, is_cloned
+
+
 def _resolve_folder_report_day(folder_name: str, cycles: dict[str, Any]) -> date | None:
-    parsed_from_name = _parse_report_day_from_folder_name(folder_name)
-    if parsed_from_name is not None:
-        return parsed_from_name
-    return _resolve_folder_dominant_actual_date(cycles)
+    dominant_from_daily_data = _resolve_folder_dominant_actual_date(cycles)
+    if dominant_from_daily_data is not None:
+        return dominant_from_daily_data
+    return _parse_report_day_from_folder_name(folder_name)
 
 
 def _weekly_cycle_matrix_data(
     report_data: dict[tuple[str, str], dict[str, Any]]
 ) -> tuple[date | None, list[str], list[list[str]]]:
-    folders_by_week: dict[date, list[dict[str, Any]]] = defaultdict(list)
+    weekly_groups: dict[date, list[dict[str, Any]]] = defaultdict(list)
     for (folder_id, folder_name), payload in report_data.items():
         cycles = payload.get("cycles", {})
         if not isinstance(cycles, dict):
             continue
-        report_day = _resolve_folder_report_day(str(folder_name), cycles)
+        report_day = _resolve_daily_title_day(cycles)
         if report_day is None or report_day.weekday() > 4:
             continue
-        week_start = report_day - timedelta(days=report_day.weekday())
         progress_rows = _build_cycle_progress_rows(cycles)
         if not progress_rows:
             continue
-        resolved_folder_name = str(folder_name or "").strip() or "unknown-folder"
-        folders_by_week[week_start].append(
+        week_start = report_day - timedelta(days=report_day.weekday())
+        weekly_groups[week_start].append(
             {
                 "folder_id": str(folder_id),
-                "folder_name": resolved_folder_name,
                 "report_day": report_day,
                 "progress_rows": progress_rows,
             }
         )
 
-    if not folders_by_week:
+    if not weekly_groups:
         return None, [], []
-    target_week_start = max(folders_by_week.keys())
-    folder_columns = sorted(
-        folders_by_week[target_week_start],
-        key=lambda item: (item["report_day"], item["folder_name"].lower(), item["folder_id"]),
-    )
-    column_labels = [f"nightly-dev-{item['folder_name']}" for item in folder_columns]
-    rows_by_cycle: dict[str, dict[str, Any]] = {}
-    for col_idx, folder_item in enumerate(folder_columns):
-        for progress_row in folder_item["progress_rows"]:
+
+    def _aggregate_progress_map(
+        progress_rows: list[dict[str, Any]],
+    ) -> dict[str, dict[str, Any]]:
+        aggregated: dict[str, dict[str, Any]] = {}
+        for progress_row in progress_rows:
             label = _build_summary_cycle_label(progress_row)
-            if not label:
+            normalized_label, is_cloned = _normalize_weekly_cycle_label(label)
+            if not normalized_label:
                 continue
-            row_bucket = rows_by_cycle.setdefault(
-                label,
-                {
-                    "sort_key": _summary_sort_key(progress_row),
-                    "totals_by_column": defaultdict(int),
-                    "passed_by_column": defaultdict(int),
-                },
-            )
             cycle_sort_key = _summary_sort_key(progress_row)
-            if cycle_sort_key < row_bucket["sort_key"]:
-                row_bucket["sort_key"] = cycle_sort_key
-            row_bucket["totals_by_column"][col_idx] = int(progress_row["total_cases"])
-            row_bucket["passed_by_column"][col_idx] = int(progress_row["passed_cases"])
+            total_cases = int(progress_row.get("total_cases", 0))
+            passed_cases = int(progress_row.get("passed_cases", 0))
+            existing = aggregated.get(normalized_label)
+            if existing is None:
+                aggregated[normalized_label] = {
+                    "sort_key": cycle_sort_key,
+                    "total_cases": total_cases,
+                    "passed_cases": passed_cases,
+                    "is_cloned": is_cloned,
+                }
+                continue
+            # Prefer non-cloned row; use cloned only as fallback when base is absent.
+            if existing["is_cloned"] and not is_cloned:
+                aggregated[normalized_label] = {
+                    "sort_key": cycle_sort_key,
+                    "total_cases": total_cases,
+                    "passed_cases": passed_cases,
+                    "is_cloned": False,
+                }
+                continue
+            if (not existing["is_cloned"]) and is_cloned:
+                continue
+            if cycle_sort_key < existing["sort_key"]:
+                existing["sort_key"] = cycle_sort_key
+            existing["total_cases"] = max(existing["total_cases"], total_cases)
+            existing["passed_cases"] = max(existing["passed_cases"], passed_cases)
+        return aggregated
+
+    target_week_start = max(
+        weekly_groups.keys(),
+        key=lambda week_start: (len(weekly_groups[week_start]), week_start),
+    )
+    week_daily_summaries = sorted(
+        weekly_groups[target_week_start],
+        key=lambda item: (item["report_day"], item["folder_id"]),
+    )
+    progress_rows_by_day: dict[date, list[dict[str, Any]]] = defaultdict(list)
+    for summary in week_daily_summaries:
+        progress_rows_by_day[summary["report_day"]].extend(summary["progress_rows"])
+    ordered_days = sorted(progress_rows_by_day.keys())
+    column_labels = [f"nightly-dev-{day.strftime('%Y.%m.%d')}" for day in ordered_days]
+
+    day_maps: dict[date, dict[str, dict[str, Any]]] = {}
+    joined_passed_by_label: dict[str, dict[str, int]] = {}
+    joined_totals_by_label: dict[str, dict[str, int]] = {}
+    for day_date, day_label in zip(ordered_days, column_labels):
+        day_map = _aggregate_progress_map(progress_rows_by_day[day_date])
+        day_maps[day_date] = day_map
+        joined_passed_by_label[day_label] = {
+            cycle_label: int(day_payload["passed_cases"])
+            for cycle_label, day_payload in day_map.items()
+        }
+        joined_totals_by_label[day_label] = {
+            cycle_label: int(day_payload["total_cases"])
+            for cycle_label, day_payload in day_map.items()
+        }
+
+    all_cycle_labels: set[str] = set()
+    for day_map in day_maps.values():
+        all_cycle_labels.update(day_map.keys())
+    if not all_cycle_labels:
+        return target_week_start, column_labels, []
+
+    sort_key_by_cycle: dict[str, tuple[Any, ...]] = {}
+    for cycle_label in all_cycle_labels:
+        sort_candidates: list[tuple[Any, ...]] = []
+        for day_map in day_maps.values():
+            payload = day_map.get(cycle_label)
+            if payload is None:
+                continue
+            sort_candidates.append(payload["sort_key"])
+        if sort_candidates:
+            sort_key_by_cycle[cycle_label] = min(sort_candidates)
 
     rows: list[list[str]] = []
-    for cycle_label, payload in sorted(
-        rows_by_cycle.items(),
-        key=lambda item: (item[1]["sort_key"], item[0].lower()),
+    for cycle_label in sorted(
+        all_cycle_labels,
+        key=lambda label: (sort_key_by_cycle.get(label, (9_999_999, label, "", "", "")), label.lower()),
     ):
-        totals_by_column = payload["totals_by_column"]
-        passed_by_column = payload["passed_by_column"]
-        available_columns = sorted(totals_by_column.keys())
-        latest_column = available_columns[-1] if available_columns else -1
-        total_cases = totals_by_column.get(latest_column, 0) if latest_column >= 0 else 0
+        total_cases = 0
+        for totals_map in joined_totals_by_label.values():
+            total_cases = max(total_cases, int(totals_map.get(cycle_label, 0)))
         row = [cycle_label, str(total_cases)]
-        for idx in range(len(column_labels)):
-            row.append(str(passed_by_column.get(idx, 0)))
+        for day_label in column_labels:
+            row.append(str(joined_passed_by_label.get(day_label, {}).get(cycle_label, 0)))
         rows.append(row)
     return target_week_start, column_labels, rows
 
@@ -2674,7 +2759,7 @@ def write_weekly_cycle_matrix_csv(path: str, weekday_labels: list[str], rows: li
         "Тестовый цикл",
         "Всего кейсов",
     ]
-    header.extend(f"Пройдено кейсов ({label})" for label in weekday_labels)
+    header.extend(label for label in weekday_labels)
     output_dir = os.path.dirname(path)
     if output_dir:
         os.makedirs(output_dir, exist_ok=True)
@@ -2689,7 +2774,7 @@ def render_weekly_html_report(week_start: date | None, weekday_labels: list[str]
     labels = list(weekday_labels)
     col_count = 2 + len(labels)
     header_cells = ["<th>Тестовый цикл</th>", "<th>Всего кейсов</th>"]
-    header_cells.extend(f"<th>Пройдено кейсов ({html.escape(label)})</th>" for label in labels)
+    header_cells.extend(f"<th>{html.escape(label)}</th>" for label in labels)
     sections = [
         "<!doctype html>",
         "<html><head><meta charset='utf-8'>",
@@ -2750,7 +2835,7 @@ def render_weekly_wiki_report(
     col_count = 2 + len(labels)
     lines = [f"h1. Weekly cycle matrix: {_wiki_escape(week_label)}", ""]
     header_cells = ["Тестовый цикл", "Всего кейсов"]
-    header_cells.extend(f"Пройдено кейсов ({_wiki_escape(label)})" for label in labels)
+    header_cells.extend(f"{_wiki_escape(label)}" for label in labels)
     lines.append("|| " + " || ".join(header_cells) + " ||")
     previous_group = ""
     for row in rows:
@@ -2800,8 +2885,7 @@ def write_weekly_readable_reports(
 
 
 def render_daily_html_report(folder_name: str, cycles: dict[str, Any]) -> str:
-    report_title_date = _resolve_daily_title_date(folder_name, cycles)
-    report_title = report_title_date
+    report_title = _build_daily_report_title(folder_name, cycles)
     sections = [
         "<!doctype html>",
         "<html><head><meta charset='utf-8'>",
@@ -2915,8 +2999,7 @@ def render_daily_html_report(folder_name: str, cycles: dict[str, Any]) -> str:
 
 
 def render_daily_wiki_report(folder_name: str, cycles: dict[str, Any]) -> str:
-    report_title_date = _resolve_daily_title_date(folder_name, cycles)
-    report_title = report_title_date
+    report_title = _build_daily_report_title(folder_name, cycles)
     lines = [f"h1. Daily report: {_wiki_escape(report_title)}", ""]
     cycle_groups = _group_cycles_by_prefix(cycles)
     for group in cycle_groups:
@@ -2990,8 +3073,8 @@ def write_daily_readable_reports(
     os.makedirs(output_dir, exist_ok=True)
     written = 0
     for (folder_id, folder_name), payload in sorted(report_data.items(), key=lambda item: item[0][1]):
-        base_name = f"{slugify(folder_name)}_{folder_id}"
         cycles = payload["cycles"]
+        base_name = _build_daily_report_base_name(str(folder_id), str(folder_name), cycles)
         if "html" in formats:
             html_path = os.path.join(output_dir, f"{base_name}.html")
             with open(html_path, "w", encoding="utf-8") as f:
@@ -3086,8 +3169,19 @@ def main() -> int:
             folder_rows: list[tuple[FolderNode, dict[date, WeeklyStat]]] = []
             cycles_cases_rows: list[list[str]] = []
             case_steps_rows: list[list[str]] = []
-            need_cycles_cases_data = args.export_cycles_cases or args.export_daily_readable
-            collect_case_steps = args.export_case_steps or args.export_daily_readable
+            need_cycles_cases_data = bool(
+                args.export_cycles_cases
+                or args.export_daily_readable
+                or args.cycle_progress_output
+                or args.weekly_cycle_matrix_output
+                or args.export_weekly_readable
+            )
+            collect_case_steps = bool(
+                args.export_case_steps
+                or args.export_daily_readable
+                or args.weekly_cycle_matrix_output
+                or args.export_weekly_readable
+            )
             total_executions = 0
             total_skipped = Counter()
             errors: list[str] = []

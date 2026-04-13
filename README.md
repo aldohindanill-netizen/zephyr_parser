@@ -54,10 +54,29 @@ Outputs:
   - `ZEPHYR_DAILY_READABLE_DIR=reports/daily_readable`
   - `ZEPHYR_DAILY_READABLE_FORMATS=html,wiki`
   - enabling daily readable also fetches step-level data internally (same API calls as case steps); set `ZEPHYR_EXPORT_CASE_STEPS=true` if you also want `reports/case_steps.csv`
+  - report title format:
+    - `Daily report: nightly-dev-<folder_name> (<most_popular_step_execution_date>)`
   - each test cycle section lists real test case keys (`QA-T...`) with result (step/execution status), execution date, and comment from the first non-empty step comment
   - output files:
-    - `<folder_name>_<folder_id>.html` (copy/paste into Confluence editor)
-    - `<folder_name>_<folder_id>.confluence.txt` (wiki-markup format)
+    - `nightly-dev-<slug(folder_name)>_<most_popular_step_execution_date>_<folder_id>.html` (copy/paste into Confluence editor)
+    - `nightly-dev-<slug(folder_name)>_<most_popular_step_execution_date>_<folder_id>.confluence.txt` (wiki-markup format)
+- weekly cycle matrix CSV (built from daily cycle summaries of target week):
+  - `ZEPHYR_WEEKLY_CYCLE_MATRIX_OUTPUT=reports/weekly_cycle_matrix.csv`
+  - columns:
+    - `Тестовый цикл` (`cycle_key | cycle_name`)
+    - `Всего кейсов` (max value across daily summaries of the week for this cycle)
+    - dynamic columns `nightly-dev-YYYY.MM.DD`
+  - source for weekly columns: daily “Сводка по тестовым циклам”
+  - daily summaries are joined by `Тестовый цикл`; missing values are filled as `0`
+  - labels with `(...cloned...)` are merged into base cycle label; base cycle has priority, cloned is fallback
+  - week selection is based on date from daily report title (`most_popular_step_execution_date`); latest week is exported
+- weekly readable reports for Confluence/HTML:
+  - `ZEPHYR_EXPORT_WEEKLY_READABLE=true`
+  - `ZEPHYR_WEEKLY_READABLE_DIR=reports/weekly_readable`
+  - `ZEPHYR_WEEKLY_READABLE_FORMATS=html,wiki`
+  - output files:
+    - `weekly_cycle_matrix_<week_start>.html`
+    - `weekly_cycle_matrix_<week_start>.confluence.txt`
 - keep `ZEPHYR_QUERY_TEMPLATE` in quotes in `.env` (contains spaces and parentheses)
 - tree-first config for 2026 folders:
   - `ZEPHYR_DISCOVERY_MODE=tree`

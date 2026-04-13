@@ -69,6 +69,10 @@ CASE_STEPS_OUTPUT="${ZEPHYR_CASE_STEPS_OUTPUT:-reports/case_steps.csv}"
 EXPORT_DAILY_READABLE="${ZEPHYR_EXPORT_DAILY_READABLE:-false}"
 DAILY_READABLE_DIR="${ZEPHYR_DAILY_READABLE_DIR:-reports/daily_readable}"
 DAILY_READABLE_FORMATS="${ZEPHYR_DAILY_READABLE_FORMATS:-html,wiki}"
+WEEKLY_CYCLE_MATRIX_OUTPUT="${ZEPHYR_WEEKLY_CYCLE_MATRIX_OUTPUT:-reports/weekly_cycle_matrix.csv}"
+EXPORT_WEEKLY_READABLE="${ZEPHYR_EXPORT_WEEKLY_READABLE:-true}"
+WEEKLY_READABLE_DIR="${ZEPHYR_WEEKLY_READABLE_DIR:-reports/weekly_readable}"
+WEEKLY_READABLE_FORMATS="${ZEPHYR_WEEKLY_READABLE_FORMATS:-html,wiki}"
 
 BASE_URL="$(strip_cr "$BASE_URL")"
 ENDPOINT="$(strip_cr "$ENDPOINT")"
@@ -112,6 +116,10 @@ CASE_STEPS_OUTPUT="$(strip_cr "$CASE_STEPS_OUTPUT")"
 EXPORT_DAILY_READABLE="$(strip_cr "$EXPORT_DAILY_READABLE")"
 DAILY_READABLE_DIR="$(strip_cr "$DAILY_READABLE_DIR")"
 DAILY_READABLE_FORMATS="$(strip_cr "$DAILY_READABLE_FORMATS")"
+WEEKLY_CYCLE_MATRIX_OUTPUT="$(strip_cr "$WEEKLY_CYCLE_MATRIX_OUTPUT")"
+EXPORT_WEEKLY_READABLE="$(strip_cr "$EXPORT_WEEKLY_READABLE")"
+WEEKLY_READABLE_DIR="$(strip_cr "$WEEKLY_READABLE_DIR")"
+WEEKLY_READABLE_FORMATS="$(strip_cr "$WEEKLY_READABLE_FORMATS")"
 
 : "${ZEPHYR_API_TOKEN:?Set ZEPHYR_API_TOKEN before running}"
 echo "[zephyr] Token is set via ZEPHYR_API_TOKEN"
@@ -229,6 +237,20 @@ if [[ "$EXPORT_DAILY_READABLE" == "true" ]]; then
   for fmt in "${readable_formats[@]}"; do
     trimmed="${fmt//[[:space:]]/}"
     [[ -n "$trimmed" ]] && cmd+=(--daily-readable-format "$trimmed")
+  done
+fi
+
+if [[ -n "$WEEKLY_CYCLE_MATRIX_OUTPUT" ]]; then
+  cmd+=(--weekly-cycle-matrix-output "$WEEKLY_CYCLE_MATRIX_OUTPUT")
+fi
+
+if [[ "$EXPORT_WEEKLY_READABLE" == "true" ]]; then
+  cmd+=(--export-weekly-readable)
+  cmd+=(--weekly-readable-dir "$WEEKLY_READABLE_DIR")
+  IFS=',' read -r -a weekly_formats <<<"$WEEKLY_READABLE_FORMATS"
+  for fmt in "${weekly_formats[@]}"; do
+    trimmed="${fmt//[[:space:]]/}"
+    [[ -n "$trimmed" ]] && cmd+=(--weekly-readable-format "$trimmed")
   done
 fi
 
