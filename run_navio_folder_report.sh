@@ -9,9 +9,23 @@ strip_cr() {
   printf '%s' "${1//$'\r'/}"
 }
 
+normalize_bool() {
+  printf '%s' "$1" | tr '[:upper:]' '[:lower:]'
+}
+
 echo "[zephyr] Script dir: $SCRIPT_DIR"
 if [[ -f "$ENV_FILE" ]]; then
   echo "[zephyr] Loading env from: $ENV_FILE"
+  # Avoid sticky values from previous shell sessions: .env must be the source of truth.
+  unset CONFLUENCE_PUBLISH_DAILY
+  unset CONFLUENCE_PUBLISH_WEEKLY
+  unset CONFLUENCE_BASE_URL
+  unset CONFLUENCE_SPACE_KEY
+  unset CONFLUENCE_PARENT_PAGE_ID
+  unset CONFLUENCE_USERNAME
+  unset CONFLUENCE_API_TOKEN
+  unset CONFLUENCE_VERIFY_SSL
+  unset CONFLUENCE_DRY_RUN
   set -a
   # shellcheck disable=SC1090
   source "$ENV_FILE"
@@ -73,6 +87,16 @@ WEEKLY_CYCLE_MATRIX_OUTPUT="${ZEPHYR_WEEKLY_CYCLE_MATRIX_OUTPUT:-reports/weekly_
 EXPORT_WEEKLY_READABLE="${ZEPHYR_EXPORT_WEEKLY_READABLE:-true}"
 WEEKLY_READABLE_DIR="${ZEPHYR_WEEKLY_READABLE_DIR:-reports/weekly_readable}"
 WEEKLY_READABLE_FORMATS="${ZEPHYR_WEEKLY_READABLE_FORMATS:-html,wiki}"
+CONFLUENCE_PUBLISH_DAILY="${CONFLUENCE_PUBLISH_DAILY:-false}"
+CONFLUENCE_PUBLISH_WEEKLY="${CONFLUENCE_PUBLISH_WEEKLY:-false}"
+CONFLUENCE_BASE_URL="${CONFLUENCE_BASE_URL:-}"
+CONFLUENCE_SPACE_KEY="${CONFLUENCE_SPACE_KEY:-}"
+CONFLUENCE_PARENT_PAGE_ID="${CONFLUENCE_PARENT_PAGE_ID:-}"
+CONFLUENCE_USERNAME="${CONFLUENCE_USERNAME:-}"
+CONFLUENCE_API_TOKEN="${CONFLUENCE_API_TOKEN:-}"
+CONFLUENCE_AUTH_MODE="${CONFLUENCE_AUTH_MODE:-auto}"
+CONFLUENCE_VERIFY_SSL="${CONFLUENCE_VERIFY_SSL:-true}"
+CONFLUENCE_DRY_RUN="${CONFLUENCE_DRY_RUN:-false}"
 
 BASE_URL="$(strip_cr "$BASE_URL")"
 ENDPOINT="$(strip_cr "$ENDPOINT")"
@@ -120,9 +144,20 @@ WEEKLY_CYCLE_MATRIX_OUTPUT="$(strip_cr "$WEEKLY_CYCLE_MATRIX_OUTPUT")"
 EXPORT_WEEKLY_READABLE="$(strip_cr "$EXPORT_WEEKLY_READABLE")"
 WEEKLY_READABLE_DIR="$(strip_cr "$WEEKLY_READABLE_DIR")"
 WEEKLY_READABLE_FORMATS="$(strip_cr "$WEEKLY_READABLE_FORMATS")"
+CONFLUENCE_PUBLISH_DAILY="$(normalize_bool "$(strip_cr "$CONFLUENCE_PUBLISH_DAILY")")"
+CONFLUENCE_PUBLISH_WEEKLY="$(normalize_bool "$(strip_cr "$CONFLUENCE_PUBLISH_WEEKLY")")"
+CONFLUENCE_BASE_URL="$(strip_cr "$CONFLUENCE_BASE_URL")"
+CONFLUENCE_SPACE_KEY="$(strip_cr "$CONFLUENCE_SPACE_KEY")"
+CONFLUENCE_PARENT_PAGE_ID="$(strip_cr "$CONFLUENCE_PARENT_PAGE_ID")"
+CONFLUENCE_USERNAME="$(strip_cr "$CONFLUENCE_USERNAME")"
+CONFLUENCE_API_TOKEN="$(strip_cr "$CONFLUENCE_API_TOKEN")"
+CONFLUENCE_AUTH_MODE="$(normalize_bool "$(strip_cr "$CONFLUENCE_AUTH_MODE")")"
+CONFLUENCE_VERIFY_SSL="$(normalize_bool "$(strip_cr "$CONFLUENCE_VERIFY_SSL")")"
+CONFLUENCE_DRY_RUN="$(normalize_bool "$(strip_cr "$CONFLUENCE_DRY_RUN")")"
 
 : "${ZEPHYR_API_TOKEN:?Set ZEPHYR_API_TOKEN before running}"
 echo "[zephyr] Token is set via ZEPHYR_API_TOKEN"
+echo "[zephyr] Confluence: daily=${CONFLUENCE_PUBLISH_DAILY} weekly=${CONFLUENCE_PUBLISH_WEEKLY} dry_run=${CONFLUENCE_DRY_RUN} auth_mode=${CONFLUENCE_AUTH_MODE}"
 
 if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
   echo "[zephyr] Error: Python binary '$PYTHON_BIN' was not found in PATH" >&2
@@ -252,6 +287,46 @@ if [[ "$EXPORT_WEEKLY_READABLE" == "true" ]]; then
     trimmed="${fmt//[[:space:]]/}"
     [[ -n "$trimmed" ]] && cmd+=(--weekly-readable-format "$trimmed")
   done
+fi
+
+if [[ "$CONFLUENCE_PUBLISH_DAILY" == "true" ]]; then
+  cmd+=(--publish-confluence-daily)
+fi
+
+if [[ "$CONFLUENCE_PUBLISH_WEEKLY" == "true" ]]; then
+  cmd+=(--publish-confluence-weekly)
+fi
+
+if [[ -n "$CONFLUENCE_BASE_URL" ]]; then
+  cmd+=(--confluence-base-url "$CONFLUENCE_BASE_URL")
+fi
+
+if [[ -n "$CONFLUENCE_SPACE_KEY" ]]; then
+  cmd+=(--confluence-space-key "$CONFLUENCE_SPACE_KEY")
+fi
+
+if [[ -n "$CONFLUENCE_PARENT_PAGE_ID" ]]; then
+  cmd+=(--confluence-parent-page-id "$CONFLUENCE_PARENT_PAGE_ID")
+fi
+
+if [[ -n "$CONFLUENCE_USERNAME" ]]; then
+  cmd+=(--confluence-username "$CONFLUENCE_USERNAME")
+fi
+
+if [[ -n "$CONFLUENCE_API_TOKEN" ]]; then
+  cmd+=(--confluence-api-token "$CONFLUENCE_API_TOKEN")
+fi
+
+if [[ "$CONFLUENCE_AUTH_MODE" == "auto" || "$CONFLUENCE_AUTH_MODE" == "basic" || "$CONFLUENCE_AUTH_MODE" == "bearer" ]]; then
+  cmd+=(--confluence-auth-mode "$CONFLUENCE_AUTH_MODE")
+fi
+
+if [[ "$CONFLUENCE_VERIFY_SSL" == "true" || "$CONFLUENCE_VERIFY_SSL" == "false" ]]; then
+  cmd+=(--confluence-verify-ssl "$CONFLUENCE_VERIFY_SSL")
+fi
+
+if [[ "$CONFLUENCE_DRY_RUN" == "true" ]]; then
+  cmd+=(--confluence-dry-run)
 fi
 
 if [[ -n "$FOLDER_PATH_REGEX" ]]; then

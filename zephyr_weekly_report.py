@@ -14,6 +14,7 @@ import json
 import os
 import re
 import sys
+import ssl
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -72,6 +73,18 @@ class FolderNode:
     parent_id: str | None
     full_path: str = ""
     is_leaf: bool = False
+
+
+@dataclass
+class ConfluenceConfig:
+    base_url: str
+    space_key: str
+    parent_page_id: str
+    username: str
+    api_token: str
+    auth_mode: str = "auto"
+    verify_ssl: bool = True
+    dry_run: bool = False
 
 
 def parse_args() -> argparse.Namespace:
@@ -362,6 +375,58 @@ def parse_args() -> argparse.Namespace:
         default=[],
         help="Weekly readable format. Can repeat; default is both html and wiki.",
     )
+    parser.add_argument(
+        "--publish-confluence-daily",
+        action="store_true",
+        help="Publish daily HTML reports to Confluence.",
+    )
+    parser.add_argument(
+        "--publish-confluence-weekly",
+        action="store_true",
+        help="Publish weekly HTML reports to Confluence.",
+    )
+    parser.add_argument(
+        "--confluence-base-url",
+        default=None,
+        help="Confluence base URL, e.g. https://your-domain.atlassian.net/wiki",
+    )
+    parser.add_argument(
+        "--confluence-space-key",
+        default=None,
+        help="Confluence space key for published pages.",
+    )
+    parser.add_argument(
+        "--confluence-parent-page-id",
+        default=None,
+        help="Confluence parent page id for created report pages.",
+    )
+    parser.add_argument(
+        "--confluence-username",
+        default=None,
+        help="Confluence username (Cloud: Atlassian email).",
+    )
+    parser.add_argument(
+        "--confluence-api-token",
+        default=None,
+        help="Confluence API token / password (prefer environment variable).",
+    )
+    parser.add_argument(
+        "--confluence-auth-mode",
+        default=None,
+        choices=("auto", "basic", "bearer"),
+        help="Confluence auth mode: auto, basic, or bearer (default: auto).",
+    )
+    parser.add_argument(
+        "--confluence-verify-ssl",
+        default=None,
+        choices=("true", "false"),
+        help="Verify SSL certificates for Confluence requests (default: true).",
+    )
+    parser.add_argument(
+        "--confluence-dry-run",
+        action="store_true",
+        help="Print Confluence actions but do not send API requests.",
+    )
     return parser.parse_args()
 
 
@@ -487,6 +552,220 @@ def request_json(
         ) from exc
     except urllib.error.URLError as exc:
         raise RuntimeError(f"Network error while requesting '{url}': {exc}") from exc
+
+
+def request_json_absolute_url(
+    url: str,
+    headers: dict[str, str],
+    params: dict[str, str] | None = None,
+    method: str = "GET",
+    body: dict[str, Any] | None = None,
+    verify_ssl: bool = True,
+) -> Any:
+    query = urllib.parse.urlencode(params or {}, doseq=True)
+    full_url = url
+    if query and method.upper() == "GET":
+        sep = "&" if "?" in full_url else "?"
+        full_url = f"{full_url}{sep}{query}"
+    request_headers = dict(headers)
+    payload = None
+    if body is not None:
+        payload = json.dumps(body).encode("utf-8")
+        request_headers["Content-Type"] = "application/json"
+    request = urllib.request.Request(
+        full_url, headers=request_headers, method=method.upper(), data=payload
+    )
+    ssl_context = None if verify_ssl else ssl._create_unverified_context()
+    try:
+        with urllib.request.urlopen(request, timeout=30, context=ssl_context) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        response_body = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(
+            f"HTTP {exc.code} while requesting '{full_url}' [{method.upper()}]. Response: {response_body}"
+        ) from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"Network error while requesting '{full_url}': {exc}") from exc
+
+
+def _parse_bool_value(value: str | None, default: bool = False) -> bool:
+    if value is None:
+        return default
+    lowered = value.strip().lower()
+    if lowered in {"1", "true", "yes", "on"}:
+        return True
+    if lowered in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
+def _normalize_confluence_base_url(value: str) -> str:
+    return value.strip().rstrip("/")
+
+
+def _confluence_content_api_candidates(base_url: str) -> list[str]:
+    parsed = urllib.parse.urlparse(base_url)
+    path = (parsed.path or "").rstrip("/").lower()
+    if path.endswith("/wiki"):
+        return [f"{base_url}/rest/api/content"]
+    return [f"{base_url}/wiki/rest/api/content", f"{base_url}/rest/api/content"]
+
+
+def _build_confluence_auth_headers(username: str, api_token: str) -> dict[str, str]:
+    user_pass = f"{username}:{api_token}".encode("utf-8")
+    # Confluence expects standard Basic auth base64; urllib has no direct helper here.
+    # Use Python stdlib base64 while keeping dependencies minimal.
+    import base64
+
+    return {
+        "Authorization": f"Basic {base64.b64encode(user_pass).decode('ascii')}",
+        "Accept": "application/json",
+    }
+
+
+def _build_confluence_auth_headers_candidates(cfg: ConfluenceConfig) -> list[dict[str, str]]:
+    bearer_headers = {
+        "Authorization": f"Bearer {cfg.api_token}",
+        "Accept": "application/json",
+    }
+    if cfg.auth_mode == "bearer":
+        return [bearer_headers]
+    if cfg.auth_mode == "basic":
+        return [_build_confluence_auth_headers(cfg.username, cfg.api_token)]
+    candidates: list[dict[str, str]] = [bearer_headers]
+    if cfg.username:
+        candidates.append(_build_confluence_auth_headers(cfg.username, cfg.api_token))
+    return candidates
+
+
+def _extract_html_body_for_confluence(raw_html: str) -> str:
+    style_blocks = re.findall(r"<style[^>]*>.*?</style>", raw_html, flags=re.IGNORECASE | re.DOTALL)
+    body_match = re.search(r"<body[^>]*>(.*)</body>", raw_html, flags=re.IGNORECASE | re.DOTALL)
+    body_content = body_match.group(1).strip() if body_match else raw_html.strip()
+    if style_blocks:
+        return "\n".join(style_blocks + [body_content])
+    return body_content
+
+
+def _confluence_title_from_report_path(path: str) -> str:
+    file_name = os.path.basename(path)
+    stem = file_name.rsplit(".", 1)[0]
+    if stem.startswith("weekly_cycle_matrix_"):
+        suffix = stem.replace("weekly_cycle_matrix_", "", 1)
+        return f"Weekly cycle matrix: {suffix}"
+    if stem.startswith("nightly-dev-"):
+        suffix = stem.replace("nightly-dev-", "", 1)
+        return f"Daily report: {suffix}"
+    return stem.replace("_", " ")
+
+
+def _confluence_page_exists(
+    content_url: str,
+    cfg: ConfluenceConfig,
+    headers: dict[str, str],
+    title: str,
+) -> bool:
+    payload = request_json_absolute_url(
+        content_url,
+        headers=headers,
+        params={"spaceKey": cfg.space_key, "title": title, "expand": "version"},
+        method="GET",
+        verify_ssl=cfg.verify_ssl,
+    )
+    if not isinstance(payload, dict):
+        return False
+    results = payload.get("results")
+    return isinstance(results, list) and len(results) > 0
+
+
+def publish_html_report_to_confluence(path: str, cfg: ConfluenceConfig) -> str:
+    with open(path, "r", encoding="utf-8") as report_file:
+        report_html = report_file.read()
+    title = _confluence_title_from_report_path(path)
+    storage_html = _extract_html_body_for_confluence(report_html)
+    if cfg.dry_run:
+        return f"DRY-RUN create page '{title}' from {path}"
+    candidate_urls = _confluence_content_api_candidates(cfg.base_url)
+    auth_headers_candidates = _build_confluence_auth_headers_candidates(cfg)
+    last_error: Exception | None = None
+    for headers in auth_headers_candidates:
+        for content_url in candidate_urls:
+            try:
+                if _confluence_page_exists(content_url, cfg, headers, title):
+                    return f"SKIP already exists '{title}'"
+                payload = {
+                    "type": "page",
+                    "title": title,
+                    "space": {"key": cfg.space_key},
+                    "ancestors": [{"id": cfg.parent_page_id}],
+                    "body": {
+                        "storage": {"value": storage_html, "representation": "storage"}
+                    },
+                }
+                request_json_absolute_url(
+                    content_url,
+                    headers=headers,
+                    method="POST",
+                    body=payload,
+                    verify_ssl=cfg.verify_ssl,
+                )
+                return f"CREATED '{title}'"
+            except Exception as exc:  # pylint: disable=broad-except
+                last_error = exc
+                continue
+    if last_error is not None:
+        raise RuntimeError(f"Confluence publish failed for '{path}': {last_error}") from last_error
+    raise RuntimeError(f"Confluence publish failed for '{path}'")
+
+
+def load_confluence_config(args: argparse.Namespace) -> ConfluenceConfig:
+    base_url = args.confluence_base_url or os.getenv("CONFLUENCE_BASE_URL", "")
+    space_key = args.confluence_space_key or os.getenv("CONFLUENCE_SPACE_KEY", "")
+    parent_page_id = args.confluence_parent_page_id or os.getenv("CONFLUENCE_PARENT_PAGE_ID", "")
+    username = args.confluence_username or os.getenv("CONFLUENCE_USERNAME", "")
+    api_token = args.confluence_api_token or os.getenv("CONFLUENCE_API_TOKEN", "")
+    auth_mode = (
+        (args.confluence_auth_mode or os.getenv("CONFLUENCE_AUTH_MODE", "auto"))
+        .strip()
+        .lower()
+    )
+    verify_ssl_raw = args.confluence_verify_ssl or os.getenv("CONFLUENCE_VERIFY_SSL")
+    verify_ssl = _parse_bool_value(verify_ssl_raw, default=True)
+    dry_run_env = _parse_bool_value(os.getenv("CONFLUENCE_DRY_RUN"), default=False)
+    dry_run = bool(args.confluence_dry_run) or dry_run_env
+    if not base_url:
+        raise ValueError("Missing Confluence base URL. Set --confluence-base-url or CONFLUENCE_BASE_URL.")
+    if not space_key:
+        raise ValueError("Missing Confluence space key. Set --confluence-space-key or CONFLUENCE_SPACE_KEY.")
+    if not parent_page_id:
+        raise ValueError(
+            "Missing Confluence parent page id. Set --confluence-parent-page-id or CONFLUENCE_PARENT_PAGE_ID."
+        )
+    if not api_token:
+        raise ValueError("Missing Confluence API token. Set --confluence-api-token or CONFLUENCE_API_TOKEN.")
+    if auth_mode not in {"auto", "basic", "bearer"}:
+        raise ValueError("Invalid Confluence auth mode. Use auto, basic, or bearer.")
+    if auth_mode == "basic" and not username:
+        raise ValueError(
+            "Missing Confluence username for basic auth. Set --confluence-username or CONFLUENCE_USERNAME."
+        )
+    return ConfluenceConfig(
+        base_url=_normalize_confluence_base_url(base_url),
+        space_key=space_key.strip(),
+        parent_page_id=parent_page_id.strip(),
+        username=username.strip(),
+        api_token=api_token.strip(),
+        auth_mode=auth_mode,
+        verify_ssl=verify_ssl,
+        dry_run=dry_run,
+    )
+
+
+def publish_reports_to_confluence(paths: list[str], cfg: ConfluenceConfig) -> list[str]:
+    outcomes: list[str] = []
+    for path in sorted(paths):
+        outcomes.append(publish_html_report_to_confluence(path, cfg))
+    return outcomes
 
 
 def fetch_executions(
@@ -2866,22 +3145,22 @@ def write_weekly_readable_reports(
     weekday_labels: list[str],
     rows: list[list[str]],
     formats: set[str],
-) -> int:
+) -> list[str]:
     os.makedirs(output_dir, exist_ok=True)
     week_label = week_start.isoformat() if week_start else "unknown_week"
     base_name = f"weekly_cycle_matrix_{week_label}"
-    written = 0
+    written_paths: list[str] = []
     if "html" in formats:
         html_path = os.path.join(output_dir, f"{base_name}.html")
         with open(html_path, "w", encoding="utf-8") as f:
             f.write(render_weekly_html_report(week_start, weekday_labels, rows))
-        written += 1
+        written_paths.append(html_path)
     if "wiki" in formats:
         wiki_path = os.path.join(output_dir, f"{base_name}.confluence.txt")
         with open(wiki_path, "w", encoding="utf-8") as f:
             f.write(render_weekly_wiki_report(week_start, weekday_labels, rows))
-        written += 1
-    return written
+        written_paths.append(wiki_path)
+    return written_paths
 
 
 def render_daily_html_report(folder_name: str, cycles: dict[str, Any]) -> str:
@@ -2923,13 +3202,13 @@ def render_daily_html_report(folder_name: str, cycles: dict[str, Any]) -> str:
         sections.append(
             "<table>"
             "<colgroup>"
-            "<col style='width:20%'>"
-            "<col style='width:30%'>"
-            "<col style='width:10%'>"
-            "<col style='width:10%'>"
-            "<col style='width:10%'>"
-            "<col style='width:15%'>"
-            "<col style='width:5%'>"
+            "<col style='width:20%' />"
+            "<col style='width:30%' />"
+            "<col style='width:10%' />"
+            "<col style='width:10%' />"
+            "<col style='width:10%' />"
+            "<col style='width:15%' />"
+            "<col style='width:5%' />"
             "</colgroup>"
             "<thead><tr>"
             "<th>Название</th><th>Критерий валидации</th><th>Тестовый прогон</th>"
@@ -3069,9 +3348,9 @@ def write_daily_readable_reports(
     output_dir: str,
     report_data: dict[tuple[str, str], dict[str, Any]],
     formats: set[str],
-) -> int:
+) -> list[str]:
     os.makedirs(output_dir, exist_ok=True)
-    written = 0
+    written_paths: list[str] = []
     for (folder_id, folder_name), payload in sorted(report_data.items(), key=lambda item: item[0][1]):
         cycles = payload["cycles"]
         base_name = _build_daily_report_base_name(str(folder_id), str(folder_name), cycles)
@@ -3079,13 +3358,13 @@ def write_daily_readable_reports(
             html_path = os.path.join(output_dir, f"{base_name}.html")
             with open(html_path, "w", encoding="utf-8") as f:
                 f.write(render_daily_html_report(folder_name, cycles))
-            written += 1
+            written_paths.append(html_path)
         if "wiki" in formats:
             wiki_path = os.path.join(output_dir, f"{base_name}.confluence.txt")
             with open(wiki_path, "w", encoding="utf-8") as f:
                 f.write(render_daily_wiki_report(folder_name, cycles))
-            written += 1
-    return written
+            written_paths.append(wiki_path)
+    return written_paths
 
 
 def print_table(weekly: dict[date, WeeklyStat]) -> None:
@@ -3164,6 +3443,22 @@ def main() -> int:
         tree_source_body = _parse_json_object_arg(
             args.tree_source_body_json, "--tree-source-body-json"
         )
+        publish_confluence_daily = args.publish_confluence_daily or _parse_bool_value(
+            os.getenv("CONFLUENCE_PUBLISH_DAILY"), default=False
+        )
+        publish_confluence_weekly = args.publish_confluence_weekly or _parse_bool_value(
+            os.getenv("CONFLUENCE_PUBLISH_WEEKLY"), default=False
+        )
+        confluence_cfg: ConfluenceConfig | None = None
+        if publish_confluence_daily or publish_confluence_weekly:
+            confluence_cfg = load_confluence_config(args)
+            print(
+                "Confluence mode: "
+                f"daily={publish_confluence_daily} "
+                f"weekly={publish_confluence_weekly} "
+                f"dry_run={confluence_cfg.dry_run} "
+                f"auth_mode={confluence_cfg.auth_mode}"
+            )
 
         if args.discover_folders:
             folder_rows: list[tuple[FolderNode, dict[date, WeeklyStat]]] = []
@@ -3412,6 +3707,7 @@ def main() -> int:
             if args.export_case_steps:
                 write_case_steps_csv(args.case_steps_output, case_steps_rows)
             report_data: dict[tuple[str, str], dict[str, Any]] | None = None
+            daily_readable_paths: list[str] = []
             if args.export_daily_readable:
                 selected_formats = set(args.daily_readable_format or ["html", "wiki"])
                 if case_steps_rows:
@@ -3420,7 +3716,7 @@ def main() -> int:
                     )
                 else:
                     report_data = aggregate_readable_daily_reports_legacy(cycles_cases_rows)
-                written_reports = write_daily_readable_reports(
+                daily_readable_paths = write_daily_readable_reports(
                     output_dir=args.daily_readable_dir,
                     report_data=report_data,
                     formats=selected_formats,
@@ -3455,6 +3751,7 @@ def main() -> int:
                     weekly_cycle_weekday_labels,
                     weekly_cycle_rows,
                 )
+            weekly_readable_paths: list[str] = []
             if args.export_weekly_readable:
                 if not weekly_cycle_rows:
                     (
@@ -3463,13 +3760,31 @@ def main() -> int:
                         weekly_cycle_rows,
                     ) = _weekly_cycle_matrix_data(report_data)
                 selected_weekly_formats = set(args.weekly_readable_format or ["html", "wiki"])
-                weekly_readable_written = write_weekly_readable_reports(
+                weekly_readable_paths = write_weekly_readable_reports(
                     output_dir=args.weekly_readable_dir,
                     week_start=weekly_cycle_week_start,
                     weekday_labels=weekly_cycle_weekday_labels,
                     rows=weekly_cycle_rows,
                     formats=selected_weekly_formats,
                 )
+            if confluence_cfg and publish_confluence_daily:
+                daily_html_paths = [p for p in daily_readable_paths if p.endswith(".html")]
+                if daily_html_paths:
+                    outcomes = publish_reports_to_confluence(daily_html_paths, confluence_cfg)
+                    print("Confluence daily publish:")
+                    for line in outcomes:
+                        print(f"- {line}")
+                else:
+                    print("Confluence daily publish skipped: no daily HTML files were generated.")
+            if confluence_cfg and publish_confluence_weekly:
+                weekly_html_paths = [p for p in weekly_readable_paths if p.endswith(".html")]
+                if weekly_html_paths:
+                    outcomes = publish_reports_to_confluence(weekly_html_paths, confluence_cfg)
+                    print("Confluence weekly publish:")
+                    for line in outcomes:
+                        print(f"- {line}")
+                else:
+                    print("Confluence weekly publish skipped: no weekly HTML files were generated.")
             print(f"Saved summary CSV: {args.output}")
             print(f"Saved per-folder CSV directory: {args.per_folder_dir}")
             if args.export_cycles_cases:
@@ -3478,14 +3793,14 @@ def main() -> int:
                 print(f"Saved case steps CSV: {args.case_steps_output}")
             if args.export_daily_readable:
                 print(f"Saved daily readable reports: {args.daily_readable_dir}")
-                print(f"Readable files written: {written_reports}")
+                print(f"Readable files written: {len(daily_readable_paths)}")
             if args.cycle_progress_output:
                 print(f"Saved cycle progress CSV: {args.cycle_progress_output}")
             if args.weekly_cycle_matrix_output:
                 print(f"Saved weekly cycle matrix CSV: {args.weekly_cycle_matrix_output}")
             if args.export_weekly_readable:
                 print(f"Saved weekly readable reports: {args.weekly_readable_dir}")
-                print(f"Weekly readable files written: {weekly_readable_written}")
+                print(f"Weekly readable files written: {len(weekly_readable_paths)}")
             print(f"Processed folders: {len(folder_rows)}")
             print(f"Fetched executions: {total_executions}")
             if total_skipped:

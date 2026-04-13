@@ -66,10 +66,23 @@ $WeeklyCycleMatrixOutput = if ($env:ZEPHYR_WEEKLY_CYCLE_MATRIX_OUTPUT) { $env:ZE
 $ExportWeeklyReadable = if ($env:ZEPHYR_EXPORT_WEEKLY_READABLE) { $env:ZEPHYR_EXPORT_WEEKLY_READABLE } else { "true" }
 $WeeklyReadableDir = if ($env:ZEPHYR_WEEKLY_READABLE_DIR) { $env:ZEPHYR_WEEKLY_READABLE_DIR } else { "reports/weekly_readable" }
 $WeeklyReadableFormats = if ($env:ZEPHYR_WEEKLY_READABLE_FORMATS) { $env:ZEPHYR_WEEKLY_READABLE_FORMATS } else { "html,wiki" }
+$ExportDailyReadable = if ($env:ZEPHYR_EXPORT_DAILY_READABLE) { $env:ZEPHYR_EXPORT_DAILY_READABLE } else { "false" }
+$DailyReadableDir = if ($env:ZEPHYR_DAILY_READABLE_DIR) { $env:ZEPHYR_DAILY_READABLE_DIR } else { "reports/daily_readable" }
+$DailyReadableFormats = if ($env:ZEPHYR_DAILY_READABLE_FORMATS) { $env:ZEPHYR_DAILY_READABLE_FORMATS } else { "html,wiki" }
 $CycleProgressOutput = if ($env:ZEPHYR_CYCLE_PROGRESS_OUTPUT) { $env:ZEPHYR_CYCLE_PROGRESS_OUTPUT } else { "reports/cycle_progress.csv" }
 $Fields = if ($env:ZEPHYR_FIELDS) { $env:ZEPHYR_FIELDS } else { "id,key,name,folderId,iterationId,projectVersionId,environmentId,userKeys,environmentIds,plannedStartDate,plannedEndDate,executionTime,estimatedTime,testResultStatuses,testCaseCount,issueCount,status(id,name,i18nKey,color),customFieldValues,createdOn,createdBy,updatedOn,updatedBy,owner" }
 $TokenHeader = if ($env:ZEPHYR_TOKEN_HEADER) { $env:ZEPHYR_TOKEN_HEADER } else { "Authorization" }
 $TokenPrefix = if ($env:ZEPHYR_TOKEN_PREFIX) { $env:ZEPHYR_TOKEN_PREFIX } else { "Bearer" }
+$ConfluencePublishDaily = if ($env:CONFLUENCE_PUBLISH_DAILY) { $env:CONFLUENCE_PUBLISH_DAILY } else { "false" }
+$ConfluencePublishWeekly = if ($env:CONFLUENCE_PUBLISH_WEEKLY) { $env:CONFLUENCE_PUBLISH_WEEKLY } else { "false" }
+$ConfluenceBaseUrl = if ($env:CONFLUENCE_BASE_URL) { $env:CONFLUENCE_BASE_URL } else { "" }
+$ConfluenceSpaceKey = if ($env:CONFLUENCE_SPACE_KEY) { $env:CONFLUENCE_SPACE_KEY } else { "" }
+$ConfluenceParentPageId = if ($env:CONFLUENCE_PARENT_PAGE_ID) { $env:CONFLUENCE_PARENT_PAGE_ID } else { "" }
+$ConfluenceUsername = if ($env:CONFLUENCE_USERNAME) { $env:CONFLUENCE_USERNAME } else { "" }
+$ConfluenceApiToken = if ($env:CONFLUENCE_API_TOKEN) { $env:CONFLUENCE_API_TOKEN } else { "" }
+$ConfluenceAuthMode = if ($env:CONFLUENCE_AUTH_MODE) { $env:CONFLUENCE_AUTH_MODE.ToLowerInvariant() } else { "auto" }
+$ConfluenceVerifySsl = if ($env:CONFLUENCE_VERIFY_SSL) { $env:CONFLUENCE_VERIFY_SSL } else { "true" }
+$ConfluenceDryRun = if ($env:CONFLUENCE_DRY_RUN) { $env:CONFLUENCE_DRY_RUN } else { "false" }
 
 if (-not $env:ZEPHYR_API_TOKEN) {
     throw "Set ZEPHYR_API_TOKEN environment variable before running."
@@ -145,6 +158,56 @@ if ($ExportWeeklyReadable -eq "true") {
             $ArgsList += @("--weekly-readable-format", $fmt)
         }
     }
+}
+
+if ($ExportDailyReadable -eq "true") {
+    $ArgsList += @("--export-daily-readable", "--daily-readable-dir", $DailyReadableDir)
+    $DailyReadableFormats.Split(",") | ForEach-Object {
+        $fmt = $_.Trim()
+        if ($fmt) {
+            $ArgsList += @("--daily-readable-format", $fmt)
+        }
+    }
+}
+
+if ($ConfluencePublishDaily -eq "true") {
+    $ArgsList += "--publish-confluence-daily"
+}
+
+if ($ConfluencePublishWeekly -eq "true") {
+    $ArgsList += "--publish-confluence-weekly"
+}
+
+if ($ConfluenceBaseUrl) {
+    $ArgsList += @("--confluence-base-url", $ConfluenceBaseUrl)
+}
+
+if ($ConfluenceSpaceKey) {
+    $ArgsList += @("--confluence-space-key", $ConfluenceSpaceKey)
+}
+
+if ($ConfluenceParentPageId) {
+    $ArgsList += @("--confluence-parent-page-id", $ConfluenceParentPageId)
+}
+
+if ($ConfluenceUsername) {
+    $ArgsList += @("--confluence-username", $ConfluenceUsername)
+}
+
+if ($ConfluenceApiToken) {
+    $ArgsList += @("--confluence-api-token", $ConfluenceApiToken)
+}
+
+if ($ConfluenceAuthMode -in @("auto", "basic", "bearer")) {
+    $ArgsList += @("--confluence-auth-mode", $ConfluenceAuthMode)
+}
+
+if ($ConfluenceVerifySsl -in @("true", "false")) {
+    $ArgsList += @("--confluence-verify-ssl", $ConfluenceVerifySsl)
+}
+
+if ($ConfluenceDryRun -eq "true") {
+    $ArgsList += "--confluence-dry-run"
 }
 
 if ($env:ZEPHYR_EXTRA_PARAMS) {

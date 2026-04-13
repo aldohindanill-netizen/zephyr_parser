@@ -77,6 +77,24 @@ Outputs:
   - output files:
     - `weekly_cycle_matrix_<week_start>.html`
     - `weekly_cycle_matrix_<week_start>.confluence.txt`
+- optional auto-publish to Confluence (creates new pages, skips existing titles):
+  - `CONFLUENCE_PUBLISH_DAILY=true` (publishes each generated daily HTML report)
+  - `CONFLUENCE_PUBLISH_WEEKLY=true` (publishes generated weekly HTML report)
+  - required:
+    - `CONFLUENCE_BASE_URL` (Cloud example: `https://<org>.atlassian.net/wiki`)
+    - `CONFLUENCE_SPACE_KEY`
+    - `CONFLUENCE_PARENT_PAGE_ID`
+    - `CONFLUENCE_API_TOKEN`
+  - auth mode:
+    - `CONFLUENCE_AUTH_MODE=auto|basic|bearer` (default: `auto`)
+    - `bearer` is recommended for Confluence Server/Data Center when PAT works as `Authorization: Bearer ...`
+    - for `basic` set `CONFLUENCE_USERNAME` (Cloud: Atlassian account email)
+  - optional:
+    - `CONFLUENCE_VERIFY_SSL=true|false`
+    - `CONFLUENCE_DRY_RUN=true|false` (prints intended actions without API calls)
+  - title format used for new pages:
+    - daily: `Daily report: nightly-dev-<slug(folder_name)>_<most_popular_step_execution_date>_<folder_id>`
+    - weekly: `Weekly cycle matrix: <week_start>`
 - keep `ZEPHYR_QUERY_TEMPLATE` in quotes in `.env` (contains spaces and parentheses)
 - tree-first config for 2026 folders:
   - `ZEPHYR_DISCOVERY_MODE=tree`
@@ -107,6 +125,7 @@ Use local `.env` plus environment variable `ZEPHYR_API_TOKEN` loaded by launcher
 - Do not pass token via CLI argument (`--token`) in normal usage.
 - Do not commit `.env` into git.
 - Keep `.env.example` in repo as a safe template.
+- Do not commit `CONFLUENCE_API_TOKEN` to git.
 
 Windows tip (for manual session export, if needed):
 
