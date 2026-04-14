@@ -165,8 +165,8 @@ Windows tip (for manual session export, if needed):
   - `--status-field "some.path.to.status"`
 - You can pass multiple `--date-field` or `--status-field` values.
 - For Zephyr write-back endpoint tune:
-  - `ZEPHYR_GOOGLE_UPDATE_ENDPOINT_TEMPLATE` (default `rest/tests/1.0/testresult/{test_result_id}`)
-  - `ZEPHYR_GOOGLE_UPDATE_METHOD` (`PUT|POST|PATCH`)
-  - `ZEPHYR_GOOGLE_UPDATE_STATUS_ID_FIELD` (default `testResultStatusId`)
-  - `ZEPHYR_GOOGLE_UPDATE_COMMENT_FIELD` (default `comment`)
-  - `ZEPHYR_GOOGLE_UPDATE_EXTRA_BODY_JSON` (optional extra JSON object)
+  - `ZEPHYR_GSHEET_UPDATE_ENDPOINT_TEMPLATE` (default `rest/tests/1.0/testresult/{test_result_id}`)
+  - `ZEPHYR_GSHEET_UPDATE_METHOD` (`PUT|POST|PATCH`)
+  - `ZEPHYR_GSHEET_UPDATE_STATUS_ID_FIELD` (default `testResultStatusId`)
+  - `ZEPHYR_GSHEET_UPDATE_COMMENT_FIELD` (default `comment`)
+  - `ZEPHYR_GSHEET_UPDATE_EXTRA_BODY_JSON` (optional extra JSON object)
