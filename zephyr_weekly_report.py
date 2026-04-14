@@ -332,6 +332,64 @@ def parse_args() -> argparse.Namespace:
         default=[],
         help="Readable report format. Can repeat; default is both html and wiki.",
     )
+    parser.add_argument(
+        "--create-folder-first",
+        action="store_true",
+        help="Before report generation, ensure target Zephyr folder exists (create if missing).",
+    )
+    parser.add_argument(
+        "--create-folder-name",
+        default=None,
+        help="Folder name to create when --create-folder-first is enabled.",
+    )
+    parser.add_argument(
+        "--create-folder-name-template",
+        default=None,
+        help=(
+            "strftime template for folder name generation, e.g. '%%Y.%%m.%%d'. "
+            "Used only when --create-folder-name is not provided."
+        ),
+    )
+    parser.add_argument(
+        "--create-folder-parent-id",
+        default=None,
+        help="Optional parent folder id for folder creation.",
+    )
+    parser.add_argument(
+        "--create-folder-endpoint",
+        default="/rest/tests/1.0/folder",
+        help="Folder creation endpoint used with POST.",
+    )
+    parser.add_argument(
+        "--create-folder-name-field",
+        default="name",
+        help="Field name in create-folder request body for folder name (default: name).",
+    )
+    parser.add_argument(
+        "--create-folder-project-id-field",
+        default="projectId",
+        help="Field name in create-folder request body for project id (default: projectId).",
+    )
+    parser.add_argument(
+        "--create-folder-parent-id-field",
+        default="parentId",
+        help="Field name in create-folder request body for parent id (default: parentId).",
+    )
+    parser.add_argument(
+        "--create-folder-body-json",
+        default=None,
+        help="Optional extra JSON object merged into create-folder request body.",
+    )
+    parser.add_argument(
+        "--create-folder-dry-run",
+        action="store_true",
+        help="Print folder creation payload without sending POST request.",
+    )
+    parser.add_argument(
+        "--create-folder-use-as-root",
+        action="store_true",
+        help="Use created/existing folder id as the only --root-folder-id for this run.",
+    )
     return parser.parse_args()
 
 
@@ -540,11 +598,22 @@ def _collect_folder_nodes(payload: Any) -> list[FolderNode]:
         node = _to_folder_node(payload)
         if node:
             collected.append(node)
-        for key in ("values", "results", "items", "content", "folders", "children"):
+        for key in (
+            "values",
+            "results",
+            "items",
+            "content",
+            "folders",
+            "children",
+            "data",
+            "result",
+        ):
             value = payload.get(key)
             if isinstance(value, list):
                 for entry in value:
                     collected.extend(_collect_folder_nodes(entry))
+            elif isinstance(value, dict):
+                collected.extend(_collect_folder_nodes(value))
     elif isinstance(payload, list):
         for entry in payload:
             collected.extend(_collect_folder_nodes(entry))
@@ -778,6 +847,139 @@ def _parse_json_object_arg(raw: str | None, arg_name: str) -> dict[str, Any]:
     if not isinstance(parsed, dict):
         raise ValueError(f"{arg_name} must be JSON object")
     return parsed
+
+
+def resolve_folder_creation_name(
+    explicit_name: str | None, name_template: str | None
+) -> str | None:
+    if explicit_name and explicit_name.strip():
+        return explicit_name.strip()
+    if name_template and name_template.strip():
+        candidate = date.today().strftime(name_template.strip()).strip()
+        return candidate or None
+    return None
+
+
+def _normalize_project_or_parent(value: str | None) -> str | int | None:
+    if value is None:
+        return None
+    raw = value.strip()
+    if not raw:
+        return None
+    return int(raw) if raw.isdigit() else raw
+
+
+def _find_existing_folder(
+    nodes: list[FolderNode], name: str, parent_id: str | None
+) -> FolderNode | None:
+    normalized_name = name.strip()
+    normalized_parent = parent_id.strip() if parent_id else None
+    candidates: list[FolderNode] = []
+    for node in nodes:
+        if node.folder_name.strip() != normalized_name:
+            continue
+        if normalized_parent and (node.parent_id or "").strip() != normalized_parent:
+            continue
+        candidates.append(node)
+    if not candidates:
+        return None
+    return sorted(candidates, key=lambda n: n.folder_id)[0]
+
+
+def ensure_folder_created_or_existing(
+    args: argparse.Namespace,
+    headers: dict[str, str],
+    tree_source_query: dict[str, Any],
+    tree_source_body: dict[str, Any],
+) -> FolderNode | None:
+    if not args.create_folder_first:
+        return None
+
+    if not args.project_id:
+        raise ValueError("--create-folder-first requires --project-id")
+
+    target_name = resolve_folder_creation_name(
+        args.create_folder_name, args.create_folder_name_template
+    )
+    if not target_name:
+        raise ValueError(
+            "--create-folder-first requires --create-folder-name or --create-folder-name-template"
+        )
+
+    parent_id = args.create_folder_parent_id.strip() if args.create_folder_parent_id else None
+    discovered_nodes: list[FolderNode] = []
+    discovery_errors: list[str] = []
+    source = "none"
+    try:
+        if args.tree_source_endpoint:
+            discovered_nodes, source = discover_folders_custom_tree_source(
+                base_url=args.base_url,
+                headers=headers,
+                endpoint=args.tree_source_endpoint,
+                method=args.tree_source_method,
+                query_params=tree_source_query,
+                body=tree_source_body,
+            )
+        if not discovered_nodes:
+            discovered_nodes, source, fallback_errors = discover_folders_tree_fallback(
+                base_url=args.base_url,
+                headers=headers,
+                project_id=args.project_id,
+                folder_search_endpoint=args.folder_search_endpoint,
+                foldertree_endpoint=args.foldertree_endpoint,
+            )
+            discovery_errors.extend(fallback_errors)
+    except Exception as exc:  # pylint: disable=broad-except
+        discovery_errors.append(str(exc))
+
+    if discovered_nodes:
+        existing = _find_existing_folder(discovered_nodes, target_name, parent_id)
+        if existing:
+            print(
+                f"Folder already exists: id={existing.folder_id}, name='{existing.folder_name}', source={source}"
+            )
+            return existing
+    elif discovery_errors:
+        print("Folder existence check failed, continue with create attempt:")
+        for error in discovery_errors[:10]:
+            print(f"- {error}")
+
+    extra_body = _parse_json_object_arg(
+        args.create_folder_body_json, "--create-folder-body-json"
+    )
+    create_body = dict(extra_body)
+    create_body.setdefault(args.create_folder_name_field, target_name)
+    project_value = _normalize_project_or_parent(args.project_id)
+    if project_value is not None:
+        create_body.setdefault(args.create_folder_project_id_field, project_value)
+    parent_value = _normalize_project_or_parent(parent_id)
+    if parent_value is not None:
+        create_body.setdefault(args.create_folder_parent_id_field, parent_value)
+
+    if args.create_folder_dry_run:
+        print("Folder create dry-run enabled.")
+        print(f"Create endpoint: {args.create_folder_endpoint}")
+        print(f"Create body: {json.dumps(create_body, ensure_ascii=False)}")
+        return None
+
+    payload = request_json(
+        base_url=args.base_url,
+        endpoint=args.create_folder_endpoint,
+        headers=headers,
+        method="POST",
+        body=create_body,
+    )
+    nodes = _collect_folder_nodes(payload)
+    created = _find_existing_folder(nodes, target_name, parent_id)
+    if not created and nodes:
+        created = sorted(nodes, key=lambda n: n.folder_id)[0]
+    if not created:
+        raise RuntimeError(
+            "Folder creation response does not contain folder id/name. "
+            "Set --create-folder-endpoint and field mappings for your Zephyr instance."
+        )
+    print(f"Created folder: id={created.folder_id}, name='{created.folder_name}'")
+    return created
 
 
 def discover_folders_custom_tree_source(
@@ -2230,6 +2432,24 @@ def main() -> int:
         tree_source_body = _parse_json_object_arg(
             args.tree_source_body_json, "--tree-source-body-json"
         )
+        created_or_existing_folder = ensure_folder_created_or_existing(
+            args=args,
+            headers=headers,
+            tree_source_query=tree_source_query,
+            tree_source_body=tree_source_body,
+        )
+        if args.create_folder_use_as_root and created_or_existing_folder:
+            root_folder_ids = [created_or_existing_folder.folder_id]
+            allowed_root_folder_ids = {created_or_existing_folder.folder_id}
+            print(
+                "Using created/existing folder as root filter: "
+                f"{created_or_existing_folder.folder_id}"
+            )
+        elif args.create_folder_use_as_root and args.create_folder_dry_run:
+            print(
+                "create-folder-use-as-root requested with dry-run; "
+                "root filters were not overridden because folder id is unknown."
+            )
 
         if args.discover_folders:
             folder_rows: list[tuple[FolderNode, dict[date, WeeklyStat]]] = []

@@ -58,6 +58,22 @@ Outputs:
   - output files:
     - `<folder_name>_<folder_id>.html` (copy/paste into Confluence editor)
     - `<folder_name>_<folder_id>.confluence.txt` (wiki-markup format)
+- optional first step: create target Zephyr folder before report generation:
+  - `ZEPHYR_CREATE_FOLDER_FIRST=true`
+  - set one of:
+    - `ZEPHYR_CREATE_FOLDER_NAME=2026.04.14`
+    - `ZEPHYR_CREATE_FOLDER_NAME_TEMPLATE=%Y.%m.%d`
+  - optional placement and endpoint/body mapping:
+    - `ZEPHYR_CREATE_FOLDER_PARENT_ID=...`
+    - `ZEPHYR_CREATE_FOLDER_ENDPOINT=rest/tests/1.0/folder`
+    - `ZEPHYR_CREATE_FOLDER_NAME_FIELD=name`
+    - `ZEPHYR_CREATE_FOLDER_PROJECT_ID_FIELD=projectId`
+    - `ZEPHYR_CREATE_FOLDER_PARENT_ID_FIELD=parentId`
+    - `ZEPHYR_CREATE_FOLDER_BODY_JSON='{"type":"TEST_RUN"}'` (example)
+  - optional safe mode:
+    - `ZEPHYR_CREATE_FOLDER_DRY_RUN=true` (prints payload, no POST)
+  - optional scope override:
+    - `ZEPHYR_CREATE_FOLDER_USE_AS_ROOT=true` (use created/existing folder as the only root filter in current run)
 - keep `ZEPHYR_QUERY_TEMPLATE` in quotes in `.env` (contains spaces and parentheses)
 - tree-first config for 2026 folders:
   - `ZEPHYR_DISCOVERY_MODE=tree`
