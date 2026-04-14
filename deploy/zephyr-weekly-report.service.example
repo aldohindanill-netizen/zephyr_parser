@@ -1,0 +1,25 @@
+# Example systemd unit: supervises the long-running Python loop (Restart=always).
+# The script repeats work every ZEPHYR_LOOP_INTERVAL_MINUTES; the unit does not implement cron timing.
+#
+# Install (edit paths first):
+#   sudo cp deploy/zephyr-weekly-report.service.example /etc/systemd/system/zephyr-weekly-report.service
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now zephyr-weekly-report
+#
+# Logs: journalctl -u zephyr-weekly-report -f
+
+[Unit]
+Description=Zephyr weekly report refresh loop
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Restart=always
+RestartSec=10
+WorkingDirectory=/path/to/zephyr_parser
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/path/to/zephyr_parser/run_zephyr_weekly_report.sh
+
+[Install]
+WantedBy=multi-user.target

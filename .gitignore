@@ -4,3 +4,4 @@
 weekly_zephyr_report.csv
 __pycache__/
 reports/
+logs/

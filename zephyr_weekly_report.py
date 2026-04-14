@@ -9,18 +9,23 @@ from __future__ import annotations
 
 import argparse
 import csv
+import io
 import html
 import json
 import os
 import re
+import signal
 import sys
 import ssl
+import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 
@@ -41,6 +46,16 @@ DEFAULT_STATUS_FIELDS = [
     "executionStatus",
     "result",
 ]
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None or not str(raw).strip():
+        return default
+    try:
+        return int(str(raw).strip())
+    except ValueError:
+        return default
 
 
 @dataclass
@@ -138,6 +153,15 @@ def parse_args() -> argparse.Namespace:
         "--to-date",
         default=None,
         help="End date inclusive (YYYY-MM-DD)",
+    )
+    parser.add_argument(
+        "--rolling-days",
+        type=int,
+        default=_env_int("ZEPHYR_ROLLING_DAYS", 0),
+        help=(
+            "If >0, set from/to to a rolling window ending today (inclusive), "
+            "overriding --from-date and --to-date. Default 0 (off); ZEPHYR_ROLLING_DAYS."
+        ),
     )
     parser.add_argument(
         "--date-field",
@@ -433,7 +457,135 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Update existing Confluence pages with the same title instead of skipping.",
     )
+    parser.add_argument(
+        "--loop-interval-minutes",
+        type=int,
+        default=None,
+        help=(
+            "Repeat the full report run after this many minutes until SIGINT/SIGTERM. "
+            "If omitted, ZEPHYR_LOOP_INTERVAL_MINUTES is used when set."
+        ),
+    )
+    parser.add_argument(
+        "--run-lock-file",
+        default=os.getenv("ZEPHYR_RUN_LOCK_FILE") or None,
+        help=(
+            "If set, only one process may run at a time (cron-friendly). "
+            "Another instance exits immediately. Default: ZEPHYR_RUN_LOCK_FILE."
+        ),
+    )
     return parser.parse_args()
+
+
+def _resolve_loop_interval_minutes(args: argparse.Namespace) -> int | None:
+    if args.loop_interval_minutes is not None:
+        if args.loop_interval_minutes <= 0:
+            raise ValueError("--loop-interval-minutes must be a positive integer")
+        return args.loop_interval_minutes
+    raw = os.getenv("ZEPHYR_LOOP_INTERVAL_MINUTES")
+    if raw is None or not str(raw).strip():
+        return None
+    try:
+        v = int(str(raw).strip())
+    except ValueError:
+        return None
+    if v <= 0:
+        return None
+    return v
+
+
+_run_lock_handle: Any = None
+
+
+def _try_acquire_run_lock(lock_path: str) -> bool:
+    """Return True if this process holds the lock; False if another instance is running."""
+    global _run_lock_handle
+    path = Path(lock_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if sys.platform == "win32":
+        import msvcrt
+
+        if not path.exists() or path.stat().st_size == 0:
+            path.write_bytes(b"\0")
+        binary = path.open("r+b")
+        try:
+            msvcrt.locking(binary.fileno(), msvcrt.LK_NBLCK, 1)
+        except OSError:
+            binary.close()
+            return False
+        _run_lock_handle = binary
+        return True
+    import fcntl
+
+    handle = path.open("a+", encoding="utf-8")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        handle.close()
+        return False
+    _run_lock_handle = handle
+    return True
+
+
+def _release_run_lock() -> None:
+    global _run_lock_handle
+    if _run_lock_handle is None:
+        return
+    try:
+        if sys.platform == "win32":
+            import msvcrt
+
+            try:
+                msvcrt.locking(_run_lock_handle.fileno(), msvcrt.LK_UNLCK, 1)
+            except OSError:
+                pass
+        else:
+            import fcntl
+
+            try:
+                fcntl.flock(_run_lock_handle.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+    finally:
+        try:
+            _run_lock_handle.close()
+        except OSError:
+            pass
+        _run_lock_handle = None
+
+
+def _interruptible_sleep(total_seconds: float, stop: threading.Event) -> None:
+    if total_seconds <= 0:
+        return
+    deadline = time.monotonic() + total_seconds
+    while time.monotonic() < deadline:
+        if stop.is_set():
+            return
+        remaining = deadline - time.monotonic()
+        time.sleep(min(1.0, remaining))
+
+
+def _run_loop(args: argparse.Namespace, interval_minutes: int) -> int:
+    stop = threading.Event()
+
+    def _handle_stop(_signum: int, _frame: Any) -> None:
+        stop.set()
+
+    signal.signal(signal.SIGINT, _handle_stop)
+    if hasattr(signal, "SIGTERM"):
+        signal.signal(signal.SIGTERM, _handle_stop)
+
+    iteration = 0
+    while not stop.is_set():
+        iteration += 1
+        print(f"Loop iteration {iteration} starting", file=sys.stderr)
+        run_once(args)
+        if stop.is_set():
+            break
+        print(f"Sleeping {interval_minutes} minutes until next run", file=sys.stderr)
+        _interruptible_sleep(float(interval_minutes * 60), stop)
+    print("Loop stopped (interrupt or signal)", file=sys.stderr)
+    return 0
 
 
 def parse_date(value: str | None) -> date | None:
@@ -462,6 +614,78 @@ def parse_datetime(value: str) -> datetime:
             except ValueError:
                 continue
     raise ValueError(f"Unable to parse datetime '{value}'")
+
+
+def _try_parse_row_date(raw: str) -> date | None:
+    cleaned = str(raw or "").strip()
+    if not cleaned:
+        return None
+    try:
+        return parse_datetime(cleaned).date()
+    except ValueError:
+        return _parse_display_date(cleaned)
+
+
+def _write_text_if_changed(path: str, content: str) -> bool:
+    try:
+        if os.path.isfile(path):
+            with open(path, encoding="utf-8") as handle:
+                if handle.read() == content:
+                    return False
+    except OSError:
+        pass
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    with open(path, "w", encoding="utf-8", newline="") as handle:
+        handle.write(content)
+    return True
+
+
+def _filter_cycles_cases_rows_by_window(
+    rows: list[list[str]],
+    from_date: date,
+    to_date: date,
+) -> list[list[str]]:
+    filtered: list[list[str]] = []
+    for row in rows:
+        dates: list[date] = []
+        if len(row) > 6:
+            d = _try_parse_row_date(row[6])
+            if d is not None:
+                dates.append(d)
+        if len(row) > 11:
+            d = _try_parse_row_date(row[11])
+            if d is not None:
+                dates.append(d)
+        if not dates:
+            continue
+        if any(from_date <= d <= to_date for d in dates):
+            filtered.append(row)
+    return filtered
+
+
+def _filter_case_steps_rows_by_window(
+    rows: list[list[str]],
+    from_date: date,
+    to_date: date,
+) -> list[list[str]]:
+    filtered: list[list[str]] = []
+    for row in rows:
+        dates: list[date] = []
+        if len(row) > 17:
+            d = _try_parse_row_date(row[17])
+            if d is not None:
+                dates.append(d)
+        if len(row) > 23:
+            d = _try_parse_row_date(row[23])
+            if d is not None:
+                dates.append(d)
+        if not dates:
+            continue
+        if any(from_date <= d <= to_date for d in dates):
+            filtered.append(row)
+    return filtered
 
 
 def get_by_path(data: dict[str, Any], path: str) -> Any:
@@ -2815,10 +3039,14 @@ def _build_cycle_progress_rows(cycles: dict[str, Any]) -> list[dict[str, Any]]:
         cycle_key = str(cycle.get("cycle_key") or "")
         total_cases = len(cycle.get("cases", {}))
         passed_cases = 0
+        not_executed_cases = 0
         for case in cycle.get("cases", {}).values():
             normalized = normalize_status(case.get("result", case.get("test_case_status", "")))
             if normalized == "passed":
                 passed_cases += 1
+            elif normalized == "not_executed":
+                not_executed_cases += 1
+        all_not_executed = total_cases > 0 and not_executed_cases == total_cases
         rows.append(
             {
                 "cycle_title": str(cycle_title),
@@ -2826,13 +3054,17 @@ def _build_cycle_progress_rows(cycles: dict[str, Any]) -> list[dict[str, Any]]:
                 "cycle_key": cycle_key,
                 "total_cases": total_cases,
                 "passed_cases": passed_cases,
+                "not_executed_cases": not_executed_cases,
+                "all_not_executed": all_not_executed,
             }
         )
     return rows
 
 
-def _passed_count_color(passed_cases: int) -> str:
+def _passed_count_color(passed_cases: int, *, all_not_executed: bool = False) -> str:
     if passed_cases <= 0:
+        if all_not_executed:
+            return "#c9c9c2"
         return "#ff9074"
     if passed_cases == 1:
         return "#ffc402"
@@ -2841,7 +3073,9 @@ def _passed_count_color(passed_cases: int) -> str:
     return "#01875b"
 
 
-def _passed_count_text_color(passed_cases: int) -> str:
+def _passed_count_text_color(passed_cases: int, *, all_not_executed: bool = False) -> str:
+    if passed_cases <= 0 and all_not_executed:
+        return "#2f2f2f"
     return "#2f2f2f" if passed_cases <= 1 else "#ffffff"
 
 
@@ -2873,7 +3107,7 @@ def _cycle_progress_csv_rows(
     return rows
 
 
-def write_cycle_progress_csv(path: str, rows: list[list[str]]) -> None:
+def write_cycle_progress_csv(path: str, rows: list[list[str]]) -> bool:
     header = [
         "folder_id",
         "folder_name",
@@ -2882,13 +3116,11 @@ def write_cycle_progress_csv(path: str, rows: list[list[str]]) -> None:
         "total_cases",
         "passed_cases",
     ]
-    output_dir = os.path.dirname(path)
-    if output_dir:
-        os.makedirs(output_dir, exist_ok=True)
-    with open(path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow(header)
-        writer.writerows(rows)
+    buffer = io.StringIO()
+    writer = csv.writer(buffer, lineterminator="\n")
+    writer.writerow(header)
+    writer.writerows(rows)
+    return _write_text_if_changed(path, buffer.getvalue())
 
 
 def _weekly_cycle_display_label(cycle: dict[str, Any]) -> str:
@@ -2967,9 +3199,28 @@ def _resolve_folder_report_day(folder_name: str, cycles: dict[str, Any]) -> date
     return _parse_report_day_from_folder_name(folder_name)
 
 
+def _filter_report_data_by_resolved_folder_day(
+    report_data: dict[tuple[str, str], dict[str, Any]],
+    from_date: date,
+    to_date: date,
+) -> dict[tuple[str, str], dict[str, Any]]:
+    out: dict[tuple[str, str], dict[str, Any]] = {}
+    for key, payload in report_data.items():
+        _folder_id, folder_name = key
+        cycles = payload.get("cycles", {})
+        if not isinstance(cycles, dict):
+            continue
+        rd = _resolve_folder_report_day(folder_name, cycles)
+        if rd is None:
+            out[key] = payload
+        elif from_date <= rd <= to_date:
+            out[key] = payload
+    return out
+
+
 def _weekly_cycle_matrix_data(
     report_data: dict[tuple[str, str], dict[str, Any]]
-) -> tuple[date | None, list[str], list[list[str]]]:
+) -> tuple[date | None, list[str], list[list[str]], list[list[bool]]]:
     weekly_groups: dict[date, list[dict[str, Any]]] = defaultdict(list)
     for (folder_id, folder_name), payload in report_data.items():
         cycles = payload.get("cycles", {})
@@ -2991,7 +3242,7 @@ def _weekly_cycle_matrix_data(
         )
 
     if not weekly_groups:
-        return None, [], []
+        return None, [], [], []
 
     def _aggregate_progress_map(
         progress_rows: list[dict[str, Any]],
@@ -3005,12 +3256,14 @@ def _weekly_cycle_matrix_data(
             cycle_sort_key = _summary_sort_key(progress_row)
             total_cases = int(progress_row.get("total_cases", 0))
             passed_cases = int(progress_row.get("passed_cases", 0))
+            all_not_executed = bool(progress_row.get("all_not_executed", False))
             existing = aggregated.get(normalized_label)
             if existing is None:
                 aggregated[normalized_label] = {
                     "sort_key": cycle_sort_key,
                     "total_cases": total_cases,
                     "passed_cases": passed_cases,
+                    "all_not_executed": all_not_executed,
                     "is_cloned": is_cloned,
                 }
                 continue
@@ -3020,6 +3273,7 @@ def _weekly_cycle_matrix_data(
                     "sort_key": cycle_sort_key,
                     "total_cases": total_cases,
                     "passed_cases": passed_cases,
+                    "all_not_executed": all_not_executed,
                     "is_cloned": False,
                 }
                 continue
@@ -3029,6 +3283,7 @@ def _weekly_cycle_matrix_data(
                 existing["sort_key"] = cycle_sort_key
             existing["total_cases"] = max(existing["total_cases"], total_cases)
             existing["passed_cases"] = max(existing["passed_cases"], passed_cases)
+            existing["all_not_executed"] = existing["all_not_executed"] and all_not_executed
         return aggregated
 
     target_week_start = max(
@@ -3048,6 +3303,7 @@ def _weekly_cycle_matrix_data(
     day_maps: dict[date, dict[str, dict[str, Any]]] = {}
     joined_passed_by_label: dict[str, dict[str, int]] = {}
     joined_totals_by_label: dict[str, dict[str, int]] = {}
+    joined_all_not_executed_by_label: dict[str, dict[str, bool]] = {}
     for day_date, day_label in zip(ordered_days, column_labels):
         day_map = _aggregate_progress_map(progress_rows_by_day[day_date])
         day_maps[day_date] = day_map
@@ -3059,12 +3315,16 @@ def _weekly_cycle_matrix_data(
             cycle_label: int(day_payload["total_cases"])
             for cycle_label, day_payload in day_map.items()
         }
+        joined_all_not_executed_by_label[day_label] = {
+            cycle_label: bool(day_payload.get("all_not_executed", False))
+            for cycle_label, day_payload in day_map.items()
+        }
 
     all_cycle_labels: set[str] = set()
     for day_map in day_maps.values():
         all_cycle_labels.update(day_map.keys())
     if not all_cycle_labels:
-        return target_week_start, column_labels, []
+        return target_week_start, column_labels, [], []
 
     sort_key_by_cycle: dict[str, tuple[Any, ...]] = {}
     for cycle_label in all_cycle_labels:
@@ -3078,6 +3338,7 @@ def _weekly_cycle_matrix_data(
             sort_key_by_cycle[cycle_label] = min(sort_candidates)
 
     rows: list[list[str]] = []
+    cell_all_not_executed: list[list[bool]] = []
     for cycle_label in sorted(
         all_cycle_labels,
         key=lambda label: (sort_key_by_cycle.get(label, (9_999_999, label, "", "", "")), label.lower()),
@@ -3086,33 +3347,39 @@ def _weekly_cycle_matrix_data(
         for totals_map in joined_totals_by_label.values():
             total_cases = max(total_cases, int(totals_map.get(cycle_label, 0)))
         row = [cycle_label, str(total_cases)]
+        ne_flags: list[bool] = []
         for day_label in column_labels:
             row.append(str(joined_passed_by_label.get(day_label, {}).get(cycle_label, 0)))
+            ne_flags.append(bool(joined_all_not_executed_by_label.get(day_label, {}).get(cycle_label, False)))
         rows.append(row)
-    return target_week_start, column_labels, rows
+        cell_all_not_executed.append(ne_flags)
+    return target_week_start, column_labels, rows, cell_all_not_executed
 
 
 def _weekly_cycle_matrix_rows(report_data: dict[tuple[str, str], dict[str, Any]]) -> list[list[str]]:
-    _, _, rows = _weekly_cycle_matrix_data(report_data)
+    _, _, rows, _ = _weekly_cycle_matrix_data(report_data)
     return rows
 
 
-def write_weekly_cycle_matrix_csv(path: str, weekday_labels: list[str], rows: list[list[str]]) -> None:
+def write_weekly_cycle_matrix_csv(path: str, weekday_labels: list[str], rows: list[list[str]]) -> bool:
     header = [
         "Тестовый цикл",
         "Всего кейсов",
     ]
     header.extend(label for label in weekday_labels)
-    output_dir = os.path.dirname(path)
-    if output_dir:
-        os.makedirs(output_dir, exist_ok=True)
-    with open(path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow(header)
-        writer.writerows(rows)
+    buffer = io.StringIO()
+    writer = csv.writer(buffer, lineterminator="\n")
+    writer.writerow(header)
+    writer.writerows(rows)
+    return _write_text_if_changed(path, buffer.getvalue())
 
 
-def render_weekly_html_report(week_start: date | None, weekday_labels: list[str], rows: list[list[str]]) -> str:
+def render_weekly_html_report(
+    week_start: date | None,
+    weekday_labels: list[str],
+    rows: list[list[str]],
+    cell_all_not_executed: list[list[bool]] | None = None,
+) -> str:
     week_label = week_start.isoformat() if week_start else "N/A"
     labels = list(weekday_labels)
     col_count = 2 + len(labels)
@@ -3137,7 +3404,7 @@ def render_weekly_html_report(week_start: date | None, weekday_labels: list[str]
         "<thead><tr>" + "".join(header_cells) + "</tr></thead><tbody>",
     ]
     previous_group = ""
-    for row in rows:
+    for row_idx, row in enumerate(rows):
         summary_row = {
             "cycle_index": _extract_cycle_index({"cycle_name": row[0]}),
             "cycle_title": row[0],
@@ -3147,11 +3414,18 @@ def render_weekly_html_report(week_start: date | None, weekday_labels: list[str]
         if previous_group and current_group and current_group != previous_group:
             sections.append(f"<tr class='scenario-sep'><td colspan='{col_count}'></td></tr>")
         passed_cells: list[str] = []
+        ne_row = (
+            cell_all_not_executed[row_idx]
+            if cell_all_not_executed and row_idx < len(cell_all_not_executed)
+            else []
+        )
         for idx in range(len(labels)):
             passed_value = int(row[2 + idx]) if 2 + idx < len(row) else 0
+            all_ne = bool(ne_row[idx]) if idx < len(ne_row) else False
             passed_cells.append(
                 "<td class='passed-count-cell' "
-                f"style='background:{_passed_count_color(passed_value)};color:{_passed_count_text_color(passed_value)};'>"
+                f"style='background:{_passed_count_color(passed_value, all_not_executed=all_ne)};"
+                f"color:{_passed_count_text_color(passed_value, all_not_executed=all_ne)};'>"
                 f"{passed_value}</td>"
             )
         sections.append(
@@ -3209,22 +3483,25 @@ def write_weekly_readable_reports(
     weekday_labels: list[str],
     rows: list[list[str]],
     formats: set[str],
+    cell_all_not_executed: list[list[bool]] | None = None,
 ) -> list[str]:
     os.makedirs(output_dir, exist_ok=True)
     week_label = week_start.isoformat() if week_start else "unknown_week"
     base_name = f"weekly_cycle_matrix_{week_label}"
-    written_paths: list[str] = []
+    updated_paths: list[str] = []
     if "html" in formats:
         html_path = os.path.join(output_dir, f"{base_name}.html")
-        with open(html_path, "w", encoding="utf-8") as f:
-            f.write(render_weekly_html_report(week_start, weekday_labels, rows))
-        written_paths.append(html_path)
+        html_body = render_weekly_html_report(
+            week_start, weekday_labels, rows, cell_all_not_executed=cell_all_not_executed
+        )
+        if _write_text_if_changed(html_path, html_body):
+            updated_paths.append(html_path)
     if "wiki" in formats:
         wiki_path = os.path.join(output_dir, f"{base_name}.confluence.txt")
-        with open(wiki_path, "w", encoding="utf-8") as f:
-            f.write(render_weekly_wiki_report(week_start, weekday_labels, rows))
-        written_paths.append(wiki_path)
-    return written_paths
+        wiki_body = render_weekly_wiki_report(week_start, weekday_labels, rows)
+        if _write_text_if_changed(wiki_path, wiki_body):
+            updated_paths.append(wiki_path)
+    return updated_paths
 
 
 def render_daily_html_report(folder_name: str, cycles: dict[str, Any]) -> str:
@@ -3326,8 +3603,9 @@ def render_daily_html_report(folder_name: str, cycles: dict[str, Any]) -> str:
             sections.append("<tr class='scenario-sep'><td colspan='3'></td></tr>")
         cycle_label = _build_summary_cycle_label(row)
         passed_cases = int(row["passed_cases"])
-        bg_color = _passed_count_color(passed_cases)
-        text_color = _passed_count_text_color(passed_cases)
+        all_ne = bool(row.get("all_not_executed", False))
+        bg_color = _passed_count_color(passed_cases, all_not_executed=all_ne)
+        text_color = _passed_count_text_color(passed_cases, all_not_executed=all_ne)
         sections.append(
             "<tr>"
             f"<td>{html.escape(cycle_label)}</td>"
@@ -3414,21 +3692,21 @@ def write_daily_readable_reports(
     formats: set[str],
 ) -> list[str]:
     os.makedirs(output_dir, exist_ok=True)
-    written_paths: list[str] = []
+    updated_paths: list[str] = []
     for (folder_id, folder_name), payload in sorted(report_data.items(), key=lambda item: item[0][1]):
         cycles = payload["cycles"]
         base_name = _build_daily_report_base_name(str(folder_id), str(folder_name), cycles)
         if "html" in formats:
             html_path = os.path.join(output_dir, f"{base_name}.html")
-            with open(html_path, "w", encoding="utf-8") as f:
-                f.write(render_daily_html_report(folder_name, cycles))
-            written_paths.append(html_path)
+            html_body = render_daily_html_report(folder_name, cycles)
+            if _write_text_if_changed(html_path, html_body):
+                updated_paths.append(html_path)
         if "wiki" in formats:
             wiki_path = os.path.join(output_dir, f"{base_name}.confluence.txt")
-            with open(wiki_path, "w", encoding="utf-8") as f:
-                f.write(render_daily_wiki_report(folder_name, cycles))
-            written_paths.append(wiki_path)
-    return written_paths
+            wiki_body = render_daily_wiki_report(folder_name, cycles)
+            if _write_text_if_changed(wiki_path, wiki_body):
+                updated_paths.append(wiki_path)
+    return updated_paths
 
 
 def print_table(weekly: dict[date, WeeklyStat]) -> None:
@@ -3476,18 +3754,28 @@ def print_table(weekly: dict[date, WeeklyStat]) -> None:
         print(fmt.format(*row))
 
 
-def main() -> int:
-    args = parse_args()
+def run_once(args: argparse.Namespace) -> int:
     try:
         token = args.token or os.getenv("ZEPHYR_API_TOKEN")
         if not token:
             raise ValueError(
                 "Missing API token. Pass --token or set ZEPHYR_API_TOKEN environment variable."
             )
-        from_date = parse_date(args.from_date)
-        to_date = parse_date(args.to_date)
-        if from_date and to_date and from_date > to_date:
-            raise ValueError("--from-date must be less or equal to --to-date")
+        rolling_days = max(0, int(args.rolling_days))
+        if rolling_days > 0:
+            to_date = date.today()
+            from_date = to_date - timedelta(days=rolling_days - 1)
+            print(
+                "Rolling window: "
+                f"rolling_days={rolling_days} from_date={from_date.isoformat()} "
+                f"to_date={to_date.isoformat()} (overrides --from-date / --to-date)",
+                file=sys.stderr,
+            )
+        else:
+            from_date = parse_date(args.from_date)
+            to_date = parse_date(args.to_date)
+            if from_date and to_date and from_date > to_date:
+                raise ValueError("--from-date must be less or equal to --to-date")
 
         headers = build_headers(args.token_header, args.token_prefix, token)
         extra_params = parse_extra_params(args.extra_param)
@@ -3760,6 +4048,19 @@ def main() -> int:
                             continue
                         raise RuntimeError(message) from exc
 
+            if rolling_days > 0 and from_date is not None and to_date is not None:
+                cycles_cases_rows = _filter_cycles_cases_rows_by_window(
+                    cycles_cases_rows, from_date, to_date
+                )
+                case_steps_rows = _filter_case_steps_rows_by_window(
+                    case_steps_rows, from_date, to_date
+                )
+                print(
+                    "Rolling window row filter: "
+                    f"cycles_cases_rows={len(cycles_cases_rows)} case_steps_rows={len(case_steps_rows)}",
+                    file=sys.stderr,
+                )
+
             os.makedirs(args.per_folder_dir, exist_ok=True)
             for folder, weekly in folder_rows:
                 file_name = f"{slugify(folder.folder_name)}_{folder.folder_id}.csv"
@@ -3799,19 +4100,35 @@ def main() -> int:
                         )
                     else:
                         report_data = aggregate_readable_daily_reports_legacy(cycles_cases_rows)
+            if (
+                rolling_days > 0
+                and from_date is not None
+                and to_date is not None
+                and report_data is not None
+            ):
+                report_data = _filter_report_data_by_resolved_folder_day(
+                    report_data, from_date, to_date
+                )
+            cycle_progress_csv_updated: bool | None = None
+            weekly_matrix_csv_updated: bool | None = None
+            report_data_for_matrix = report_data or {}
             if args.cycle_progress_output:
-                cycle_progress_rows = _cycle_progress_csv_rows(report_data)
-                write_cycle_progress_csv(args.cycle_progress_output, cycle_progress_rows)
+                cycle_progress_rows = _cycle_progress_csv_rows(report_data_for_matrix)
+                cycle_progress_csv_updated = write_cycle_progress_csv(
+                    args.cycle_progress_output, cycle_progress_rows
+                )
             weekly_cycle_week_start: date | None = None
             weekly_cycle_weekday_labels = _default_weekday_labels()
             weekly_cycle_rows: list[list[str]] = []
+            weekly_cycle_cell_all_ne: list[list[bool]] = []
             if args.weekly_cycle_matrix_output:
                 (
                     weekly_cycle_week_start,
                     weekly_cycle_weekday_labels,
                     weekly_cycle_rows,
-                ) = _weekly_cycle_matrix_data(report_data)
-                write_weekly_cycle_matrix_csv(
+                    weekly_cycle_cell_all_ne,
+                ) = _weekly_cycle_matrix_data(report_data_for_matrix)
+                weekly_matrix_csv_updated = write_weekly_cycle_matrix_csv(
                     args.weekly_cycle_matrix_output,
                     weekly_cycle_weekday_labels,
                     weekly_cycle_rows,
@@ -3823,7 +4140,8 @@ def main() -> int:
                         weekly_cycle_week_start,
                         weekly_cycle_weekday_labels,
                         weekly_cycle_rows,
-                    ) = _weekly_cycle_matrix_data(report_data)
+                        weekly_cycle_cell_all_ne,
+                    ) = _weekly_cycle_matrix_data(report_data_for_matrix)
                 selected_weekly_formats = set(args.weekly_readable_format or ["html", "wiki"])
                 weekly_readable_paths = write_weekly_readable_reports(
                     output_dir=args.weekly_readable_dir,
@@ -3831,6 +4149,7 @@ def main() -> int:
                     weekday_labels=weekly_cycle_weekday_labels,
                     rows=weekly_cycle_rows,
                     formats=selected_weekly_formats,
+                    cell_all_not_executed=weekly_cycle_cell_all_ne,
                 )
             if confluence_cfg and publish_confluence_daily:
                 daily_html_paths = [p for p in daily_readable_paths if p.endswith(".html")]
@@ -3858,14 +4177,24 @@ def main() -> int:
                 print(f"Saved case steps CSV: {args.case_steps_output}")
             if args.export_daily_readable:
                 print(f"Saved daily readable reports: {args.daily_readable_dir}")
-                print(f"Readable files written: {len(daily_readable_paths)}")
+                print(f"Daily readable files updated: {len(daily_readable_paths)}")
             if args.cycle_progress_output:
-                print(f"Saved cycle progress CSV: {args.cycle_progress_output}")
+                status = (
+                    "content changed"
+                    if cycle_progress_csv_updated
+                    else "unchanged (skipped write)"
+                )
+                print(f"Cycle progress CSV: {args.cycle_progress_output} ({status})")
             if args.weekly_cycle_matrix_output:
-                print(f"Saved weekly cycle matrix CSV: {args.weekly_cycle_matrix_output}")
+                status = (
+                    "content changed"
+                    if weekly_matrix_csv_updated
+                    else "unchanged (skipped write)"
+                )
+                print(f"Weekly cycle matrix CSV: {args.weekly_cycle_matrix_output} ({status})")
             if args.export_weekly_readable:
                 print(f"Saved weekly readable reports: {args.weekly_readable_dir}")
-                print(f"Weekly readable files written: {len(weekly_readable_paths)}")
+                print(f"Weekly readable files updated: {len(weekly_readable_paths)}")
             print(f"Processed folders: {len(folder_rows)}")
             print(f"Fetched executions: {total_executions}")
             if total_skipped:
@@ -3902,6 +4231,30 @@ def main() -> int:
     except Exception as exc:  # pylint: disable=broad-except
         print(f"Error: {exc}", file=sys.stderr)
         return 1
+
+
+def main() -> int:
+    args = parse_args()
+    lock_file = (args.run_lock_file or "").strip() or None
+    if lock_file:
+        if not _try_acquire_run_lock(lock_file):
+            print(
+                f"Another instance is running (lock file {lock_file}); exiting without work.",
+                file=sys.stderr,
+            )
+            return 0
+    try:
+        try:
+            interval_minutes = _resolve_loop_interval_minutes(args)
+        except ValueError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
+        if interval_minutes is not None:
+            print(f"Loop mode: interval_minutes={interval_minutes}", file=sys.stderr)
+            return _run_loop(args, interval_minutes)
+        return run_once(args)
+    finally:
+        _release_run_lock()
 
 
 if __name__ == "__main__":

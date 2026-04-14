@@ -117,11 +117,20 @@ $ArgsList = @(
     "--weekly-cycle-matrix-output", $WeeklyCycleMatrixOutput
 )
 
-if ($env:ZEPHYR_FROM_DATE) {
-    $ArgsList += @("--from-date", $env:ZEPHYR_FROM_DATE)
+$RollingDaysRaw = if ($env:ZEPHYR_ROLLING_DAYS) { $env:ZEPHYR_ROLLING_DAYS.Trim() } else { "" }
+$RollingDaysInt = 0
+if ($RollingDaysRaw -match '^\d+$') {
+    $RollingDaysInt = [int]$RollingDaysRaw
 }
-if ($env:ZEPHYR_TO_DATE) {
-    $ArgsList += @("--to-date", $env:ZEPHYR_TO_DATE)
+if ($RollingDaysInt -gt 0) {
+    $ArgsList += @("--rolling-days", "$RollingDaysInt")
+} else {
+    if ($env:ZEPHYR_FROM_DATE) {
+        $ArgsList += @("--from-date", $env:ZEPHYR_FROM_DATE)
+    }
+    if ($env:ZEPHYR_TO_DATE) {
+        $ArgsList += @("--to-date", $env:ZEPHYR_TO_DATE)
+    }
 }
 
 if ($TreeLeafOnly -eq "true") {
@@ -222,6 +231,14 @@ if ($env:ZEPHYR_EXTRA_PARAMS) {
             $ArgsList += @("--extra-param", $param)
         }
     }
+}
+
+if ($env:ZEPHYR_LOOP_INTERVAL_MINUTES) {
+    $ArgsList += @("--loop-interval-minutes", $env:ZEPHYR_LOOP_INTERVAL_MINUTES)
+}
+
+if ($env:ZEPHYR_RUN_LOCK_FILE) {
+    $ArgsList += @("--run-lock-file", $env:ZEPHYR_RUN_LOCK_FILE)
 }
 
 if ($ExtraArgs) {

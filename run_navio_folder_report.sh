@@ -64,6 +64,7 @@ QUERY_TEMPLATE="${ZEPHYR_QUERY_TEMPLATE:-testRun.projectId IN (${PROJECT_ID}) AN
 PROJECT_QUERY="${ZEPHYR_PROJECT_QUERY:-testRun.projectId IN (${PROJECT_ID}) ORDER BY testRun.name ASC}"
 FROM_DATE="${ZEPHYR_FROM_DATE:-}"
 TO_DATE="${ZEPHYR_TO_DATE:-}"
+ROLLING_DAYS="${ZEPHYR_ROLLING_DAYS:-}"
 DEBUG_FOLDER_FIELDS="${ZEPHYR_DEBUG_FOLDER_FIELDS:-false}"
 DISCOVERY_MODE="${ZEPHYR_DISCOVERY_MODE:-tree}"
 TREE_LEAF_ONLY="${ZEPHYR_TREE_LEAF_ONLY:-true}"
@@ -122,6 +123,7 @@ QUERY_TEMPLATE="$(strip_cr "$QUERY_TEMPLATE")"
 PROJECT_QUERY="$(strip_cr "$PROJECT_QUERY")"
 FROM_DATE="$(strip_cr "$FROM_DATE")"
 TO_DATE="$(strip_cr "$TO_DATE")"
+ROLLING_DAYS="$(strip_cr "$ROLLING_DAYS")"
 DEBUG_FOLDER_FIELDS="$(strip_cr "$DEBUG_FOLDER_FIELDS")"
 DISCOVERY_MODE="$(strip_cr "$DISCOVERY_MODE")"
 TREE_LEAF_ONLY="$(strip_cr "$TREE_LEAF_ONLY")"
@@ -339,12 +341,15 @@ if [[ -n "$FOLDER_PATH_REGEX" ]]; then
   cmd+=(--folder-path-regex "$FOLDER_PATH_REGEX")
 fi
 
-if [[ -n "$FROM_DATE" ]]; then
-  cmd+=(--from-date "$FROM_DATE")
-fi
-
-if [[ -n "$TO_DATE" ]]; then
-  cmd+=(--to-date "$TO_DATE")
+if [[ -n "$ROLLING_DAYS" ]] && [[ "$ROLLING_DAYS" =~ ^[0-9]+$ ]] && (( ROLLING_DAYS > 0 )); then
+  cmd+=(--rolling-days "$ROLLING_DAYS")
+else
+  if [[ -n "$FROM_DATE" ]]; then
+    cmd+=(--from-date "$FROM_DATE")
+  fi
+  if [[ -n "$TO_DATE" ]]; then
+    cmd+=(--to-date "$TO_DATE")
+  fi
 fi
 
 if [[ "$DEBUG_FOLDER_FIELDS" == "true" ]]; then
