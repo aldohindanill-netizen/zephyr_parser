@@ -24,6 +24,12 @@ Run report via launcher:
 bash ./run_navio_folder_report.sh
 ```
 
+Run Google Sheets pipeline launcher:
+
+```bash
+bash ./run_zephyr_google_pipeline.sh --help
+```
+
 The launcher runs in tree-first mode by default:
 
 - tries custom tree source first (`ZEPHYR_TREE_SOURCE_*`) when configured
@@ -58,6 +64,57 @@ Outputs:
   - output files:
     - `<folder_name>_<folder_id>.html` (copy/paste into Confluence editor)
     - `<folder_name>_<folder_id>.confluence.txt` (wiki-markup format)
+- optional first step: create target Zephyr folder before report generation:
+  - `ZEPHYR_CREATE_FOLDER_FIRST=true`
+  - set one of:
+    - `ZEPHYR_CREATE_FOLDER_NAME=2026.04.14`
+    - `ZEPHYR_CREATE_FOLDER_NAME_TEMPLATE=%Y.%m.%d`
+  - optional placement and endpoint/body mapping:
+    - `ZEPHYR_CREATE_FOLDER_PARENT_ID=...`
+    - `ZEPHYR_CREATE_FOLDER_ENDPOINT=rest/tests/1.0/folder`
+    - `ZEPHYR_CREATE_FOLDER_NAME_FIELD=name`
+    - `ZEPHYR_CREATE_FOLDER_PROJECT_ID_FIELD=projectId`
+    - `ZEPHYR_CREATE_FOLDER_PARENT_ID_FIELD=parentId`
+    - `ZEPHYR_CREATE_FOLDER_BODY_JSON='{"type":"TEST_RUN"}'` (example)
+  - optional safe mode:
+    - `ZEPHYR_CREATE_FOLDER_DRY_RUN=true` (prints payload, no POST)
+  - optional scope override:
+    - `ZEPHYR_CREATE_FOLDER_USE_AS_ROOT=true` (use created/existing folder as the only root filter in current run)
+- Google Sheets daily pipeline:
+  - service account setup:
+    - create Google Cloud service account
+    - enable Google Sheets API + Google Drive API
+    - download JSON key and set `GOOGLE_SERVICE_ACCOUNT_FILE=/abs/path/key.json`
+    - share spreadsheet (or parent Drive folder) with service account email
+  - install dependencies:
+    - `pip install google-api-python-client google-auth`
+  - generate/update sheet from Zephyr folder:
+    - `ZEPHYR_GSHEET_BRANCH_NAME_TEMPLATE=%Y.%m.%d` (or set fixed `ZEPHYR_BRANCH_NAME`)
+    - `ZEPHYR_GSHEET_SPREADSHEET_ID=` (empty to auto-create)
+    - run: `bash ./run_zephyr_google_pipeline.sh generate`
+  - sync checked Pass/Fail + Comment back to Zephyr:
+    - `ZEPHYR_GSHEET_SPREADSHEET_ID=<existing_sheet_id>`
+    - run: `bash ./run_zephyr_google_pipeline.sh sync`
+  - realtime on checkbox edit:
+    - use Apps Script from `google_apps_script/Code.gs`
+    - set script properties:
+      - `ZEPHYR_BASE_URL`
+      - `ZEPHYR_API_TOKEN`
+      - optional: `RUN_SHEET_NAME` (default `Run`)
+      - optional: `UPDATE_ENDPOINT_TEMPLATE` (default `rest/tests/1.0/testresult/{test_result_id}`)
+      - optional: `UPDATE_METHOD` (default `PUT`)
+      - optional: `UPDATE_STATUS_ID_FIELD` (default `testResultStatusId`)
+      - optional: `UPDATE_COMMENT_FIELD` (default `comment`)
+    - behavior:
+      - Pass/Fail are mutually exclusive
+      - on Pass/Fail/Comment edit Apps Script reads `pass_status_id/fail_status_id` from `Config`
+      - writes status + comment directly to Zephyr API
+      - writes result to columns M:N (`sync_status`, `synced_at`)
+- new helper scripts:
+  - `zephyr_google_sheets_pipeline.py`
+    - `generate-sheet`: creates/updates Config + Run tabs with grouped daily rows
+    - `sync-sheet`: sends Pass/Fail + Comment into Zephyr update endpoint
+  - `run_zephyr_google_pipeline.sh`: environment-based launcher for both modes
 - keep `ZEPHYR_QUERY_TEMPLATE` in quotes in `.env` (contains spaces and parentheses)
 - tree-first config for 2026 folders:
   - `ZEPHYR_DISCOVERY_MODE=tree`
@@ -107,3 +164,9 @@ Windows tip (for manual session export, if needed):
   - `--date-field "some.path.to.date"`
   - `--status-field "some.path.to.status"`
 - You can pass multiple `--date-field` or `--status-field` values.
+- For Zephyr write-back endpoint tune:
+  - `ZEPHYR_GSHEET_UPDATE_ENDPOINT_TEMPLATE` (default `rest/tests/1.0/testresult/{test_result_id}`)
+  - `ZEPHYR_GSHEET_UPDATE_METHOD` (`PUT|POST|PATCH`)
+  - `ZEPHYR_GSHEET_UPDATE_STATUS_ID_FIELD` (default `testResultStatusId`)
+  - `ZEPHYR_GSHEET_UPDATE_COMMENT_FIELD` (default `comment`)
+  - `ZEPHYR_GSHEET_UPDATE_EXTRA_BODY_JSON` (optional extra JSON object)
