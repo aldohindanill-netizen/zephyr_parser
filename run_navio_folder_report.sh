@@ -97,6 +97,7 @@ CONFLUENCE_API_TOKEN="${CONFLUENCE_API_TOKEN:-}"
 CONFLUENCE_AUTH_MODE="${CONFLUENCE_AUTH_MODE:-auto}"
 CONFLUENCE_VERIFY_SSL="${CONFLUENCE_VERIFY_SSL:-true}"
 CONFLUENCE_DRY_RUN="${CONFLUENCE_DRY_RUN:-false}"
+CONFLUENCE_UPDATE_EXISTING="${CONFLUENCE_UPDATE_EXISTING:-false}"
 
 BASE_URL="$(strip_cr "$BASE_URL")"
 ENDPOINT="$(strip_cr "$ENDPOINT")"
@@ -154,10 +155,11 @@ CONFLUENCE_API_TOKEN="$(strip_cr "$CONFLUENCE_API_TOKEN")"
 CONFLUENCE_AUTH_MODE="$(normalize_bool "$(strip_cr "$CONFLUENCE_AUTH_MODE")")"
 CONFLUENCE_VERIFY_SSL="$(normalize_bool "$(strip_cr "$CONFLUENCE_VERIFY_SSL")")"
 CONFLUENCE_DRY_RUN="$(normalize_bool "$(strip_cr "$CONFLUENCE_DRY_RUN")")"
+CONFLUENCE_UPDATE_EXISTING="$(normalize_bool "$(strip_cr "$CONFLUENCE_UPDATE_EXISTING")")"
 
 : "${ZEPHYR_API_TOKEN:?Set ZEPHYR_API_TOKEN before running}"
 echo "[zephyr] Token is set via ZEPHYR_API_TOKEN"
-echo "[zephyr] Confluence: daily=${CONFLUENCE_PUBLISH_DAILY} weekly=${CONFLUENCE_PUBLISH_WEEKLY} dry_run=${CONFLUENCE_DRY_RUN} auth_mode=${CONFLUENCE_AUTH_MODE}"
+echo "[zephyr] Confluence: daily=${CONFLUENCE_PUBLISH_DAILY} weekly=${CONFLUENCE_PUBLISH_WEEKLY} dry_run=${CONFLUENCE_DRY_RUN} auth_mode=${CONFLUENCE_AUTH_MODE} update_existing=${CONFLUENCE_UPDATE_EXISTING}"
 
 if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
   echo "[zephyr] Error: Python binary '$PYTHON_BIN' was not found in PATH" >&2
@@ -327,6 +329,10 @@ fi
 
 if [[ "$CONFLUENCE_DRY_RUN" == "true" ]]; then
   cmd+=(--confluence-dry-run)
+fi
+
+if [[ "$CONFLUENCE_UPDATE_EXISTING" == "true" ]]; then
+  cmd+=(--confluence-update-existing)
 fi
 
 if [[ -n "$FOLDER_PATH_REGEX" ]]; then

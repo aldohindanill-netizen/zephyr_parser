@@ -92,6 +92,7 @@ Outputs:
   - optional:
     - `CONFLUENCE_VERIFY_SSL=true|false`
     - `CONFLUENCE_DRY_RUN=true|false` (prints intended actions without API calls)
+    - `CONFLUENCE_UPDATE_EXISTING=true|false` (when true, existing pages with same title are updated instead of skipped)
   - title format used for new pages:
     - daily: `Daily report: nightly-dev-<slug(folder_name)>_<most_popular_step_execution_date>_<folder_id>`
     - weekly: `Weekly cycle matrix: <week_start>`

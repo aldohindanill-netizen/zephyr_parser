@@ -83,6 +83,7 @@ $ConfluenceApiToken = if ($env:CONFLUENCE_API_TOKEN) { $env:CONFLUENCE_API_TOKEN
 $ConfluenceAuthMode = if ($env:CONFLUENCE_AUTH_MODE) { $env:CONFLUENCE_AUTH_MODE.ToLowerInvariant() } else { "auto" }
 $ConfluenceVerifySsl = if ($env:CONFLUENCE_VERIFY_SSL) { $env:CONFLUENCE_VERIFY_SSL } else { "true" }
 $ConfluenceDryRun = if ($env:CONFLUENCE_DRY_RUN) { $env:CONFLUENCE_DRY_RUN } else { "false" }
+$ConfluenceUpdateExisting = if ($env:CONFLUENCE_UPDATE_EXISTING) { $env:CONFLUENCE_UPDATE_EXISTING } else { "false" }
 
 if (-not $env:ZEPHYR_API_TOKEN) {
     throw "Set ZEPHYR_API_TOKEN environment variable before running."
@@ -208,6 +209,10 @@ if ($ConfluenceVerifySsl -in @("true", "false")) {
 
 if ($ConfluenceDryRun -eq "true") {
     $ArgsList += "--confluence-dry-run"
+}
+
+if ($ConfluenceUpdateExisting -eq "true") {
+    $ArgsList += "--confluence-update-existing"
 }
 
 if ($env:ZEPHYR_EXTRA_PARAMS) {

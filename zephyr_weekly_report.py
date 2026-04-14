@@ -85,6 +85,7 @@ class ConfluenceConfig:
     auth_mode: str = "auto"
     verify_ssl: bool = True
     dry_run: bool = False
+    update_existing: bool = False
 
 
 def parse_args() -> argparse.Namespace:
@@ -427,6 +428,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Print Confluence actions but do not send API requests.",
     )
+    parser.add_argument(
+        "--confluence-update-existing",
+        action="store_true",
+        help="Update existing Confluence pages with the same title instead of skipping.",
+    )
     return parser.parse_args()
 
 
@@ -659,12 +665,12 @@ def _confluence_title_from_report_path(path: str) -> str:
     return stem.replace("_", " ")
 
 
-def _confluence_page_exists(
+def _confluence_find_page(
     content_url: str,
     cfg: ConfluenceConfig,
     headers: dict[str, str],
     title: str,
-) -> bool:
+) -> tuple[str, int] | None:
     payload = request_json_absolute_url(
         content_url,
         headers=headers,
@@ -673,9 +679,23 @@ def _confluence_page_exists(
         verify_ssl=cfg.verify_ssl,
     )
     if not isinstance(payload, dict):
-        return False
+        return None
     results = payload.get("results")
-    return isinstance(results, list) and len(results) > 0
+    if not isinstance(results, list) or not results:
+        return None
+    first = results[0]
+    if not isinstance(first, dict):
+        return None
+    page_id = str(first.get("id") or "").strip()
+    version = first.get("version")
+    version_number = 0
+    if isinstance(version, dict):
+        raw_number = version.get("number")
+        if isinstance(raw_number, int):
+            version_number = raw_number
+    if not page_id:
+        return None
+    return page_id, version_number
 
 
 def publish_html_report_to_confluence(path: str, cfg: ConfluenceConfig) -> str:
@@ -684,15 +704,36 @@ def publish_html_report_to_confluence(path: str, cfg: ConfluenceConfig) -> str:
     title = _confluence_title_from_report_path(path)
     storage_html = _extract_html_body_for_confluence(report_html)
     if cfg.dry_run:
-        return f"DRY-RUN create page '{title}' from {path}"
+        action = "upsert" if cfg.update_existing else "create"
+        return f"DRY-RUN {action} page '{title}' from {path}"
     candidate_urls = _confluence_content_api_candidates(cfg.base_url)
     auth_headers_candidates = _build_confluence_auth_headers_candidates(cfg)
     last_error: Exception | None = None
     for headers in auth_headers_candidates:
         for content_url in candidate_urls:
             try:
-                if _confluence_page_exists(content_url, cfg, headers, title):
-                    return f"SKIP already exists '{title}'"
+                existing = _confluence_find_page(content_url, cfg, headers, title)
+                if existing:
+                    if not cfg.update_existing:
+                        return f"SKIP already exists '{title}'"
+                    page_id, current_version = existing
+                    update_payload = {
+                        "id": page_id,
+                        "type": "page",
+                        "title": title,
+                        "version": {"number": max(current_version, 0) + 1},
+                        "body": {
+                            "storage": {"value": storage_html, "representation": "storage"}
+                        },
+                    }
+                    request_json_absolute_url(
+                        f"{content_url.rstrip('/')}/{page_id}",
+                        headers=headers,
+                        method="PUT",
+                        body=update_payload,
+                        verify_ssl=cfg.verify_ssl,
+                    )
+                    return f"UPDATED '{title}'"
                 payload = {
                     "type": "page",
                     "title": title,
@@ -733,6 +774,8 @@ def load_confluence_config(args: argparse.Namespace) -> ConfluenceConfig:
     verify_ssl = _parse_bool_value(verify_ssl_raw, default=True)
     dry_run_env = _parse_bool_value(os.getenv("CONFLUENCE_DRY_RUN"), default=False)
     dry_run = bool(args.confluence_dry_run) or dry_run_env
+    update_existing_env = _parse_bool_value(os.getenv("CONFLUENCE_UPDATE_EXISTING"), default=False)
+    update_existing = bool(args.confluence_update_existing) or update_existing_env
     if not base_url:
         raise ValueError("Missing Confluence base URL. Set --confluence-base-url or CONFLUENCE_BASE_URL.")
     if not space_key:
@@ -758,6 +801,7 @@ def load_confluence_config(args: argparse.Namespace) -> ConfluenceConfig:
         auth_mode=auth_mode,
         verify_ssl=verify_ssl,
         dry_run=dry_run,
+        update_existing=update_existing,
     )
 
 
@@ -2446,7 +2490,27 @@ def _status_badge_html(status: str) -> str:
         "false positive": "st-false-positive",
     }
     cls = status_to_class.get(normalized, "st-unknown")
-    return f"<span class='status-badge {cls}'>{html.escape(status or '')}</span>"
+    class_to_inline_style = {
+        "st-pass": "background:#33c24d;color:#ffffff;",
+        "st-fail": "background:#e53935;color:#ffffff;",
+        "st-not-executed": "background:#c9c9c2;color:#2f2f2f;",
+        "st-in-progress": "background:#f0ad4e;color:#2f2f2f;",
+        "st-blocked": "background:#4a90e2;color:#ffffff;",
+        "st-cant-test": "background:#9c27ff;color:#ffffff;",
+        "st-not-tested-pi": "background:#8d7cc3;color:#ffffff;",
+        "st-danger": "background:#4f6078;color:#ffffff;",
+        "st-cant-reproduce": "background:#f08f78;color:#2f2f2f;",
+        "st-false-positive": "background:#ecd96b;color:#2f2f2f;",
+        "st-unknown": "background:#f4f5f7;color:#172b4d;",
+    }
+    inline_style = class_to_inline_style.get(cls, class_to_inline_style["st-unknown"])
+    return (
+        "<span "
+        f"class='status-badge {cls}' "
+        "style='display:inline-block;padding:2px 8px;border-radius:10px;"
+        "font-size:12px;font-weight:700;line-height:1.4;"
+        f"{inline_style}'>{html.escape(status or '')}</span>"
+    )
 
 
 def _render_cycle_info_html(cycle: dict[str, Any]) -> str:
@@ -3457,7 +3521,8 @@ def main() -> int:
                 f"daily={publish_confluence_daily} "
                 f"weekly={publish_confluence_weekly} "
                 f"dry_run={confluence_cfg.dry_run} "
-                f"auth_mode={confluence_cfg.auth_mode}"
+                f"auth_mode={confluence_cfg.auth_mode} "
+                f"update_existing={confluence_cfg.update_existing}"
             )
 
         if args.discover_folders:
