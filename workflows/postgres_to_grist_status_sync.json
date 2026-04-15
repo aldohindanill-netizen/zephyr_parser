@@ -1,0 +1,172 @@
+{
+  "name": "postgres_to_grist_status_sync",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 1
+            }
+          ]
+        }
+      },
+      "id": "Cron_15m",
+      "name": "Cron_15m",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        120,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT folder_id, grist_doc_id, COALESCE(grist_table_id, 'Table1') AS grist_table_id FROM grist_folder_docs WHERE grist_doc_id IS NOT NULL AND grist_doc_id <> '';",
+        "options": {}
+      },
+      "id": "Load_Doc_Map_Postgres",
+      "name": "Load_Doc_Map_Postgres",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        360,
+        300
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "PostgresZephyrOps",
+          "name": "PostgresZephyrOps"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "={{ `SELECT '${$json.folder_id}' AS folder_id, '${$json.grist_doc_id}' AS grist_doc_id, '${$json.grist_table_id}' AS grist_table_id, ru.run_name AS cycle_name, tr.test_case_name, COALESCE(tr.desired_status_id, '') AS desired_status_id, COALESCE(tr.desired_comment, '') AS desired_comment FROM test_results tr JOIN test_runs ru ON ru.test_run_id = tr.test_run_id WHERE ru.folder_id = '${$json.folder_id}' ORDER BY ru.run_name, tr.test_case_name;` }}",
+        "options": {}
+      },
+      "id": "Load_Folder_Status_Postgres",
+      "name": "Load_Folder_Status_Postgres",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        610,
+        300
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "PostgresZephyrOps",
+          "name": "PostgresZephyrOps"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "if (!items.length) return [];\nconst base = items[0].json || {};\nconst PASS_STATUS_ID = '145';\nconst FAIL_STATUS_ID = '146';\n\nconst records = items.map((item) => {\n  const row = item.json || {};\n  const statusId = String(row.desired_status_id || '').trim();\n  const done = statusId === PASS_STATUS_ID;\n  const notDone = statusId === FAIL_STATUS_ID;\n\n  return {\n    require: {\n      A: String(row.cycle_name || ''),\n      B: String(row.test_case_name || '')\n    },\n    fields: {\n      D: done,\n      E: notDone,\n      F: String(row.desired_comment || '')\n    }\n  };\n}).filter((r) => r.require.A && r.require.B);\n\nif (!records.length) return [];\nreturn [{json: {\n  folder_id: base.folder_id,\n  grist_doc_id: base.grist_doc_id,\n  grist_table_id: base.grist_table_id || 'Table1',\n  request_body: { records }\n}}];"
+      },
+      "id": "Build_Grist_Status_Upsert",
+      "name": "Build_Grist_Status_Upsert",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        860,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "PUT",
+        "url": "={{`${$env.GRIST_API_URL}/docs/${$json.grist_doc_id}/tables/${$json.grist_table_id}/records`}}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "={{'Bearer ' + $env.GRIST_API_TOKEN}}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{$json.request_body}}",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "json"
+            }
+          }
+        }
+      },
+      "id": "Upsert_Grist_Status",
+      "name": "Upsert_Grist_Status",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1110,
+        300
+      ],
+      "continueOnFail": true
+    }
+  ],
+  "connections": {
+    "Cron_15m": {
+      "main": [
+        [
+          {
+            "node": "Load_Doc_Map_Postgres",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load_Doc_Map_Postgres": {
+      "main": [
+        [
+          {
+            "node": "Load_Folder_Status_Postgres",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load_Folder_Status_Postgres": {
+      "main": [
+        [
+          {
+            "node": "Build_Grist_Status_Upsert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build_Grist_Status_Upsert": {
+      "main": [
+        [
+          {
+            "node": "Upsert_Grist_Status",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "6f5f88f7-8b6f-4b85-b521-d5f96a95f3a9",
+  "id": "postgres_to_grist_status_sync",
+  "tags": []
+}

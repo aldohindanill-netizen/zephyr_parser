@@ -2,7 +2,8 @@
 """Generate a weekly Zephyr test execution summary.
 
 The script fetches paginated execution data from a Zephyr API endpoint,
-normalizes statuses, aggregates by ISO week (Monday start), and exports CSV.
+aggregates executions by ISO week (Monday start) using raw API statuses,
+and computes normalized pass rate for reporting.
 """
 
 from __future__ import annotations
@@ -40,29 +41,6 @@ DEFAULT_STATUS_FIELDS = [
     "executionStatus",
     "result",
 ]
-
-
-@dataclass
-class WeeklyStat:
-    total: int = 0
-    passed: int = 0
-    failed: int = 0
-    blocked: int = 0
-    not_executed: int = 0
-    other: int = 0
-
-    def to_row(self, week_start: date) -> list[str]:
-        pass_rate = (self.passed / self.total * 100.0) if self.total else 0.0
-        return [
-            week_start.isoformat(),
-            str(self.total),
-            str(self.passed),
-            str(self.failed),
-            str(self.blocked),
-            str(self.not_executed),
-            str(self.other),
-            f"{pass_rate:.2f}",
-        ]
 
 
 @dataclass
@@ -1139,7 +1117,7 @@ def aggregate_by_folder_from_executions(
     resolved_folder_names: dict[str, str] | None = None,
     folder_path_pattern: re.Pattern[str] | None = None,
     resolved_folder_paths: dict[str, str] | None = None,
-) -> tuple[list[tuple[FolderNode, dict[date, WeeklyStat]]], Counter]:
+) -> tuple[list[tuple[FolderNode, dict[date, Counter[str]]]], Counter]:
     grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
     names: dict[str, str] = {}
     stats = Counter()
@@ -1158,7 +1136,7 @@ def aggregate_by_folder_from_executions(
         grouped[folder_id].append(item)
         names.setdefault(folder_id, folder_name or f"folder_{folder_id}")
 
-    rows: list[tuple[FolderNode, dict[date, WeeklyStat]]] = []
+    rows: list[tuple[FolderNode, dict[date, Counter[str]]]] = []
     for folder_id in sorted(grouped.keys()):
         effective_folder_name = (
             (resolved_folder_names or {}).get(folder_id) or names[folder_id]
@@ -1721,8 +1699,8 @@ def aggregate_weekly(
     status_fields: list[str],
     from_date: date | None,
     to_date: date | None,
-) -> tuple[dict[date, WeeklyStat], Counter]:
-    per_week: dict[date, WeeklyStat] = defaultdict(WeeklyStat)
+) -> tuple[dict[date, Counter[str]], Counter]:
+    per_week: dict[date, Counter[str]] = defaultdict(Counter)
     skipped = Counter()
 
     for item in items:
@@ -1743,44 +1721,52 @@ def aggregate_weekly(
             continue
 
         raw_status = extract_first_str(item, status_fields)
-        status = normalize_status(raw_status)
-
-        bucket = per_week[week_start(execution_day)]
-        bucket.total += 1
-        if status == "passed":
-            bucket.passed += 1
-        elif status == "failed":
-            bucket.failed += 1
-        elif status == "blocked":
-            bucket.blocked += 1
-        elif status == "not_executed":
-            bucket.not_executed += 1
-        else:
-            bucket.other += 1
+        status_label = raw_status if raw_status else "(no status)"
+        per_week[week_start(execution_day)][status_label] += 1
 
     return per_week, skipped
 
 
-def write_csv(path: str, weekly: dict[date, WeeklyStat]) -> None:
-    header = [
-        "week_start",
-        "total",
-        "passed",
-        "failed",
-        "blocked",
-        "not_executed",
-        "other",
-        "pass_rate_pct",
-    ]
+def week_total(counter: Counter[str]) -> int:
+    return int(sum(counter.values()))
+
+
+def pass_count_for_week(counter: Counter[str]) -> int:
+    return sum(
+        count for status_label, count in counter.items() if normalize_status(status_label) == "passed"
+    )
+
+
+def all_status_labels(weekly: dict[date, Counter[str]]) -> list[str]:
+    labels: set[str] = set()
+    for counter in weekly.values():
+        labels.update(counter.keys())
+    return sorted(labels, key=str.lower)
+
+
+def write_csv(path: str, weekly: dict[date, Counter[str]]) -> None:
+    labels = all_status_labels(weekly)
+    header = ["week_start", "total", *labels, "pass_rate_pct"]
     with open(path, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow(header)
         for week in sorted(weekly.keys()):
-            writer.writerow(weekly[week].to_row(week))
+            counter = weekly[week]
+            total = week_total(counter)
+            passed = pass_count_for_week(counter)
+            pass_rate = (passed / total * 100.0) if total else 0.0
+            writer.writerow(
+                [
+                    week.isoformat(),
+                    str(total),
+                    *[str(counter.get(label, 0)) for label in labels],
+                    f"{pass_rate:.2f}",
+                ]
+            )
 
 
 def write_folder_summary_csv(
-    path: str, folder_rows: list[tuple[FolderNode, dict[date, WeeklyStat]]]
+    path: str, folder_rows: list[tuple[FolderNode, dict[date, Counter[str]]]]
 ) -> None:
     header = [
         "folder_id",
@@ -1799,8 +1785,30 @@ def write_folder_summary_csv(
         writer.writerow(header)
         for folder, weekly in folder_rows:
             for week in sorted(weekly.keys()):
-                stat = weekly[week]
-                row = stat.to_row(week)
+                counter = weekly[week]
+                total = week_total(counter)
+                normalized = Counter(normalize_status(status) for status in counter.elements())
+                pass_rate = (
+                    normalized["passed"] / total * 100.0
+                    if total
+                    else 0.0
+                )
+                row = [
+                    week.isoformat(),
+                    str(total),
+                    str(normalized["passed"]),
+                    str(normalized["failed"]),
+                    str(normalized["blocked"]),
+                    str(normalized["not_executed"]),
+                    str(
+                        total
+                        - normalized["passed"]
+                        - normalized["failed"]
+                        - normalized["blocked"]
+                        - normalized["not_executed"]
+                    ),
+                    f"{pass_rate:.2f}",
+                ]
                 writer.writerow([folder.folder_id, folder.folder_name, *row])
 
 
@@ -2356,49 +2364,32 @@ def write_daily_readable_reports(
     return written
 
 
-def print_table(weekly: dict[date, WeeklyStat]) -> None:
+def print_readable_report(weekly: dict[date, Counter[str]]) -> None:
     if not weekly:
         print("No executions found for selected filters.")
         return
 
-    columns = [
-        "week_start",
-        "total",
-        "passed",
-        "failed",
-        "blocked",
-        "not_exec",
-        "other",
-        "pass_rate%",
-    ]
-    rows = []
+    total_counter: Counter[str] = Counter()
     for week in sorted(weekly.keys()):
-        stat = weekly[week]
-        pass_rate = (stat.passed / stat.total * 100.0) if stat.total else 0.0
-        rows.append(
-            [
-                week.isoformat(),
-                str(stat.total),
-                str(stat.passed),
-                str(stat.failed),
-                str(stat.blocked),
-                str(stat.not_executed),
-                str(stat.other),
-                f"{pass_rate:.2f}",
-            ]
-        )
+        counter = weekly[week]
+        total_counter.update(counter)
+        total = week_total(counter)
+        passed = pass_count_for_week(counter)
+        pass_rate = (passed / total * 100.0) if total else 0.0
+        print("-" * 60)
+        print(f"Week: {week.isoformat()} | Total: {total}")
+        for status_label, count in sorted(counter.items(), key=lambda item: (-item[1], item[0].lower())):
+            print(f"  {status_label}: {count}")
+        print(f"  pass_rate (normalized): {pass_rate:.2f}%")
 
-    widths = [len(c) for c in columns]
-    for row in rows:
-        for i, value in enumerate(row):
-            widths[i] = max(widths[i], len(value))
-
-    fmt = " | ".join("{:<" + str(w) + "}" for w in widths)
-    separator = "-+-".join("-" * w for w in widths)
-    print(fmt.format(*columns))
-    print(separator)
-    for row in rows:
-        print(fmt.format(*row))
+    grand_total = week_total(total_counter)
+    print("-" * 60)
+    print("Totals across all weeks:")
+    for status_label, count in sorted(
+        total_counter.items(), key=lambda item: (-item[1], item[0].lower())
+    ):
+        print(f"  {status_label}: {count}")
+    print(f"Grand total: {grand_total}")
 
 
 def main() -> int:
@@ -2452,7 +2443,7 @@ def main() -> int:
             )
 
         if args.discover_folders:
-            folder_rows: list[tuple[FolderNode, dict[date, WeeklyStat]]] = []
+            folder_rows: list[tuple[FolderNode, dict[date, Counter[str]]]] = []
             cycles_cases_rows: list[list[str]] = []
             case_steps_rows: list[list[str]] = []
             need_cycles_cases_data = args.export_cycles_cases or args.export_daily_readable
@@ -2735,7 +2726,7 @@ def main() -> int:
         )
 
         write_csv(args.output, weekly)
-        print_table(weekly)
+        print_readable_report(weekly)
         print(f"\nSaved CSV: {args.output}")
         print(f"Fetched executions: {len(executions)}")
         if skipped:

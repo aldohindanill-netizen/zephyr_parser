@@ -1,0 +1,744 @@
+{
+  "name": "grist_to_postgres_sync",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 1
+            }
+          ]
+        }
+      },
+      "id": "Cron_15m",
+      "name": "Cron_15m",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        120,
+        320
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "={{ `WITH cfg AS ( SELECT NULLIF('${$env.GRIST_ZEPHYR_PARENT_FOLDER_ID || ''}', '') AS root_id ), root AS ( SELECT f.folder_path FROM folders f, cfg WHERE f.folder_id = cfg.root_id ) SELECT f.folder_id, f.folder_name, f.folder_path, m.grist_doc_id, COALESCE(m.grist_table_id, 'Table1') AS grist_table_id FROM folders f LEFT JOIN grist_folder_docs m ON m.folder_id = f.folder_id WHERE EXISTS (SELECT 1 FROM test_runs r WHERE r.folder_id = f.folder_id) AND ( (SELECT root_id FROM cfg) IS NULL OR ( (SELECT folder_path FROM root) IS NOT NULL AND f.folder_path LIKE ((SELECT folder_path FROM root) || '/%') ) ) ORDER BY f.folder_name;` }}",
+        "options": {}
+      },
+      "id": "Load_Folders_With_Map",
+      "name": "Load_Folders_With_Map",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        360,
+        320
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "PostgresZephyrOps",
+          "name": "PostgresZephyrOps"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "return items.map((item) => {\n  const row = item.json || {};\n  const folderId = String(row.folder_id || '').trim();\n  const folderName = String(row.folder_name || folderId || 'folder').trim();\n  const slug = folderName\n    .toLowerCase()\n    .replace(/[^a-z0-9а-яё]+/gi, '-')\n    .replace(/^-+|-+$/g, '')\n    .slice(0, 48) || folderId;\n  const tableId = String(row.grist_table_id || 'Table1').trim() || 'Table1';\n  const docName = `zephyr_${folderId}_${slug}`;\n  return {\n    json: {\n      folder_id: folderId,\n      folder_name: folderName,\n      folder_path: String(row.folder_path || ''),\n      grist_doc_id: row.grist_doc_id ? String(row.grist_doc_id) : '',\n      grist_table_id: tableId,\n      grist_doc_name: docName\n    }\n  };\n}).filter((item) => item.json.folder_id);"
+      },
+      "id": "Prepare_Folder_Jobs",
+      "name": "Prepare_Folder_Jobs",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        600,
+        320
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "boolean": [
+            {
+              "value1": "={{ !!$json.grist_doc_id && $json.grist_doc_id !== 'null' && $json.grist_doc_id !== 'undefined' }}",
+              "operation": "true"
+            }
+          ]
+        }
+      },
+      "id": "Has_Grist_Doc",
+      "name": "Has_Grist_Doc",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        820,
+        320
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "return items.map((item) => ({ json: { ...item.json } })).filter((item) => {\n  const id = String(item.json.grist_doc_id || '').trim().toLowerCase();\n  return id && id !== 'null' && id !== 'undefined';\n});"
+      },
+      "id": "Keep_Existing_Doc_Map_Row",
+      "name": "Keep_Existing_Doc_Map_Row",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1040,
+        220
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "return items.map((item) => ({\n  json: {\n    ...item.json,\n    request_url: $env.GRIST_PARENT_WORKSPACE_ID\n      ? `${$env.GRIST_API_URL}/workspaces/${$env.GRIST_PARENT_WORKSPACE_ID}/docs`\n      : `${$env.GRIST_API_URL}/docs`,\n    request_body: { name: item.json.grist_doc_name }\n  }\n})).filter((item) => {\n  const id = String(item.json.grist_doc_id || '').trim().toLowerCase();\n  return !id || id === 'null' || id === 'undefined';\n});"
+      },
+      "id": "Build_Create_Doc_Request",
+      "name": "Build_Create_Doc_Request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1040,
+        420
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{$json.request_url}}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "={{'Bearer ' + $env.GRIST_API_TOKEN}}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{$json.request_body}}",
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "responseFormat": "text"
+            }
+          }
+        }
+      },
+      "id": "Create_Grist_Doc",
+      "name": "Create_Grist_Doc",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1260,
+        420
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const src = $items('Build_Create_Doc_Request', 0, 0);\nreturn items.map((item, idx) => {\n  const base = (src[idx] && src[idx].json) ? src[idx].json : {};\n  const response = item.json || {};\n  const body = typeof response === 'string'\n    ? response\n    : (typeof response.body === 'string' ? response.body : response.body || response);\n  let docId = '';\n  if (typeof body === 'string') {\n    const trimmed = body.trim();\n    if (trimmed.startsWith('{') || trimmed.startsWith('[')) {\n      try {\n        const parsed = JSON.parse(trimmed);\n        docId = String(parsed.id || parsed.docId || parsed.documentId || parsed?.doc?.id || parsed?.data?.id || parsed.data || '').trim();\n      } catch (e) {\n        docId = trimmed.replace(/^\\\"|\\\"$/g, '').trim();\n      }\n    } else {\n      docId = trimmed.replace(/^\\\"|\\\"$/g, '').trim();\n    }\n  } else if (body && typeof body === 'object') {\n    docId = String(body.id || body.docId || body.documentId || body?.doc?.id || body?.data?.id || body.data || '').trim();\n  }\n  if (!docId || docId.toLowerCase() === 'undefined' || docId.toLowerCase() === 'null') {\n    throw new Error(`Failed to create Grist doc for folder ${base.folder_id || 'unknown'}`);\n  }\n  return { json: {\n    ...base,\n    grist_doc_id: docId\n  }};\n});"
+      },
+      "id": "Build_New_Doc_Map_Row",
+      "name": "Build_New_Doc_Map_Row",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1480,
+        420
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{`${$env.GRIST_API_URL}/docs/${$json.grist_doc_id}/tables`}}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "={{'Bearer ' + $env.GRIST_API_TOKEN}}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ { tables: [ { id: $json.grist_table_id } ] } }}",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "json"
+            }
+          }
+        }
+      },
+      "id": "Ensure_Grist_Table",
+      "name": "Ensure_Grist_Table",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1710,
+        320
+      ],
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{`${$env.GRIST_API_URL}/docs/${$json.grist_doc_id}/tables/${$json.grist_table_id}/columns`}}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "={{'Bearer ' + $env.GRIST_API_TOKEN}}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ { columns: [ { id: 'D', fields: { type: 'Bool' } } ] } }}",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "json"
+            }
+          }
+        }
+      },
+      "id": "Ensure_Grist_Columns",
+      "name": "Ensure_Grist_Columns",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1930,
+        320
+      ],
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "jsCode": "const esc = (v) => v === null || v === undefined ? 'NULL' : `'${String(v).replace(/'/g, \"''\")}'`;\nreturn items.map((item) => {\n  const row = item.json || {};\n  const folderId = String(row.folder_id || '').trim();\n  const docId = String(row.grist_doc_id || '').trim();\n  const tableId = String(row.grist_table_id || 'Table1').trim() || 'Table1';\n  const docName = String(row.grist_doc_name || '');\n  if (!folderId || !docId || docId.toLowerCase() === 'undefined' || docId.toLowerCase() === 'null') {\n    return null;\n  }\n  const docUrl = `${$env.GRIST_DOCS_BASE_URL || 'https://docs.getgrist.com'}/${docId}`;\n  const sql = `\n    INSERT INTO grist_folder_docs (folder_id, grist_doc_id, grist_table_id, grist_doc_name, grist_doc_url, last_synced_at, updated_at)\n    VALUES (${esc(folderId)}, ${esc(docId)}, ${esc(tableId)}, ${esc(docName)}, ${esc(docUrl)}, NOW(), NOW())\n    ON CONFLICT (folder_id) DO UPDATE SET\n      grist_doc_id = EXCLUDED.grist_doc_id,\n      grist_table_id = EXCLUDED.grist_table_id,\n      grist_doc_name = EXCLUDED.grist_doc_name,\n      grist_doc_url = EXCLUDED.grist_doc_url,\n      last_synced_at = NOW(),\n      updated_at = NOW();\n  `;\n  return { json: { ...row, folder_id: folderId, grist_doc_id: docId, grist_table_id: tableId, sql_query: sql } };\n}).filter((item) => item !== null);"
+      },
+      "id": "Build_Save_Doc_Map_SQL",
+      "name": "Build_Save_Doc_Map_SQL",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2150,
+        320
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "={{$json.sql_query}}",
+        "options": {}
+      },
+      "id": "Save_Doc_Map_Postgres",
+      "name": "Save_Doc_Map_Postgres",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        2370,
+        320
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "PostgresZephyrOps",
+          "name": "PostgresZephyrOps"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "={{ `SELECT '${$json.grist_doc_id}' AS grist_doc_id, '${$json.grist_table_id}' AS grist_table_id, ru.folder_id, ru.run_name AS cycle_name, tr.test_case_name, tr.test_result_id, ''::text AS objective, COALESCE(tr.desired_status_id, '') AS desired_status_id, COALESCE(tr.desired_comment, '') AS desired_comment FROM test_results tr JOIN test_runs ru ON ru.test_run_id = tr.test_run_id WHERE ru.folder_id = '${$json.folder_id}' ORDER BY ru.run_name, tr.test_case_name;` }}",
+        "options": {}
+      },
+      "id": "Load_Folder_Cases_Postgres",
+      "name": "Load_Folder_Cases_Postgres",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        2590,
+        320
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "PostgresZephyrOps",
+          "name": "PostgresZephyrOps"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const grouped = new Map();\nfor (const item of items) {\n  const row = item.json || {};\n  const cycle = String(row.cycle_name || '').trim();\n  const tc = String(row.test_case_name || '').trim();\n  const docId = String(row.grist_doc_id || '').trim();\n  const tableId = String(row.grist_table_id || 'Table1').trim() || 'Table1';\n  const folderId = String(row.folder_id || '').trim();\n  if (!cycle || !tc || !docId || !folderId) continue;\n\n  const groupKey = `${folderId}::${docId}::${tableId}`;\n  if (!grouped.has(groupKey)) {\n    grouped.set(groupKey, {\n      folder_id: folderId,\n      grist_doc_id: docId,\n      grist_table_id: tableId,\n      byKey: new Map()\n    });\n  }\n\n  const recordKey = `${cycle}::${tc}`;\n  const trid = String(row.test_result_id || '').trim();\n  const objective = String(row.objective || '').trim();\n  const objectiveWithId = trid ? `TRID:${trid}${objective ? ' | ' + objective : ''}` : objective;\n  grouped.get(groupKey).byKey.set(recordKey, {\n    require: { A: cycle, B: tc },\n    fields: {\n      A: cycle,\n      B: tc,\n      C: objectiveWithId\n    }\n  });\n}\n\nconst out = [];\nfor (const group of grouped.values()) {\n  const records = Array.from(group.byKey.values());\n  if (!records.length) continue;\n  out.push({\n    json: {\n      folder_id: group.folder_id,\n      grist_doc_id: group.grist_doc_id,\n      grist_table_id: group.grist_table_id,\n      request_body: { records }\n    }\n  });\n}\nreturn out;"
+      },
+      "id": "Build_Grist_Rows_Upsert",
+      "name": "Build_Grist_Rows_Upsert",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2810,
+        320
+      ]
+    },
+    {
+      "parameters": {
+        "method": "PUT",
+        "url": "={{`${$env.GRIST_API_URL}/docs/${$json.grist_doc_id}/tables/${$json.grist_table_id}/records`}}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "={{'Bearer ' + $env.GRIST_API_TOKEN}}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{$json.request_body}}",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "json"
+            }
+          }
+        }
+      },
+      "id": "Upsert_Grist_Rows",
+      "name": "Upsert_Grist_Rows",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        3030,
+        320
+      ],
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{`${$env.GRIST_API_URL}/docs/${$json.grist_doc_id}/tables/${$json.grist_table_id}/records?limit=5000`}}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "={{'Bearer ' + $env.GRIST_API_TOKEN}}"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "json"
+            }
+          }
+        }
+      },
+      "id": "Fetch_Grist_Records",
+      "name": "Fetch_Grist_Records",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        3250,
+        320
+      ],
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "jsCode": "const srcItems = $items('Build_Grist_Rows_Upsert', 0, 0);\nconst out = [];\nconst skipped = {\n  missing_keys: 0,\n  both_checked: 0,\n  neither_checked: 0\n};\n\nconst toBool = (value) => {\n  if (value === true || value === 1) return true;\n  if (value === false || value === 0 || value === null || value === undefined) return false;\n  const normalized = String(value).trim().toLowerCase();\n  if (['true', '1', 'yes', 'y', 'on'].includes(normalized)) return true;\n  if (['false', '0', 'no', 'n', 'off', ''].includes(normalized)) return false;\n  return false;\n};\n\nfor (let idx = 0; idx < items.length; idx += 1) {\n  const src = (srcItems[idx] && srcItems[idx].json) ? srcItems[idx].json : {};\n  const payload = items[idx].json || {};\n  const records = Array.isArray(payload.records) ? payload.records : [];\n  for (const rec of records) {\n    const f = rec.fields || {};\n    const cycle = String(f.A || '').trim();\n    const tc = String(f.B || '').trim();\n    const comment = String(f.F || '');\n    const objectiveCell = String(f.C || '');\n    const tridMatch = objectiveCell.match(/TRID:(\\\\d+)/);\n    const testResultId = tridMatch ? tridMatch[1] : '';\n    const done = toBool(f.D);\n    const notDone = toBool(f.E);\n\n    if (!cycle || !tc) {\n      skipped.missing_keys += 1;\n      continue;\n    }\n\n    if (done && notDone) {\n      skipped.both_checked += 1;\n      continue;\n    }\n\n    if (!done && !notDone) {\n      skipped.neither_checked += 1;\n      continue;\n    }\n\n    out.push({ json: {\n      folder_id: String(src.folder_id || ''),\n      cycle_name: cycle,\n      test_case_name: tc,\n      test_result_id: testResultId,\n      desired_status_id: done ? '145' : '146',\n      desired_comment: comment\n    }});\n  }\n}\n\nif (skipped.missing_keys || skipped.both_checked || skipped.neither_checked) {\n  console.log('[Extract_Operator_Decisions] skipped records', skipped);\n}\n\nreturn out;"
+      },
+      "id": "Extract_Operator_Decisions",
+      "name": "Extract_Operator_Decisions",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3470,
+        320
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const esc = (v) => v === null || v === undefined ? 'NULL' : `'${String(v).replace(/'/g, \"''\")}'`;\nreturn items.map((item) => {\n  const row = item.json || {};\n  const byId = String(row.test_result_id || '').trim();\n  const whereClause = byId\n    ? `tr.test_result_id = ${esc(byId)}`\n    : `ru.test_run_id = tr.test_run_id AND ru.folder_id = ${esc(row.folder_id)} AND ru.run_name = ${esc(row.cycle_name)} AND tr.test_case_name = ${esc(row.test_case_name)}`;\n  const fromClause = byId ? '' : 'FROM test_runs ru';\n  const sql = `\n    UPDATE test_results tr\n    SET desired_status_id = ${esc(row.desired_status_id)},\n        desired_comment = ${esc(row.desired_comment || '')},\n        updated_at = NOW()\n    ${fromClause}\n    WHERE ${whereClause}\n      AND (tr.desired_status_id IS DISTINCT FROM ${esc(row.desired_status_id)}\n           OR tr.desired_comment IS DISTINCT FROM ${esc(row.desired_comment || '')});\n  `;\n  return { json: { ...row, sql_query: sql } };\n});"
+      },
+      "id": "Build_Decision_SQL",
+      "name": "Build_Decision_SQL",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3690,
+        320
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "={{$json.sql_query}}",
+        "options": {}
+      },
+      "id": "Apply_Decisions_Postgres",
+      "name": "Apply_Decisions_Postgres",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        3910,
+        320
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "PostgresZephyrOps",
+          "name": "PostgresZephyrOps"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{`${$env.GRIST_API_URL}/docs/${$json.grist_doc_id}/tables/${$json.grist_table_id}/columns`}}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "={{'Bearer ' + $env.GRIST_API_TOKEN}}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ { columns: [ { id: 'E', fields: { type: 'Bool' } } ] } }}",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "json"
+            }
+          }
+        }
+      },
+      "id": "Ensure_Grist_Column_E",
+      "name": "Ensure_Grist_Column_E",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2040,
+        320
+      ],
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{`${$env.GRIST_API_URL}/docs/${$json.grist_doc_id}/tables/${$json.grist_table_id}/columns`}}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "={{'Bearer ' + $env.GRIST_API_TOKEN}}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ { columns: [ { id: 'F', fields: { type: 'Text' } } ] } }}",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "json"
+            }
+          }
+        }
+      },
+      "id": "Ensure_Grist_Column_F",
+      "name": "Ensure_Grist_Column_F",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2150,
+        320
+      ],
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "jsCode": "const srcItems = $items('Build_Save_Doc_Map_SQL', 0, 0);\nreturn items.map((item, idx) => {\n  const src = (srcItems[idx] && srcItems[idx].json) ? srcItems[idx].json : {};\n  return {\n    json: {\n      folder_id: String(src.folder_id || ''),\n      grist_doc_id: String(src.grist_doc_id || ''),\n      grist_table_id: String(src.grist_table_id || 'Table1') || 'Table1',\n      grist_doc_name: String(src.grist_doc_name || '')\n    }\n  };\n}).filter((item) => item.json.folder_id && item.json.grist_doc_id);"
+      },
+      "id": "Restore_Folder_Context",
+      "name": "Restore_Folder_Context",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2520,
+        320
+      ]
+    }
+  ],
+  "connections": {
+    "Cron_15m": {
+      "main": [
+        [
+          {
+            "node": "Load_Folders_With_Map",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load_Folders_With_Map": {
+      "main": [
+        [
+          {
+            "node": "Prepare_Folder_Jobs",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare_Folder_Jobs": {
+      "main": [
+        [
+          {
+            "node": "Keep_Existing_Doc_Map_Row",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Build_Create_Doc_Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Has_Grist_Doc": {
+      "main": [
+        [
+          {
+            "node": "Build_Create_Doc_Request",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Keep_Existing_Doc_Map_Row",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build_Create_Doc_Request": {
+      "main": [
+        [
+          {
+            "node": "Create_Grist_Doc",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create_Grist_Doc": {
+      "main": [
+        [
+          {
+            "node": "Build_New_Doc_Map_Row",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build_New_Doc_Map_Row": {
+      "main": [
+        [
+          {
+            "node": "Build_Save_Doc_Map_SQL",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Ensure_Grist_Table",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Keep_Existing_Doc_Map_Row": {
+      "main": [
+        [
+          {
+            "node": "Build_Save_Doc_Map_SQL",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Ensure_Grist_Table",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ensure_Grist_Table": {
+      "main": [
+        [
+          {
+            "node": "Ensure_Grist_Columns",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ensure_Grist_Columns": {
+      "main": [
+        [
+          {
+            "node": "Ensure_Grist_Column_E",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build_Save_Doc_Map_SQL": {
+      "main": [
+        [
+          {
+            "node": "Save_Doc_Map_Postgres",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Load_Folder_Cases_Postgres",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load_Folder_Cases_Postgres": {
+      "main": [
+        [
+          {
+            "node": "Build_Grist_Rows_Upsert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build_Grist_Rows_Upsert": {
+      "main": [
+        [
+          {
+            "node": "Upsert_Grist_Rows",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Fetch_Grist_Records",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Upsert_Grist_Rows": {
+      "main": [
+        []
+      ]
+    },
+    "Fetch_Grist_Records": {
+      "main": [
+        [
+          {
+            "node": "Extract_Operator_Decisions",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract_Operator_Decisions": {
+      "main": [
+        [
+          {
+            "node": "Build_Decision_SQL",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build_Decision_SQL": {
+      "main": [
+        [
+          {
+            "node": "Apply_Decisions_Postgres",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ensure_Grist_Column_E": {
+      "main": [
+        [
+          {
+            "node": "Ensure_Grist_Column_F",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ensure_Grist_Column_F": {
+      "main": [
+        []
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "0ca34a60-b9d4-4ea7-bbd9-5e4d8d2e5d11",
+  "id": "grist_to_postgres_sync",
+  "tags": []
+}

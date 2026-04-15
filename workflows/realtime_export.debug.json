@@ -1,0 +1,215 @@
+[
+  {
+    "updatedAt": "2026-04-14T10:47:34.699Z",
+    "createdAt": "2026-04-14T10:44:20.339Z",
+    "id": "zephyr_writeback_realtime",
+    "name": "zephyr_writeback_realtime",
+    "description": null,
+    "active": true,
+    "isArchived": false,
+    "nodes": [
+      {
+        "parameters": {
+          "httpMethod": "POST",
+          "path": "nocodb/zephyr-writeback",
+          "responseMode": "lastNode",
+          "options": {}
+        },
+        "id": "Webhook_Input",
+        "name": "Webhook_Input",
+        "type": "n8n-nodes-base.webhook",
+        "typeVersion": 2.1,
+        "position": [
+          180,
+          280
+        ]
+      },
+      {
+        "parameters": {
+          "conditions": {
+            "boolean": [
+              {
+                "value1": "={{$env.ENABLE_REALTIME_SYNC === 'true'}}",
+                "operation": "isTrue"
+              }
+            ]
+          }
+        },
+        "id": "Realtime_Enabled",
+        "name": "Realtime_Enabled",
+        "type": "n8n-nodes-base.if",
+        "typeVersion": 2,
+        "position": [
+          420,
+          280
+        ]
+      },
+      {
+        "parameters": {
+          "jsCode": "const body = $json.body || $json;\nconst statusField = $env.ZEPHYR_UPDATE_STATUS_ID_FIELD || 'testResultStatusId';\nconst commentField = $env.ZEPHYR_UPDATE_COMMENT_FIELD || 'comment';\nconst testResultId = String(body.test_result_id || body.testResultId || '');\nif (!testResultId) {\n  throw new Error('Missing test_result_id in webhook payload');\n}\nconst endpoint = ($env.ZEPHYR_UPDATE_ENDPOINT_TEMPLATE || 'rest/tests/1.0/testresult/{test_result_id}')\n  .replace('{test_result_id}', testResultId);\nreturn [{json: {\n  request_url: `${$env.ZEPHYR_BASE_URL}/${endpoint}`,\n  request_method: $env.ZEPHYR_UPDATE_METHOD || 'PUT',\n  token: $env.ZEPHYR_API_TOKEN,\n  request_body: {\n    [statusField]: body.desired_status_id,\n    [commentField]: body.desired_comment || ''\n  },\n  source_payload: body\n}}];"
+        },
+        "id": "Build_Realtime_Request",
+        "name": "Build_Realtime_Request",
+        "type": "n8n-nodes-base.code",
+        "typeVersion": 2,
+        "position": [
+          670,
+          220
+        ]
+      },
+      {
+        "parameters": {
+          "method": "={{$json.request_method}}",
+          "url": "={{$json.request_url}}",
+          "sendHeaders": true,
+          "headerParameters": {
+            "parameters": [
+              {
+                "name": "Authorization",
+                "value": "={{'Bearer ' + $json.token}}"
+              },
+              {
+                "name": "Content-Type",
+                "value": "application/json"
+              }
+            ]
+          },
+          "sendBody": true,
+          "jsonBody": "={{$json.request_body}}",
+          "options": {
+            "response": {
+              "response": {
+                "responseFormat": "json"
+              }
+            }
+          }
+        },
+        "id": "Send_Realtime_Update",
+        "name": "Send_Realtime_Update",
+        "type": "n8n-nodes-base.httpRequest",
+        "typeVersion": 4.2,
+        "position": [
+          930,
+          220
+        ],
+        "continueOnFail": true
+      },
+      {
+        "parameters": {
+          "respondWith": "json",
+          "responseBody": "={\"ok\": true, \"mode\": \"realtime\", \"result\": $json}"
+        },
+        "id": "Respond_Ok",
+        "name": "Respond_Ok",
+        "type": "n8n-nodes-base.respondToWebhook",
+        "typeVersion": 1.2,
+        "position": [
+          1170,
+          220
+        ]
+      },
+      {
+        "parameters": {
+          "respondWith": "json",
+          "responseCode": 202,
+          "responseBody": "={\"ok\": false, \"reason\": \"ENABLE_REALTIME_SYNC is false\"}"
+        },
+        "id": "Respond_Disabled",
+        "name": "Respond_Disabled",
+        "type": "n8n-nodes-base.respondToWebhook",
+        "typeVersion": 1.2,
+        "position": [
+          670,
+          380
+        ]
+      }
+    ],
+    "connections": {
+      "Webhook_Input": {
+        "main": [
+          [
+            {
+              "node": "Realtime_Enabled",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Realtime_Enabled": {
+        "main": [
+          [
+            {
+              "node": "Build_Realtime_Request",
+              "type": "main",
+              "index": 0
+            }
+          ],
+          [
+            {
+              "node": "Respond_Disabled",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Build_Realtime_Request": {
+        "main": [
+          [
+            {
+              "node": "Send_Realtime_Update",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Send_Realtime_Update": {
+        "main": [
+          [
+            {
+              "node": "Respond_Ok",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      }
+    },
+    "settings": {
+      "executionOrder": "v1"
+    },
+    "staticData": null,
+    "meta": null,
+    "pinData": null,
+    "versionId": "0053f5e0-892d-4307-81f0-6421a1b1c6c9",
+    "activeVersionId": "0053f5e0-892d-4307-81f0-6421a1b1c6c9",
+    "versionCounter": 5,
+    "triggerCount": 1,
+    "tags": [],
+    "shared": [
+      {
+        "updatedAt": "2026-04-14T10:44:20.339Z",
+        "createdAt": "2026-04-14T10:44:20.339Z",
+        "role": "workflow:owner",
+        "workflowId": "zephyr_writeback_realtime",
+        "projectId": "8FcMqTrYv9cREKaH",
+        "project": {
+          "updatedAt": "2026-04-14T10:43:14.905Z",
+          "createdAt": "2026-04-14T10:43:14.905Z",
+          "id": "8FcMqTrYv9cREKaH",
+          "name": "Unnamed Project",
+          "type": "personal",
+          "icon": null,
+          "description": null,
+          "creatorId": "5d3a9477-8016-4644-9939-a3cb128bc775"
+        }
+      }
+    ],
+    "versionMetadata": {
+      "name": null,
+      "description": null
+    }
+  }
+]
