@@ -1,6 +1,9 @@
 .env
 .env.local
 !.env.example
+infra/.env.nocodb-n8n
+infra/.zephyr_writeback_15m.runtime.json
+infra/.zephyr_ingest_15m.runtime.json
 weekly_zephyr_report.csv
 *.pyc
 __pycache__/

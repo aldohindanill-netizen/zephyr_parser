@@ -170,3 +170,142 @@ Windows tip (for manual session export, if needed):
   - `ZEPHYR_GSHEET_UPDATE_STATUS_ID_FIELD` (default `testResultStatusId`)
   - `ZEPHYR_GSHEET_UPDATE_COMMENT_FIELD` (default `comment`)
   - `ZEPHYR_GSHEET_UPDATE_EXTRA_BODY_JSON` (optional extra JSON object)
+
+## NocoDB + n8n local migration
+
+Google Sheets flow can be migrated to a local operations stack:
+
+- `NocoDB` for operator edits
+- `n8n` for ingest/sync orchestration
+- `Postgres` for state and queue persistence
+
+Migration assets in this repo:
+
+- `infra/docker-compose.nocodb-n8n.yml`
+- `infra/.env.nocodb-n8n.example`
+- `workflows/zephyr_ingest_15m.json`
+- `workflows/zephyr_writeback_15m.json`
+- `workflows/zephyr_writeback_realtime.json` (optional path, disabled by default)
+- `docs/zephyr-api-contract.md`
+- `docs/nocodb-operator-form.md`
+- `docs/n8n-postgres-credential.md`
+- `docs/production-cutover-checklist.md`
+
+### 1) Bootstrap local stack
+
+```bash
+cp infra/.env.nocodb-n8n.example infra/.env.nocodb-n8n
+# edit secrets and token
+docker compose --env-file infra/.env.nocodb-n8n -f infra/docker-compose.nocodb-n8n.yml up -d
+```
+
+Open:
+
+- n8n: `http://localhost:5678`
+- NocoDB: `http://localhost:8080`
+
+### 2) Import n8n workflows
+
+Import JSON workflows from `workflows/` in this order:
+
+1. `zephyr_ingest_15m.json`
+2. `zephyr_writeback_15m.json`
+3. `zephyr_writeback_realtime.json` (keep inactive for prod baseline)
+
+Set environment variables in n8n container from `infra/.env.nocodb-n8n`.
+
+### 3) Create NocoDB tables
+
+Create tables according to `docs/zephyr-api-contract.md`:
+
+- `folders`
+- `test_runs`
+- `test_results`
+- `sync_queue`
+- `sync_audit`
+
+Required idempotency constraint:
+
+- unique key on `sync_queue(test_result_id, operation_hash)`
+
+Operator form details:
+
+- use `operator_daily_form` as daily editable source (`execution_day = current_date`)
+- keep `desired_status_id` as the single editable status field (Pass/Fail is derived)
+- queue items are auto-created by DB trigger on desired status/comment changes
+- see `docs/nocodb-operator-form.md`
+
+### 4) Production baseline mode
+
+Use batch mode first:
+
+- `SYNC_INTERVAL_MIN=15`
+- `SYNC_MODE=batch`
+- `ENABLE_REALTIME_SYNC=false`
+
+This keeps write-back controlled and replayable via queue rows.
+
+Batch workflow DB wiring:
+
+- workflow `workflows/zephyr_writeback_15m.json` uses Postgres nodes for queue read/write
+- create n8n credential `PostgresZephyrOps` as described in `docs/n8n-postgres-credential.md`
+
+### Operations runbook
+
+- Pause sync:
+  - disable `zephyr_writeback_15m` workflow in n8n
+- Resume sync:
+  - re-enable workflow
+- Replay failed queue:
+  - in NocoDB move selected `sync_queue.status` from `failed` to `queued`
+  - clear `next_retry_at` for immediate next cycle
+- Dead-letter handling:
+  - inspect `sync_audit.response_body`
+  - fix payload/data mapping
+  - enqueue a new operation with a fresh `operation_hash`
+- Monitoring SQL (Postgres):
+  - `infra/sql/query_sync_health.sql` - queue/state snapshot + 24h success rate
+  - `infra/sql/query_sync_recent_errors.sql` - recent non-2xx / failed attempts
+  - `infra/sql/query_sync_sla.sql` - backlog, latency p50/p95/p99, retry and dead-letter rates
+  - `infra/sql/query_sync_audit_inconsistencies.sql` - success flag vs HTTP status mismatches
+  - `infra/sql/fix_sync_audit_success_flag.sql` - normalize historical `sync_audit.success`
+  - `infra/sql/query_sync_health_since_cutover.sql` - clean snapshot from cutover timestamp
+  - `infra/sql/query_sync_recent_errors_since_cutover.sql` - errors from cutover timestamp
+
+### Grist helper scripts
+
+Use these PowerShell helpers from repo root:
+
+- Offline check (no VPN, validates `Grist -> Postgres -> sync_queue`):
+  - `.\scripts\offline-sync-check.ps1 -TestResultId 112522`
+- Post-VPN smoke (final hop validation to Zephyr via queue/writeback):
+  - `.\scripts\post-vpn-smoke.ps1 -TestResultId 112522 -WaitSeconds 120`
+
+Both scripts support optional overrides:
+
+- `-EnvFile infra/.env.nocodb-n8n`
+- `-ComposeFile infra/docker-compose.nocodb-n8n.yml`
+
+VPN continuation checklist:
+
+- `docs/vpn-resume-checklist.md`
+
+### Optional near-realtime path
+
+When ready:
+
+- set `ENABLE_REALTIME_SYNC=true`
+- activate `zephyr_writeback_realtime`
+- configure NocoDB automation/webhook to send `test_result_id`, `desired_status_id`, `desired_comment`
+
+Keep the 15-minute batch workflow active as fallback.
+
+### Rollback to script mode
+
+If migration flow is degraded:
+
+1. Disable n8n write-back workflows (`zephyr_writeback_15m` and realtime).
+2. Continue operations via existing script launcher:
+   - `bash ./run_zephyr_google_pipeline.sh generate`
+   - `bash ./run_zephyr_google_pipeline.sh sync`
+3. Keep NocoDB as read-only until queue/audit issues are fixed.

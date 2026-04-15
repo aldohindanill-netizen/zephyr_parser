@@ -1,0 +1,103 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+
+  n8n:
+    image: n8nio/n8n:latest
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    ports:
+      - "${N8N_PORT}:5678"
+    environment:
+      DB_TYPE: postgresdb
+      DB_POSTGRESDB_HOST: postgres
+      DB_POSTGRESDB_PORT: 5432
+      DB_POSTGRESDB_DATABASE: ${POSTGRES_DB}
+      DB_POSTGRESDB_USER: ${POSTGRES_USER}
+      DB_POSTGRESDB_PASSWORD: ${POSTGRES_PASSWORD}
+      N8N_HOST: ${N8N_HOST}
+      N8N_PORT: 5678
+      N8N_PROTOCOL: ${N8N_PROTOCOL}
+      WEBHOOK_URL: ${N8N_WEBHOOK_URL}
+      GENERIC_TIMEZONE: ${N8N_TIMEZONE}
+      N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY}
+      N8N_LOG_LEVEL: ${N8N_LOG_LEVEL}
+      QUEUE_BULL_REDIS_HOST: redis
+      QUEUE_BULL_REDIS_PORT: 6379
+      EXECUTIONS_MODE: regular
+      N8N_BLOCK_ENV_ACCESS_IN_NODE: "false"
+      ZEPHYR_BASE_URL: ${ZEPHYR_BASE_URL}
+      ZEPHYR_PROJECT_ID: ${ZEPHYR_PROJECT_ID}
+      ZEPHYR_API_TOKEN: ${ZEPHYR_API_TOKEN}
+      ZEPHYR_ENDPOINT: ${ZEPHYR_ENDPOINT}
+      ZEPHYR_FOLDER_SEARCH_ENDPOINT: ${ZEPHYR_FOLDER_SEARCH_ENDPOINT}
+      ZEPHYR_FOLDERTREE_ENDPOINT: ${ZEPHYR_FOLDERTREE_ENDPOINT}
+      ZEPHYR_FOLDER_ROOT_IDS: ${ZEPHYR_FOLDER_ROOT_IDS}
+      ZEPHYR_FOLDER_LEAF_ONLY: ${ZEPHYR_FOLDER_LEAF_ONLY}
+      ZEPHYR_FOLDER_NAME_REGEX: ${ZEPHYR_FOLDER_NAME_REGEX}
+      ZEPHYR_FOLDER_PATH_REGEX: ${ZEPHYR_FOLDER_PATH_REGEX}
+      ZEPHYR_QUERY_TEMPLATE: ${ZEPHYR_QUERY_TEMPLATE}
+      ZEPHYR_MAX_RESULTS: ${ZEPHYR_MAX_RESULTS}
+      ZEPHYR_START_AT: ${ZEPHYR_START_AT}
+      ZEPHYR_ARCHIVED: ${ZEPHYR_ARCHIVED}
+      ZEPHYR_UPDATE_ENDPOINT_TEMPLATE: ${ZEPHYR_UPDATE_ENDPOINT_TEMPLATE}
+      ZEPHYR_UPDATE_METHOD: ${ZEPHYR_UPDATE_METHOD}
+      ZEPHYR_UPDATE_STATUS_ID_FIELD: ${ZEPHYR_UPDATE_STATUS_ID_FIELD}
+      ZEPHYR_UPDATE_COMMENT_FIELD: ${ZEPHYR_UPDATE_COMMENT_FIELD}
+      ZEPHYR_UPDATE_EXTRA_BODY_JSON: ${ZEPHYR_UPDATE_EXTRA_BODY_JSON}
+      GRIST_API_URL: ${GRIST_API_URL}
+      GRIST_DOCS_BASE_URL: ${GRIST_DOCS_BASE_URL}
+      GRIST_PARENT_WORKSPACE_ID: ${GRIST_PARENT_WORKSPACE_ID}
+      GRIST_ZEPHYR_PARENT_FOLDER_ID: ${GRIST_ZEPHYR_PARENT_FOLDER_ID}
+      GRIST_DOC_ID: ${GRIST_DOC_ID}
+      GRIST_TABLE_ID: ${GRIST_TABLE_ID}
+      GRIST_API_TOKEN: ${GRIST_API_TOKEN}
+      GRIST_MAX_RECORDS: ${GRIST_MAX_RECORDS}
+      GRIST_STATUS_LOOKBACK_HOURS: ${GRIST_STATUS_LOOKBACK_HOURS}
+      GRIST_DONE_STATUS_ID: ${GRIST_DONE_STATUS_ID}
+      GRIST_NOT_DONE_STATUS_ID: ${GRIST_NOT_DONE_STATUS_ID}
+    volumes:
+      - n8n_data:/home/node/.n8n
+
+  nocodb:
+    image: nocodb/nocodb:latest
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "${NOCODB_PORT}:8080"
+    environment:
+      NC_DB: "pg://postgres:5432?u=${POSTGRES_USER}&p=${POSTGRES_PASSWORD}&d=${POSTGRES_DB}"
+      NC_PUBLIC_URL: ${NOCODB_PUBLIC_URL}
+      NC_AUTH_JWT_SECRET: ${NOCODB_JWT_SECRET}
+      NC_DISABLE_TELE: "true"
+      TZ: ${N8N_TIMEZONE}
+    volumes:
+      - nocodb_data:/usr/app/data
+
+volumes:
+  postgres_data:
+  n8n_data:
+  nocodb_data:
