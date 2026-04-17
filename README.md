@@ -95,6 +95,145 @@ Windows tip (for manual session export, if needed):
 [System.Environment]::SetEnvironmentVariable("ZEPHYR_API_TOKEN", "your_token", "User")
 ```
 
+## Deployment on Amvera with Redis
+
+This section covers how to run the report as a persistent **Redis-queue worker**
+inside an Amvera container.  The worker process (`redis_runner.py`) blocks on a
+Redis list; any external service (a Telegram bot, a cron job, another script)
+pushes a JSON job message to trigger a report run.
+
+### Architecture overview
+
+```
+[any client]
+     │  LPUSH zephyr:jobs '{"ZEPHYR_FROM_DATE":"2026-04-01", ...}'
+     ▼
+  Redis (Amvera pre-configured service)
+     │  BLPOP
+     ▼
+  zephyr_parser container (Amvera app)
+  └─ redis_runner.py
+       ├─ calls zephyr_weekly_report.main() in-process
+       └─ RPUSH result → zephyr:results
+          PUBLISH   → zephyr:done
+```
+
+Reports are written to `/data` (Amvera persistent storage).
+
+### Step 1 — Create a Redis service in Amvera
+
+1. In your Amvera dashboard choose **Pre-configured services → Create**.
+2. Set **Type: Redis**, choose a plan no lower than *Начальный*.
+3. In the service's **Variables** section add a secret:
+   - Name: `REDIS_ARGS`
+   - Value: `--requirepass <your-password>`
+4. Note the internal hostname shown on the **Info** page — it looks like
+   `amvera-<username>-run-<project-name>`.
+
+### Step 2 — Create the bot/app project in Amvera
+
+1. Create a new project, connect this git repository.
+2. Amvera will detect `Dockerfile` and `amvera.yaml` automatically.
+3. In the project's **Variables** section add at minimum:
+
+   | Name | Value | Secret? |
+   |------|-------|---------|
+   | `ZEPHYR_API_TOKEN` | your Zephyr token | ✓ secret |
+   | `REDIS_HOST` | `amvera-<user>-run-<redis-project>` | |
+   | `REDIS_PORT` | `6379` | |
+   | `REDIS_PASSWORD` | the password you set above | ✓ secret |
+   | `ZEPHYR_BASE_URL` | `https://jira.example.com` | |
+   | *(other `ZEPHYR_*` vars)* | as needed | |
+
+4. After saving variables **restart the container** for them to apply.
+
+### Step 3 — Push a job from a client
+
+From any machine or service that can reach the Redis instance
+(only allowed from other Amvera projects in the same account):
+
+```python
+import json, redis
+
+r = redis.Redis(
+    host="amvera-<user>-run-<redis-project>",
+    port=6379,
+    password="<your-password>",
+    decode_responses=True,
+)
+
+# Minimal job — uses all ZEPHYR_* env vars already set in the container
+r.lpush("zephyr:jobs", json.dumps({}))
+
+# Override specific variables for this run only
+r.lpush("zephyr:jobs", json.dumps({
+    "job_id": "my-run-001",
+    "ZEPHYR_FROM_DATE": "2026-04-01",
+    "ZEPHYR_TO_DATE":   "2026-04-30",
+}))
+```
+
+### Step 4 — Read results
+
+```python
+# Wait for the next result (blocking)
+_, raw = r.blpop("zephyr:results")
+result = json.loads(raw)
+print(result["exit_code"])   # 0 = success
+print(result["stdout"])
+```
+
+Or subscribe to the pub/sub channel:
+
+```python
+pubsub = r.pubsub()
+pubsub.subscribe("zephyr:done")
+for message in pubsub.listen():
+    if message["type"] == "message":
+        result = json.loads(message["data"])
+        print(result)
+```
+
+### Worker Redis env vars reference
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `REDIS_HOST` | `localhost` | Redis hostname |
+| `REDIS_PORT` | `6379` | Redis port |
+| `REDIS_PASSWORD` | *(none)* | Redis password |
+| `REDIS_DB` | `0` | Redis logical DB index |
+| `REDIS_JOB_QUEUE` | `zephyr:jobs` | List key the worker pops from |
+| `REDIS_RESULT_KEY` | `zephyr:results` | List key results are appended to |
+| `REDIS_RESULT_CHANNEL` | `zephyr:done` | Pub/Sub channel for result notifications |
+| `REDIS_RESULT_TTL` | `3600` | Seconds to keep the results list |
+| `REDIS_HEARTBEAT_KEY` | `zephyr:heartbeat` | Key refreshed by the heartbeat thread |
+| `REDIS_HEARTBEAT_INTERVAL` | `30` | Heartbeat refresh interval (seconds) |
+
+### Local testing
+
+```bash
+# 1. Start a local Redis
+docker run -d -p 6379:6379 redis
+
+# 2. Install dependencies
+pip install -r requirements.txt
+
+# 3. Set required env vars
+export ZEPHYR_API_TOKEN=...
+export ZEPHYR_BASE_URL=https://jira.example.com
+# ... other ZEPHYR_* vars ...
+
+# 4. Run the worker
+python redis_runner.py
+
+# 5. In another terminal, push a job
+python -c "
+import json, redis
+r = redis.Redis(decode_responses=True)
+r.lpush('zephyr:jobs', json.dumps({'job_id': 'test-1'}))
+"
+```
+
 ## Notes
 
 - Default auth header is `Authorization: Bearer <token>`.
