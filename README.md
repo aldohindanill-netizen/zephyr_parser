@@ -97,28 +97,131 @@ Windows tip (for manual session export, if needed):
 
 ## Deployment on Amvera with Redis
 
-This section covers how to run the report as a persistent **Redis-queue worker**
+This section covers how to run the tool as a persistent **Redis-queue worker**
 inside an Amvera container.  The worker process (`redis_runner.py`) blocks on a
 Redis list; any external service (a Telegram bot, a cron job, another script)
-pushes a JSON job message to trigger a report run.
+pushes a JSON job message to trigger an action — reading from Zephyr or
+writing results back.
 
-### Architecture overview
+### Full pipeline overview
 
 ```
-[any client]
-     │  LPUSH zephyr:jobs '{"ZEPHYR_FROM_DATE":"2026-04-01", ...}'
-     ▼
-  Redis (Amvera pre-configured service)
-     │  BLPOP
-     ▼
-  zephyr_parser container (Amvera app)
-  └─ redis_runner.py
-       ├─ calls zephyr_weekly_report.main() in-process
-       └─ RPUSH result → zephyr:results
-          PUBLISH   → zephyr:done
+┌──────────────────────────────────────────────────────────────────────┐
+│  External client (bot / cron / script)                               │
+│                                                                      │
+│  1.  LPUSH zephyr:jobs  {"action":"list_folders", "job_id":"f01"}   │
+│  2.  LPUSH zephyr:jobs  {"action":"run_report", ...}                │
+│  3.  LPUSH zephyr:jobs  {"action":"upload_result", "test_run_id":…} │
+└───────────────────────────┬──────────────────────────────────────────┘
+                            │
+                     Redis (Amvera pre-configured service, port 6379)
+                            │  BLPOP zephyr:jobs
+                            ▼
+              ┌─────────────────────────────────────────┐
+              │   zephyr_parser container (Amvera app)  │
+              │   redis_runner.py                       │
+              │                                         │
+              │  action = "list_folders"                │
+              │    → zephyr_weekly_report --list-       │
+              │      folders-json                       │
+              │    → GET foldertree / folder/search     │
+              │    ← folders[] JSON                     │
+              │                                         │
+              │  action = "run_report"                  │
+              │    → zephyr_weekly_report --discover-   │
+              │      folders (full pipeline)            │
+              │    → GET executions, steps, cases       │
+              │    ← CSV files written to /data         │
+              │      stdout / stderr in result          │
+              │                                         │
+              │  action = "upload_result"               │
+              │    → POST /testresults   (new result)   │
+              │    → PUT  /testresults/… (update)       │
+              │    → PUT  /…/testscriptresults/… (step) │
+              │    ← Zephyr API response JSON           │
+              └───────────────┬─────────────────────────┘
+                              │  RPUSH  zephyr:results
+                              │  PUBLISH zephyr:done
+                              ▼
+                      Redis result list / pub-sub channel
 ```
 
-Reports are written to `/data` (Amvera persistent storage).
+Reports and CSV files are written to `/data` (Amvera persistent storage).
+
+### Worker actions
+
+#### `list_folders` — get the folder tree from Zephyr
+
+Discovers the folder tree (respecting all `ZEPHYR_TREE_*` filters) and
+returns a JSON array in the result's `"folders"` key.
+
+```python
+r.lpush("zephyr:jobs", json.dumps({
+    "action": "list_folders",
+    "job_id": "folders-001",
+}))
+
+_, raw = r.blpop("zephyr:results")
+data = json.loads(raw)
+# data["folders"] → [{"id":"10545","name":"2026.04.17","parent_id":…}, …]
+```
+
+#### `run_report` — run the full weekly report
+
+Fetches all executions for the configured folders, aggregates them, and
+writes CSV reports to `/data`.  All `ZEPHYR_*` env-var overrides from the
+job message are applied only for the duration of this run.
+
+```python
+r.lpush("zephyr:jobs", json.dumps({
+    "action": "run_report",
+    "job_id": "report-001",
+    "ZEPHYR_FROM_DATE": "2026-04-01",
+    "ZEPHYR_TO_DATE":   "2026-04-30",
+}))
+
+_, raw = r.blpop("zephyr:results")
+data = json.loads(raw)
+# data["exit_code"], data["stdout"], data["stderr"]
+```
+
+#### `upload_result` — write a test result back to Zephyr
+
+Three sub-modes, chosen automatically based on the fields present:
+
+| Fields present | Operation |
+|----------------|-----------|
+| `test_run_id` + `item_id` + `status_id` | POST new result |
+| `test_run_id` + `result_id` + `status_id` | PUT update result |
+| `test_run_id` + `result_id` + `step_result_id` + `status_id` | PUT update step |
+
+```python
+# POST a new test result
+r.lpush("zephyr:jobs", json.dumps({
+    "action": "upload_result",
+    "job_id": "upload-001",
+    "test_run_id": "12345",
+    "item_id":     "67890",
+    "status_id":   "1",          # use a status id from Zephyr
+    "comment":     "Automated run via bot",
+    "execution_date": "2026-04-17T10:00:00",
+}))
+
+# PUT update an existing result
+r.lpush("zephyr:jobs", json.dumps({
+    "action": "upload_result",
+    "job_id": "upload-002",
+    "test_run_id": "12345",
+    "result_id":   "99999",
+    "status_id":   "2",
+    "comment":     "Retested — passed",
+}))
+
+_, raw = r.blpop("zephyr:results")
+data = json.loads(raw)
+# data["exit_code"] == 0 on success
+# data["response"]  contains the Zephyr API response body
+```
 
 ### Step 1 — Create a Redis service in Amvera
 
@@ -139,18 +242,15 @@ Reports are written to `/data` (Amvera persistent storage).
    | Name | Value | Secret? |
    |------|-------|---------|
    | `ZEPHYR_API_TOKEN` | your Zephyr token | ✓ secret |
+   | `ZEPHYR_BASE_URL` | `https://jira.example.com` | |
    | `REDIS_HOST` | `amvera-<user>-run-<redis-project>` | |
    | `REDIS_PORT` | `6379` | |
    | `REDIS_PASSWORD` | the password you set above | ✓ secret |
-   | `ZEPHYR_BASE_URL` | `https://jira.example.com` | |
    | *(other `ZEPHYR_*` vars)* | as needed | |
 
 4. After saving variables **restart the container** for them to apply.
 
-### Step 3 — Push a job from a client
-
-From any machine or service that can reach the Redis instance
-(only allowed from other Amvera projects in the same account):
+### Step 3 — Read results
 
 ```python
 import json, redis
@@ -162,28 +262,14 @@ r = redis.Redis(
     decode_responses=True,
 )
 
-# Minimal job — uses all ZEPHYR_* env vars already set in the container
-r.lpush("zephyr:jobs", json.dumps({}))
-
-# Override specific variables for this run only
-r.lpush("zephyr:jobs", json.dumps({
-    "job_id": "my-run-001",
-    "ZEPHYR_FROM_DATE": "2026-04-01",
-    "ZEPHYR_TO_DATE":   "2026-04-30",
-}))
-```
-
-### Step 4 — Read results
-
-```python
-# Wait for the next result (blocking)
+# Blocking pop — waits for the next result
 _, raw = r.blpop("zephyr:results")
 result = json.loads(raw)
+print(result["action"])      # "run_report" / "list_folders" / "upload_result"
 print(result["exit_code"])   # 0 = success
-print(result["stdout"])
 ```
 
-Or subscribe to the pub/sub channel:
+Or subscribe to the pub/sub channel for non-blocking delivery:
 
 ```python
 pubsub = r.pubsub()
@@ -218,20 +304,40 @@ docker run -d -p 6379:6379 redis
 # 2. Install dependencies
 pip install -r requirements.txt
 
-# 3. Set required env vars
-export ZEPHYR_API_TOKEN=...
+# 3. Set required env vars (minimum to start the worker)
+export ZEPHYR_API_TOKEN=your_token
 export ZEPHYR_BASE_URL=https://jira.example.com
-# ... other ZEPHYR_* vars ...
+export ZEPHYR_PROJECT_ID=10904
+export ZEPHYR_ROOT_FOLDER_IDS=10545
+# ... other ZEPHYR_* vars from .env.example ...
 
 # 4. Run the worker
 python redis_runner.py
 
-# 5. In another terminal, push a job
-python -c "
+# 5. In another terminal — list folders
+python - <<'EOF'
 import json, redis
 r = redis.Redis(decode_responses=True)
-r.lpush('zephyr:jobs', json.dumps({'job_id': 'test-1'}))
-"
+r.lpush("zephyr:jobs", json.dumps({"action": "list_folders", "job_id": "t1"}))
+_, raw = r.blpop("zephyr:results")
+import pprint; pprint.pprint(json.loads(raw))
+EOF
+
+# 6. Upload a test result
+python - <<'EOF'
+import json, redis
+r = redis.Redis(decode_responses=True)
+r.lpush("zephyr:jobs", json.dumps({
+    "action": "upload_result",
+    "job_id": "t2",
+    "test_run_id": "12345",
+    "item_id": "67890",
+    "status_id": "1",
+    "comment": "passed via bot",
+}))
+_, raw = r.blpop("zephyr:results")
+import pprint; pprint.pprint(json.loads(raw))
+EOF
 ```
 
 ## Notes
