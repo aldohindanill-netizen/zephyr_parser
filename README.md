@@ -123,6 +123,43 @@ print(json.loads(raw)["exit_code"])   # 0 = успех
 
 ---
 
+## Устранение неполадок
+
+### TelegramConflictError: can't use getUpdates while webhook is active
+
+Если Telegram-бот падает с ошибкой вида:
+
+```
+TelegramConflictError: Conflict: can't use getUpdates method while webhook is active;
+use deleteWebhook to delete the webhook first
+```
+
+Это значит, что ранее для бота был зарегистрирован webhook, и теперь он мешает работе в режиме polling.
+
+**Быстрое решение — удалить webhook один раз:**
+
+```bash
+TELEGRAM_BOT_TOKEN=<токен> python delete_webhook.py
+```
+
+Или через curl:
+
+```bash
+curl "https://api.telegram.org/bot<TOKEN>/deleteWebhook?drop_pending_updates=true"
+```
+
+**Постоянное решение** — добавить удаление webhook в стартап бота перед запуском polling.
+Для aiogram 3.x это делается через `await bot.delete_webhook(drop_pending_updates=True)`
+перед вызовом `await dp.start_polling(bot)`:
+
+```python
+async def main():
+    await bot.delete_webhook(drop_pending_updates=True)
+    await dp.start_polling(bot)
+```
+
+---
+
 ## Notes
 
 - Заголовок авторизации по умолчанию: `Authorization: Bearer <token>`.
