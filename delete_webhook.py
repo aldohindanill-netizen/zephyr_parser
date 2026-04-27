@@ -10,11 +10,11 @@ Usage:
     python delete_webhook.py <token>
 """
 
-import sys
-import urllib.request
-import urllib.error
-import os
 import json
+import os
+import sys
+import urllib.error
+import urllib.request
 
 
 def delete_webhook(token: str) -> None:
@@ -23,7 +23,14 @@ def delete_webhook(token: str) -> None:
         with urllib.request.urlopen(url, timeout=10) as resp:
             body = json.loads(resp.read().decode())
     except urllib.error.HTTPError as exc:
-        body = json.loads(exc.read().decode())
+        try:
+            body = json.loads(exc.read().decode())
+        except Exception:
+            print(f"HTTP error {exc.code}: {exc.reason}", file=sys.stderr)
+            sys.exit(1)
+    except urllib.error.URLError as exc:
+        print(f"Network error: {exc.reason}", file=sys.stderr)
+        sys.exit(1)
 
     if body.get("ok"):
         print("Webhook deleted successfully. Bot can now use polling (getUpdates).")

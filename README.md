@@ -153,10 +153,25 @@ curl "https://api.telegram.org/bot<TOKEN>/deleteWebhook?drop_pending_updates=tru
 перед вызовом `await dp.start_polling(bot)`:
 
 ```python
+import asyncio
+from aiogram import Bot, Dispatcher
+
+BOT_TOKEN = "YOUR_BOT_TOKEN"
+
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher()
+
 async def main():
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
 ```
+
+Это гарантирует, что даже если ранее был зарегистрирован webhook (например, при деплое
+на Amvera или в другой webhook-среде), при каждом запуске бот корректно переключится
+в режим polling без `TelegramConflictError`.
 
 ---
 
