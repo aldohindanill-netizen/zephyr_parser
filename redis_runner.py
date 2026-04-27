@@ -126,7 +126,7 @@ def _env_int(key: str, default: int) -> int:
 # Build a Redis client from env vars
 # ---------------------------------------------------------------------------
 
-def build_redis_client() -> redis.Redis:
+def build_redis_client(retry: bool = False) -> redis.Redis:
     host = _env("REDIS_HOST", "localhost")
     port = _env_int("REDIS_PORT", 6379)
     password = os.environ.get("REDIS_PASSWORD") or None
@@ -141,6 +141,18 @@ def build_redis_client() -> redis.Redis:
         socket_timeout=None,  # BLPOP blocks indefinitely
         decode_responses=True,
     )
+    delays = [5, 10, 20, 30, 60] if retry else []
+    for attempt, delay in enumerate(delays, start=1):
+        try:
+            client.ping()
+            log.info("Redis connection OK")
+            return client
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "Redis not ready (attempt %d/%d): %s — retrying in %ds",
+                attempt, len(delays), exc, delay,
+            )
+            time.sleep(delay)
     client.ping()
     log.info("Redis connection OK")
     return client
@@ -520,7 +532,7 @@ def handle_upload_result(job: dict, overrides: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    client = build_redis_client()
+    client = build_redis_client(retry=True)
     start_heartbeat(client)
 
     queue_key = _env("REDIS_JOB_QUEUE", "zephyr:jobs")
