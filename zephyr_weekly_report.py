@@ -474,6 +474,20 @@ def parse_args() -> argparse.Namespace:
             "Another instance exits immediately. Default: ZEPHYR_RUN_LOCK_FILE."
         ),
     )
+    parser.add_argument(
+        "--list-folders-json",
+        action="store_true",
+        help=(
+            "Discover the folder tree, print a JSON array of folder objects to stdout "
+            "(id, name, parent_id, full_path, is_leaf), then exit. "
+            "Respects all --tree-* / --root-folder-id filters."
+        ),
+    )
+    parser.add_argument(
+        "--list-folders-output",
+        default=None,
+        help="Write --list-folders-json output to this file path instead of stdout.",
+    )
     return parser.parse_args()
 
 
@@ -774,7 +788,10 @@ def request_json(
     )
     try:
         with urllib.request.urlopen(request, timeout=30) as response:
-            return json.loads(response.read().decode("utf-8"))
+            raw = response.read()
+            if not raw:
+                return None
+            return json.loads(raw.decode("utf-8"))
     except urllib.error.HTTPError as exc:
         body = exc.read().decode("utf-8", errors="replace")
         raise RuntimeError(
@@ -3754,6 +3771,146 @@ def print_table(weekly: dict[date, WeeklyStat]) -> None:
         print(fmt.format(*row))
 
 
+def list_folders_as_json(
+    base_url: str,
+    headers: dict[str, str],
+    args: argparse.Namespace,
+    tree_name_pattern: re.Pattern[str] | None,
+    tree_root_path_pattern: re.Pattern[str] | None,
+    tree_source_query: dict[str, Any],
+    tree_source_body: dict[str, Any],
+    root_folder_ids: list[str],
+) -> str:
+    """Discover the folder tree and return a JSON string (array of folder dicts)."""
+    selected: list[FolderNode] = []
+    if args.tree_source_endpoint:
+        nodes, _, _ = discover_folders_custom_tree_source(
+            base_url=base_url,
+            endpoint=args.tree_source_endpoint,
+            headers=headers,
+            method=args.tree_source_method,
+            query_params=tree_source_query,
+            body=tree_source_body,
+        )
+    elif args.tree_autoprobe:
+        nodes, _, _ = probe_tree_endpoints(
+            base_url=base_url,
+            headers=headers,
+            project_id=args.project_id,
+        )
+    else:
+        nodes, _, _ = discover_folders_tree_fallback(
+            base_url=base_url,
+            folder_search_endpoint=args.folder_search_endpoint,
+            foldertree_endpoint=args.foldertree_endpoint,
+            headers=headers,
+            project_id=args.project_id,
+        )
+    selected = select_tree_target_folders(
+        nodes=nodes,
+        root_folder_ids=root_folder_ids,
+        leaf_only=args.tree_leaf_only,
+        name_pattern=tree_name_pattern,
+        root_path_pattern=tree_root_path_pattern,
+    )
+    result = [
+        {
+            "id": f.folder_id,
+            "name": f.folder_name,
+            "parent_id": f.parent_id,
+            "full_path": f.full_path,
+            "is_leaf": f.is_leaf,
+        }
+        for f in selected
+    ]
+    return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+def post_test_result(
+    base_url: str,
+    headers: dict[str, str],
+    test_run_id: str,
+    item_id: str,
+    status_id: str,
+    comment: str | None = None,
+    execution_date: str | None = None,
+) -> dict[str, Any] | None:
+    """POST a new test result for a test-run item.
+
+    Corresponds to: POST rest/tests/1.0/testrun/{test_run_id}/testresults
+    Body fields that the Navio/Zephyr API accepts::
+
+        {
+            "testRunItemId": <item_id>,
+            "testResultStatusId": <status_id>,
+            "comment": "...",          # optional
+            "executionDate": "...",    # optional ISO-8601
+        }
+
+    Returns the parsed response body or None when the server returns no body.
+    """
+    endpoint = f"rest/tests/1.0/testrun/{test_run_id}/testresults"
+    body: dict[str, Any] = {
+        "testRunItemId": item_id,
+        "testResultStatusId": status_id,
+    }
+    if comment is not None:
+        body["comment"] = comment
+    if execution_date is not None:
+        body["executionDate"] = execution_date
+    return request_json(base_url, endpoint, headers, method="POST", body=body)
+
+
+def put_test_result(
+    base_url: str,
+    headers: dict[str, str],
+    test_run_id: str,
+    result_id: str,
+    status_id: str,
+    comment: str | None = None,
+    execution_date: str | None = None,
+) -> dict[str, Any] | None:
+    """PUT (update) an existing test result by its id.
+
+    Corresponds to: PUT rest/tests/1.0/testrun/{test_run_id}/testresults/{result_id}
+    Returns the parsed response body or None when the server returns no body.
+    """
+    endpoint = f"rest/tests/1.0/testrun/{test_run_id}/testresults/{result_id}"
+    body: dict[str, Any] = {"testResultStatusId": status_id}
+    if comment is not None:
+        body["comment"] = comment
+    if execution_date is not None:
+        body["executionDate"] = execution_date
+    return request_json(base_url, endpoint, headers, method="PUT", body=body)
+
+
+def put_test_step_result(
+    base_url: str,
+    headers: dict[str, str],
+    test_run_id: str,
+    result_id: str,
+    step_result_id: str,
+    status_id: str,
+    comment: str | None = None,
+) -> dict[str, Any] | None:
+    """PUT (update) a single script-step result within a test result.
+
+    Corresponds to:
+    PUT rest/tests/1.0/testrun/{test_run_id}/testresults/{result_id}/testscriptresults/{step_result_id}
+    Returns the parsed response body or None when the server returns no body.
+    """
+    endpoint = (
+        f"rest/tests/1.0/testrun/{test_run_id}/testresults/{result_id}"
+        f"/testscriptresults/{step_result_id}"
+    )
+    body: dict[str, Any] = {"testResultStatusId": status_id}
+    if comment is not None:
+        body["comment"] = comment
+    return request_json(base_url, endpoint, headers, method="PUT", body=body)
+
+
+def main() -> int:
+    args = parse_args()
 def run_once(args: argparse.Namespace) -> int:
     try:
         token = args.token or os.getenv("ZEPHYR_API_TOKEN")
@@ -3812,6 +3969,29 @@ def run_once(args: argparse.Namespace) -> int:
                 f"auth_mode={confluence_cfg.auth_mode} "
                 f"update_existing={confluence_cfg.update_existing}"
             )
+
+        if args.list_folders_json:
+            folder_json = list_folders_as_json(
+                base_url=args.base_url,
+                headers=headers,
+                args=args,
+                tree_name_pattern=tree_name_pattern,
+                tree_root_path_pattern=tree_root_path_pattern,
+                tree_source_query=tree_source_query,
+                tree_source_body=tree_source_body,
+                root_folder_ids=root_folder_ids,
+            )
+            if args.list_folders_output:
+                os.makedirs(
+                    os.path.dirname(args.list_folders_output) or ".", exist_ok=True
+                )
+                with open(args.list_folders_output, "w", encoding="utf-8") as fh:
+                    fh.write(folder_json)
+                    fh.write("\n")
+                print(f"Folder list saved: {args.list_folders_output}")
+            else:
+                print(folder_json)
+            return 0
 
         if args.discover_folders:
             folder_rows: list[tuple[FolderNode, dict[date, WeeklyStat]]] = []

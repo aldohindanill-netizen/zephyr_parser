@@ -1,0 +1,12 @@
+meta:
+  environment: docker
+  toolchain:
+    name: docker
+
+build:
+  dockerfile: Dockerfile
+
+run:
+  # Reports are written to persistent storage mounted at /data.
+  # Set this to a different path if you prefer another mount point.
+  persistenceMount: /data

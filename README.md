@@ -1,38 +1,39 @@
 # zephyr_parser
 
-CLI utility to fetch Zephyr test executions and build a weekly summary table.
+CLI-утилита и Redis-воркер для генерации отчётов по тест-экзекьюшенам Zephyr.
 
-## What it does
+Связанный репозиторий: **[zephyr-bot](https://github.com/aldohindanill-netizen/zephyr-bot)** — Telegram-бот для ввода результатов.
 
-- downloads paginated execution data from Zephyr API
-- groups runs by week (week starts on Monday)
-- calculates totals by status (passed/failed/blocked/not executed/other)
-- writes CSV report and prints a console table
+---
 
-## Usage
+## Что делает
 
-Create local config file and set real token:
+- Скачивает пагинированные данные экзекьюшенов из Zephyr API
+- Обнаруживает дерево папок (tree-режим) или выводит папки из экзекьюшенов
+- Агрегирует по ISO-неделям (понедельник) и считает totals по статусам
+- Экспортирует CSV-отчёты и HTML/wiki-страницы для Confluence
+- Предоставляет Redis-воркер (`redis_runner.py`) для управления запусками через очередь
+
+---
+
+## Запуск локально
 
 ```bash
 cp .env.example .env
-# edit .env and set ZEPHYR_API_TOKEN
-```
+# установить ZEPHYR_API_TOKEN и другие переменные
 
-Run report via launcher:
-
-```bash
 bash ./run_navio_folder_report.sh
 ```
 
-The launcher runs in tree-first mode by default:
+Launcher запускает в tree-режиме:
 
-- tries custom tree source first (`ZEPHYR_TREE_SOURCE_*`) when configured
-- tries `POST` on `ZEPHYR_FOLDER_SEARCH_ENDPOINT`
-- falls back to `GET` on `ZEPHYR_FOLDERTREE_ENDPOINT` (working source from HAR: `rest/tests/1.0/project/10904/foldertree/testrun`)
-- selects only matching tree nodes (leaf + regex/path filters)
-- fetches executions for each selected folder id
+- пробует кастомный источник (`ZEPHYR_TREE_SOURCE_*`) если настроен
+- делает `POST` на `ZEPHYR_FOLDER_SEARCH_ENDPOINT`
+- fallback: `GET` на `ZEPHYR_FOLDERTREE_ENDPOINT`
+- выбирает совпадающие узлы (leaf + regex/path фильтры)
+- скачивает экзекьюшены для каждой папки
 
-Outputs:
+---
 
 - summary CSV: `ZEPHYR_OUTPUT` (default `weekly_zephyr_report.csv`)
 - per-folder CSV files: `ZEPHYR_PER_FOLDER_DIR` (default `reports/by_folder`)
@@ -119,30 +120,155 @@ Outputs:
   - `ZEPHYR_TO_DATE=2026-12-31`
 - set `ZEPHYR_DEBUG_FOLDER_FIELDS=true` to print raw folder fields for diagnostics
 
-## Token storage
+## Выходные файлы
 
-Use local `.env` plus environment variable `ZEPHYR_API_TOKEN` loaded by launcher.
+| Переменная | Путь по умолчанию | Содержимое |
+|------------|------------------|-----------|
+| `ZEPHYR_OUTPUT` | `weekly_zephyr_report.csv` | Сводный отчёт по неделям |
+| `ZEPHYR_PER_FOLDER_DIR` | `reports/by_folder/` | Отчёт по каждой папке |
+| `ZEPHYR_CYCLES_CASES_OUTPUT` | `reports/cycles_and_cases.csv` | Папка → цикл → кейс |
+| `ZEPHYR_CASE_STEPS_OUTPUT` | `reports/case_steps.csv` | Кейс → шаги → статус |
+| `ZEPHYR_DAILY_READABLE_DIR` | `reports/daily_readable/` | HTML и wiki для Confluence |
+
+---
 
 - Do not pass token via CLI argument (`--token`) in normal usage.
 - Do not commit `.env` into git.
 - Keep `.env.example` in repo as a safe template.
 - Do not commit `CONFLUENCE_API_TOKEN` to git.
 
-Windows tip (for manual session export, if needed):
+## Деплой на Amvera (Redis-воркер)
 
-```powershell
-[System.Environment]::SetEnvironmentVariable("ZEPHYR_API_TOKEN", "your_token", "User")
+`redis_runner.py` — постоянно работающий воркер. Принимает задания из Redis-очереди и выполняет одно из трёх действий:
+
+| `action` | Что делает |
+|----------|-----------|
+| `run_report` | Запускает полный пайплайн отчёта, пишет CSV в `/data` |
+| `list_folders` | Возвращает дерево папок как JSON-массив |
+| `upload_result` | POST/PUT результат тест-кейса обратно в Zephyr |
+
+### Деплой
+
+1. Создать **преднастроенный сервис Redis** в Amvera.  
+   В разделе «Переменные» добавить секрет `REDIS_ARGS=--requirepass <пароль>`.
+
+2. Создать **проект приложения** из этого репозитория.  
+   В разделе «Переменные» добавить:
+
+   | Переменная | Тип | Значение |
+   |------------|-----|---------|
+   | `ZEPHYR_API_TOKEN` | секрет | токен Zephyr API |
+   | `ZEPHYR_BASE_URL` | переменная | `https://jira.example.com` |
+   | `ZEPHYR_PROJECT_ID` | переменная | `10904` |
+   | `ZEPHYR_ROOT_FOLDER_IDS` | переменная | `10545` |
+   | `REDIS_HOST` | переменная | `amvera-<логин>-run-<имя-redis>` |
+   | `REDIS_PASSWORD` | секрет | пароль Redis |
+
+3. После сохранения переменных — **перезапустить** контейнер.
+
+### Отправить задание из клиента
+
+```python
+import json, redis
+
+r = redis.Redis(host="amvera-user-run-my-redis", port=6379,
+                password="...", decode_responses=True)
+
+# Запустить отчёт
+r.lpush("zephyr:jobs", json.dumps({
+    "action": "run_report",
+    "job_id": "r01",
+    "ZEPHYR_FROM_DATE": "2026-04-01",
+    "ZEPHYR_TO_DATE":   "2026-04-30",
+}))
+
+# Получить результат
+_, raw = r.blpop("zephyr:results")
+print(json.loads(raw)["exit_code"])   # 0 = успех
 ```
+
+### Redis env vars воркера
+
+| Переменная | По умолчанию | Описание |
+|------------|-------------|---------|
+| `REDIS_HOST` | `localhost` | хост Redis |
+| `REDIS_PORT` | `6379` | порт |
+| `REDIS_PASSWORD` | — | пароль |
+| `REDIS_DB` | `0` | номер БД |
+| `REDIS_JOB_QUEUE` | `zephyr:jobs` | ключ очереди заданий |
+| `REDIS_RESULT_KEY` | `zephyr:results` | ключ списка результатов |
+| `REDIS_RESULT_CHANNEL` | `zephyr:done` | pub/sub канал |
+| `REDIS_RESULT_TTL` | `3600` | TTL результатов (сек) |
+| `REDIS_HEARTBEAT_KEY` | `zephyr:heartbeat` | ключ heartbeat |
+| `REDIS_HEARTBEAT_INTERVAL` | `30` | интервал heartbeat (сек) |
+
+---
+
+## Хранение токена
+
+- Используйте `.env` + переменная `ZEPHYR_API_TOKEN`, загружаемая лаунчером.
+- Не передавайте токен через `--token` в обычном использовании.
+- Не коммитьте `.env` в git.
+- `.env.example` — безопасный шаблон, хранится в репозитории.
+
+---
+
+## Устранение неполадок
+
+### TelegramConflictError: can't use getUpdates while webhook is active
+
+Если Telegram-бот падает с ошибкой вида:
+
+```
+TelegramConflictError: Conflict: can't use getUpdates method while webhook is active;
+use deleteWebhook to delete the webhook first
+```
+
+Это значит, что ранее для бота был зарегистрирован webhook, и теперь он мешает работе в режиме polling.
+
+**Быстрое решение — удалить webhook один раз:**
+
+```bash
+TELEGRAM_BOT_TOKEN=<токен> python delete_webhook.py
+```
+
+Или через curl:
+
+```bash
+curl "https://api.telegram.org/bot<TOKEN>/deleteWebhook?drop_pending_updates=true"
+```
+
+**Постоянное решение** — добавить удаление webhook в стартап бота перед запуском polling.
+Для aiogram 3.x это делается через `await bot.delete_webhook(drop_pending_updates=True)`
+перед вызовом `await dp.start_polling(bot)`:
+
+```python
+import asyncio
+from aiogram import Bot, Dispatcher
+
+BOT_TOKEN = "YOUR_BOT_TOKEN"
+
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher()
+
+async def main():
+    await bot.delete_webhook(drop_pending_updates=True)
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+Это гарантирует, что даже если ранее был зарегистрирован webhook (например, при деплое
+на Amvera или в другой webhook-среде), при каждом запуске бот корректно переключится
+в режим polling без `TelegramConflictError`.
+
+---
 
 ## Notes
 
-- Default auth header is `Authorization: Bearer <token>`.
-- Tree discovery endpoints are configurable via:
-  - `ZEPHYR_FOLDER_SEARCH_ENDPOINT`
-  - `ZEPHYR_FOLDERTREE_ENDPOINT`
-- Set `ZEPHYR_TREE_AUTOPROBE=true` only for diagnostics; keep it `false` in stable mode.
-- Folder query template must include `{folder_id}` placeholder.
-- If your Zephyr instance uses different fields for date/status, pass custom paths:
-  - `--date-field "some.path.to.date"`
-  - `--status-field "some.path.to.status"`
-- You can pass multiple `--date-field` or `--status-field` values.
+- Заголовок авторизации по умолчанию: `Authorization: Bearer <token>`.
+- Эндпоинты обнаружения папок настраиваются через `ZEPHYR_FOLDER_SEARCH_ENDPOINT` / `ZEPHYR_FOLDERTREE_ENDPOINT`.
+- `ZEPHYR_TREE_AUTOPROBE=true` — только для диагностики.
+- `ZEPHYR_QUERY_TEMPLATE` должен содержать плейсхолдер `{folder_id}`.
+- Для кастомных полей даты/статуса: `--date-field` / `--status-field` (можно передавать несколько).
