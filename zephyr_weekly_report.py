@@ -2218,6 +2218,905 @@ def _prepare_cycle_cases_with_groups(cycle: dict[str, Any]) -> tuple[list[dict[s
     return prepared, spans
 
 
+def _cycle_sort_key(cycle: dict[str, Any]) -> tuple[str, str, str]:
+    return (
+        str(cycle.get("cycle_key") or ""),
+        str(cycle.get("cycle_name") or ""),
+        str(cycle.get("cycle_id") or ""),
+    )
+
+
+_GROUP_TITLE_STOPWORDS = {
+    "и",
+    "или",
+    "а",
+    "но",
+    "в",
+    "во",
+    "на",
+    "по",
+    "с",
+    "со",
+    "без",
+    "для",
+    "из",
+    "под",
+    "над",
+    "к",
+    "ко",
+    "у",
+    "о",
+    "об",
+    "обо",
+    "при",
+    "от",
+    "до",
+    "слева",
+    "справа",
+    "слева.",
+    "справа.",
+}
+
+
+def _clean_cycle_name_for_grouping(name: str) -> str:
+    plain = _plain_from_html_like(name or "")
+    no_index = re.sub(r"(?<!\d)\d+\.\d+(?!\d)", " ", plain)
+    no_iteration = re.sub(r"(?i)\bитерац(?:ия|ии)\s*\d+\b", " ", no_index)
+    no_brackets = re.sub(r"[()\\[\\]{}:;,.!?\"']", " ", no_iteration)
+    return re.sub(r"\s+", " ", no_brackets).strip()
+
+
+def _title_tokens(cleaned_name: str) -> list[str]:
+    return re.findall(r"[A-Za-zА-Яа-яЁё0-9-]+", cleaned_name)
+
+
+def _common_prefix_tokens(token_rows: list[list[str]]) -> list[str]:
+    if not token_rows:
+        return []
+    prefix = list(token_rows[0])
+    for row in token_rows[1:]:
+        limit = min(len(prefix), len(row))
+        i = 0
+        while i < limit and prefix[i].lower() == row[i].lower():
+            i += 1
+        prefix = prefix[:i]
+        if not prefix:
+            break
+    return prefix
+
+
+def _prettify_group_title(title: str) -> str:
+    cleaned = re.sub(r"(?i)\bиз\s+под\b", "из-под", title or "")
+    return re.sub(r"\s+", " ", cleaned).strip()
+
+
+def _extract_meaningful_tokens(name: str) -> list[tuple[str, str]]:
+    cleaned = _clean_cycle_name_for_grouping(name)
+    raw_tokens = _title_tokens(cleaned)
+    meaningful: list[tuple[str, str]] = []
+    for token in raw_tokens:
+        lowered = token.lower()
+        if lowered in _GROUP_TITLE_STOPWORDS:
+            continue
+        normalized = lowered
+        if normalized in _GROUP_TITLE_STOPWORDS:
+            continue
+        if len(normalized) < 2:
+            continue
+        meaningful.append((token, normalized))
+    return meaningful
+
+
+def _build_group_title(cycles: list[dict[str, Any]]) -> str:
+    if not cycles:
+        return "Тестовые циклы"
+
+    cleaned_titles = [
+        _clean_cycle_name_for_grouping(str(cycle.get("cycle_name") or cycle.get("cycle_key") or ""))
+        for cycle in cycles
+    ]
+    token_rows = [_title_tokens(title) for title in cleaned_titles if title]
+    prefix_tokens = _common_prefix_tokens(token_rows)
+    while prefix_tokens and prefix_tokens[-1].lower() in _GROUP_TITLE_STOPWORDS:
+        prefix_tokens.pop()
+    if prefix_tokens:
+        return _prettify_group_title(" ".join(prefix_tokens))
+
+    token_sets: list[set[str]] = []
+    first_tokens = _extract_meaningful_tokens(str(cycles[0].get("cycle_name") or ""))
+    if not first_tokens:
+        fallback = cleaned_titles[0] if cleaned_titles else ""
+        return fallback or str(cycles[0].get("cycle_name") or cycles[0].get("cycle_key") or "Тестовые циклы")
+    token_sets.append({norm for _, norm in first_tokens})
+    for cycle in cycles[1:]:
+        tokens = _extract_meaningful_tokens(str(cycle.get("cycle_name") or ""))
+        token_sets.append({norm for _, norm in tokens})
+
+    common_tokens = set.intersection(*token_sets) if token_sets else set()
+    if not common_tokens:
+        fallback = cleaned_titles[0] if cleaned_titles else ""
+        return fallback or str(cycles[0].get("cycle_name") or cycles[0].get("cycle_key") or "Тестовые циклы")
+
+    ordered_common: list[str] = []
+    seen: set[str] = set()
+    for original, normalized in first_tokens:
+        if normalized in common_tokens and normalized not in seen:
+            ordered_common.append(original)
+            seen.add(normalized)
+
+    if not ordered_common:
+        fallback = cleaned_titles[0] if cleaned_titles else ""
+        return fallback or str(cycles[0].get("cycle_name") or cycles[0].get("cycle_key") or "Тестовые циклы")
+
+    return _prettify_group_title(" ".join(ordered_common))
+
+
+def _build_summary_cycle_label(row: dict[str, Any]) -> str:
+    cycle_index = str(row.get("cycle_index") or "").strip()
+    cycle_title = str(row.get("cycle_title") or "").strip()
+    if cycle_index and cycle_title:
+        if re.match(rf"^{re.escape(cycle_index)}\b", cycle_title):
+            return _prettify_group_title(cycle_title)
+        return _prettify_group_title(f"{cycle_index} {cycle_title}")
+    label = cycle_index or str(row.get("cycle_key") or "").strip() or cycle_title
+    return _prettify_group_title(label)
+
+
+def _summary_scenario_group(row: dict[str, Any]) -> str:
+    cycle_index = str(row.get("cycle_index") or "").strip()
+    match = re.match(r"^(\d+)\.\d+$", cycle_index)
+    if match:
+        return match.group(1)
+    return ""
+
+
+def _summary_group_title_from_labels(labels: list[str], fallback_group: str) -> str:
+    meaningful_rows: list[list[tuple[str, str]]] = []
+    for label in labels:
+        cleaned = re.sub(r"^\s*\d+\.\d+\s*", "", str(label or "")).strip()
+        tokens = _extract_meaningful_tokens(cleaned)
+        if tokens:
+            meaningful_rows.append(tokens)
+    if not meaningful_rows:
+        return fallback_group
+    common_tokens = set(norm for _, norm in meaningful_rows[0])
+    for token_row in meaningful_rows[1:]:
+        common_tokens &= {norm for _, norm in token_row}
+    if not common_tokens:
+        first_clean = re.sub(r"^\s*\d+\.\d+\s*", "", str(labels[0] if labels else "")).strip()
+        return first_clean or fallback_group
+    ordered: list[str] = []
+    used: set[str] = set()
+    for original, normalized in meaningful_rows[0]:
+        if normalized in common_tokens and normalized not in used:
+            ordered.append(original)
+            used.add(normalized)
+    if not ordered:
+        first_clean = re.sub(r"^\s*\d+\.\d+\s*", "", str(labels[0] if labels else "")).strip()
+        raw_title = first_clean or fallback_group
+    else:
+        raw_title = _prettify_group_title(" ".join(ordered))
+    # Human-friendly fixes for shortened Russian phrases in grouped totals.
+    friendly = raw_title
+    friendly = re.sub(r"(?i)\bчастично\s+полосе\b", "частично в полосе", friendly)
+    friendly = re.sub(r"(?i)\bзоне\s+видимости\b", "в зоне видимости", friendly)
+    return friendly
+
+
+def _summary_sort_key(row: dict[str, Any]) -> tuple[int, int | str, int | str, str, str]:
+    cycle_index = str(row.get("cycle_index") or "").strip()
+    match = re.match(r"^(\d+)\.(\d+)$", cycle_index)
+    if match:
+        return (
+            0,
+            int(match.group(1)),
+            int(match.group(2)),
+            str(row.get("cycle_title") or ""),
+            str(row.get("cycle_key") or ""),
+        )
+    return (
+        1,
+        str(row.get("cycle_key") or ""),
+        str(row.get("cycle_title") or ""),
+        str(row.get("cycle_index") or ""),
+        "",
+    )
+
+
+def _extract_cycle_index(cycle: dict[str, Any]) -> str:
+    """
+    Extract dotted index like '1.1' from cycle name/key.
+    Prefer cycle_name because business naming can contain the required index.
+    """
+    candidates = [
+        str(cycle.get("cycle_name") or "").strip(),
+        str(cycle.get("cycle_key") or "").strip(),
+        str(cycle.get("cycle_id") or "").strip(),
+    ]
+    for value in candidates:
+        if not value:
+            continue
+        match = re.search(r"(?<!\d)(\d+\.\d+)(?!\d)", value)
+        if match:
+            return match.group(1)
+    return ""
+
+
+def _parse_cycle_group_id(cycle: dict[str, Any]) -> str:
+    cycle_index = _extract_cycle_index(cycle)
+    match = re.match(r"^(\d+)\.\d+$", cycle_index)
+    if match:
+        return match.group(1)
+    cycle_name = str(cycle.get("cycle_name") or "").strip()
+    cycle_key = str(cycle.get("cycle_key") or "").strip()
+    return cycle_name or cycle_key or str(cycle.get("cycle_id") or "")
+
+
+def _group_cycles_by_prefix(cycles: dict[str, Any]) -> list[dict[str, Any]]:
+    grouped: dict[str, dict[str, Any]] = {}
+    for cycle in cycles.values():
+        group_id = _parse_cycle_group_id(cycle)
+        group_bucket = grouped.setdefault(group_id, {"group_id": group_id, "cycles": []})
+        group_bucket["cycles"].append(cycle)
+
+    def group_sort_key(item: dict[str, Any]) -> tuple[int, int | str]:
+        group_id = str(item.get("group_id") or "")
+        if group_id.isdigit():
+            return (0, int(group_id))
+        return (1, group_id.lower())
+
+    result: list[dict[str, Any]] = []
+    for group in grouped.values():
+        group_cycles = sorted(group["cycles"], key=_cycle_sort_key)
+        result.append(
+            {
+                "group_id": group["group_id"],
+                "group_title": _build_group_title(group_cycles),
+                "cycles": group_cycles,
+            }
+        )
+    result.sort(key=group_sort_key)
+    return result
+
+
+def _build_cycle_progress_rows(cycles: dict[str, Any]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for cycle in sorted(cycles.values(), key=_cycle_sort_key):
+        cycle_title = cycle.get("cycle_name") or cycle.get("cycle_key") or cycle.get("cycle_id") or "Unnamed cycle"
+        cycle_index = _extract_cycle_index(cycle)
+        cycle_key = str(cycle.get("cycle_key") or "")
+        total_cases = len(cycle.get("cases", {}))
+        passed_cases = 0
+        not_executed_cases = 0
+        blocked_cases = 0
+        for case in cycle.get("cases", {}).values():
+            normalized = normalize_status(case.get("result", case.get("test_case_status", "")))
+            if normalized == "passed":
+                passed_cases += 1
+            elif normalized == "not_executed":
+                not_executed_cases += 1
+            elif normalized == "blocked":
+                blocked_cases += 1
+        all_not_executed = total_cases > 0 and not_executed_cases == total_cases
+        all_blocked = total_cases > 0 and blocked_cases == total_cases
+        rows.append(
+            {
+                "cycle_title": str(cycle_title),
+                "cycle_index": cycle_index,
+                "cycle_key": cycle_key,
+                "total_cases": total_cases,
+                "passed_cases": passed_cases,
+                "not_executed_cases": not_executed_cases,
+                "blocked_cases": blocked_cases,
+                "all_not_executed": all_not_executed,
+                "all_blocked": all_blocked,
+            }
+        )
+    return rows
+
+
+def _passed_count_color(
+    passed_cases: int, *, all_not_executed: bool = False, all_blocked: bool = False
+) -> str:
+    if passed_cases <= 0:
+        if all_blocked:
+            return "#4a90e2"
+        if all_not_executed:
+            return "#c9c9c2"
+        return "#ff9074"
+    if passed_cases == 1:
+        return "#ffc402"
+    if passed_cases == 2:
+        return "#37b37e"
+    return "#01875b"
+
+
+def _passed_count_text_color(
+    passed_cases: int, *, all_not_executed: bool = False, all_blocked: bool = False
+) -> str:
+    if passed_cases <= 0 and all_blocked:
+        return "#ffffff"
+    if passed_cases <= 0 and all_not_executed:
+        return "#2f2f2f"
+    return "#2f2f2f" if passed_cases <= 1 else "#ffffff"
+
+
+def _cycle_progress_csv_rows(
+    report_data: dict[tuple[str, str], dict[str, Any]],
+) -> list[list[str]]:
+    rows: list[list[str]] = []
+    for (folder_id, folder_name), payload in sorted(report_data.items(), key=lambda item: item[0][1]):
+        cycles = payload.get("cycles", {})
+        for cycle in sorted(cycles.values(), key=_cycle_sort_key):
+            cycle_key = str(cycle.get("cycle_key") or "")
+            cycle_name = str(cycle.get("cycle_name") or "")
+            total_cases = len(cycle.get("cases", {}))
+            passed_cases = 0
+            for case in cycle.get("cases", {}).values():
+                normalized = normalize_status(case.get("result", case.get("test_case_status", "")))
+                if normalized == "passed":
+                    passed_cases += 1
+            rows.append(
+                [
+                    str(folder_id),
+                    str(folder_name),
+                    cycle_key,
+                    cycle_name,
+                    str(total_cases),
+                    str(passed_cases),
+                ]
+            )
+    return rows
+
+
+def write_cycle_progress_csv(path: str, rows: list[list[str]]) -> bool:
+    header = [
+        "folder_id",
+        "folder_name",
+        "cycle_key",
+        "cycle_name",
+        "total_cases",
+        "passed_cases",
+    ]
+    buffer = io.StringIO()
+    writer = csv.writer(buffer, lineterminator="\n")
+    writer.writerow(header)
+    writer.writerows(rows)
+    return _write_text_if_changed(path, buffer.getvalue())
+
+
+def _weekly_cycle_display_label(cycle: dict[str, Any]) -> str:
+    cycle_name = str(cycle.get("cycle_name") or "").strip()
+    cycle_key = str(cycle.get("cycle_key") or "").strip()
+    return cycle_name or cycle_key or str(cycle.get("cycle_id") or "Unnamed cycle")
+
+
+def _weekly_cycle_sort_key_from_cycle(cycle: dict[str, Any]) -> tuple[int, int | str, int | str, str, str]:
+    cycle_name = str(cycle.get("cycle_name") or "").strip()
+    summary_row = {
+        "cycle_index": _extract_cycle_index(cycle),
+        "cycle_title": cycle_name,
+        "cycle_key": str(cycle.get("cycle_key") or "").strip(),
+    }
+    return _summary_sort_key(summary_row)
+
+
+def _default_weekday_labels() -> list[str]:
+    return ["База", "Вт", "Ср", "Чт", "Пт"]
+
+
+def _parse_report_day_from_folder_name(folder_name: str) -> date | None:
+    raw_name = str(folder_name or "").strip()
+    if not raw_name:
+        return None
+    dotted_matches = re.findall(r"\b(\d{2}\.\d{2}\.\d{4})\b", raw_name)
+    if dotted_matches:
+        # New folder naming: the report day is the right-most dd.mm.yyyy date.
+        try:
+            return datetime.strptime(dotted_matches[-1], "%d.%m.%Y").date()
+        except ValueError:
+            pass
+    for pattern in ("%Y.%m.%d", "%Y-%m-%d", "%Y_%m_%d"):
+        try:
+            return datetime.strptime(raw_name, pattern).date()
+        except ValueError:
+            continue
+    return None
+
+
+def _parse_weekly_column_label_from_folder_name(folder_name: str) -> str | None:
+    raw_name = str(folder_name or "").strip()
+    if not raw_name:
+        return None
+    match = re.match(r"^(nightly-dev-\d{4}[._-]\d{2}[._-]\d{2})\b", raw_name, flags=re.IGNORECASE)
+    if not match:
+        return None
+    return match.group(1)
+
+
+def _resolve_folder_dominant_actual_date(cycles: dict[str, Any]) -> date | None:
+    date_counter: Counter[date] = Counter()
+    for cycle in cycles.values():
+        if not isinstance(cycle, dict):
+            continue
+        for case in cycle.get("cases", {}).values():
+            if not isinstance(case, dict):
+                continue
+            display_day = _parse_display_date(_resolve_case_display_date(case))
+            if display_day is None:
+                continue
+            date_counter[display_day] += 1
+    if not date_counter:
+        return None
+    top_count = max(date_counter.values())
+    candidates = sorted(day for day, count in date_counter.items() if count == top_count)
+    return candidates[0]
+
+
+def _resolve_daily_title_day(cycles: dict[str, Any]) -> date | None:
+    title_date = _resolve_daily_title_date(cycles)
+    if not title_date:
+        return None
+    return _parse_display_date(title_date)
+
+
+def _normalize_weekly_cycle_label(label: str) -> tuple[str, bool]:
+    raw = _prettify_group_title(str(label or "").strip())
+    if not raw:
+        return "", False
+    normalized = re.sub(r"\s*\((?:cloned|клонированный)\)\s*$", "", raw, flags=re.IGNORECASE).strip()
+    if not normalized:
+        normalized = raw
+    is_cloned = normalized != raw
+    return normalized, is_cloned
+
+
+def _resolve_folder_report_day(folder_name: str, cycles: dict[str, Any]) -> date | None:
+    parsed_from_folder_name = _parse_report_day_from_folder_name(folder_name)
+    if parsed_from_folder_name is not None:
+        return parsed_from_folder_name
+    return _resolve_folder_dominant_actual_date(cycles)
+
+
+def _filter_report_data_by_resolved_folder_day(
+    report_data: dict[tuple[str, str], dict[str, Any]],
+    from_date: date,
+    to_date: date,
+) -> dict[tuple[str, str], dict[str, Any]]:
+    out: dict[tuple[str, str], dict[str, Any]] = {}
+    for key, payload in report_data.items():
+        _folder_id, folder_name = key
+        cycles = payload.get("cycles", {})
+        if not isinstance(cycles, dict):
+            continue
+        rd = _resolve_folder_report_day(folder_name, cycles)
+        if rd is None:
+            out[key] = payload
+        elif from_date <= rd <= to_date:
+            out[key] = payload
+    return out
+
+
+def _weekly_cycle_matrix_data(
+    report_data: dict[tuple[str, str], dict[str, Any]]
+) -> tuple[date | None, list[str], list[list[str]], list[list[bool]], list[list[bool]]]:
+    weekly_groups: dict[date, list[dict[str, Any]]] = defaultdict(list)
+    for (folder_id, folder_name), payload in report_data.items():
+        cycles = payload.get("cycles", {})
+        if not isinstance(cycles, dict):
+            continue
+        report_day = _resolve_folder_report_day(folder_name, cycles)
+        if report_day is None:
+            report_day = _resolve_daily_title_day(cycles)
+        if report_day is None or report_day.weekday() > 4:
+            continue
+        progress_rows = _build_cycle_progress_rows(cycles)
+        if not progress_rows:
+            continue
+        week_start = report_day - timedelta(days=report_day.weekday())
+        weekly_groups[week_start].append(
+            {
+                "folder_id": str(folder_id),
+                "report_day": report_day,
+                "column_label": _parse_weekly_column_label_from_folder_name(folder_name),
+                "progress_rows": progress_rows,
+            }
+        )
+
+    if not weekly_groups:
+        return None, [], [], []
+
+    def _aggregate_progress_map(
+        progress_rows: list[dict[str, Any]],
+    ) -> dict[str, dict[str, Any]]:
+        aggregated: dict[str, dict[str, Any]] = {}
+        for progress_row in progress_rows:
+            label = _build_summary_cycle_label(progress_row)
+            normalized_label, is_cloned = _normalize_weekly_cycle_label(label)
+            if not normalized_label:
+                continue
+            cycle_sort_key = _summary_sort_key(progress_row)
+            total_cases = int(progress_row.get("total_cases", 0))
+            passed_cases = int(progress_row.get("passed_cases", 0))
+            all_not_executed = bool(progress_row.get("all_not_executed", False))
+            existing = aggregated.get(normalized_label)
+            if existing is None:
+                aggregated[normalized_label] = {
+                    "sort_key": cycle_sort_key,
+                    "total_cases": total_cases,
+                    "passed_cases": passed_cases,
+                    "all_not_executed": all_not_executed,
+                    "all_blocked": bool(progress_row.get("all_blocked", False)),
+                    "is_cloned": is_cloned,
+                }
+                continue
+            # Prefer non-cloned row; use cloned only as fallback when base is absent.
+            if existing["is_cloned"] and not is_cloned:
+                aggregated[normalized_label] = {
+                    "sort_key": cycle_sort_key,
+                    "total_cases": total_cases,
+                    "passed_cases": passed_cases,
+                    "all_not_executed": all_not_executed,
+                    "all_blocked": bool(progress_row.get("all_blocked", False)),
+                    "is_cloned": False,
+                }
+                continue
+            if (not existing["is_cloned"]) and is_cloned:
+                continue
+            if cycle_sort_key < existing["sort_key"]:
+                existing["sort_key"] = cycle_sort_key
+            existing["total_cases"] = max(existing["total_cases"], total_cases)
+            existing["passed_cases"] = max(existing["passed_cases"], passed_cases)
+            existing["all_not_executed"] = existing["all_not_executed"] and all_not_executed
+            existing["all_blocked"] = existing["all_blocked"] and bool(
+                progress_row.get("all_blocked", False)
+            )
+        return aggregated
+
+    # Export the latest available week (matches README behavior).
+    target_week_start = max(weekly_groups.keys())
+    week_daily_summaries = sorted(
+        weekly_groups[target_week_start],
+        key=lambda item: (item["report_day"], item["folder_id"]),
+    )
+    progress_rows_by_day: dict[date, list[dict[str, Any]]] = defaultdict(list)
+    column_labels_by_day: dict[date, list[str]] = defaultdict(list)
+    for summary in week_daily_summaries:
+        progress_rows_by_day[summary["report_day"]].extend(summary["progress_rows"])
+        column_label = str(summary.get("column_label") or "").strip()
+        if column_label:
+            column_labels_by_day[summary["report_day"]].append(column_label)
+    ordered_days = sorted(progress_rows_by_day.keys())
+    column_labels: list[str] = []
+    for day in ordered_days:
+        day_labels = column_labels_by_day.get(day, [])
+        if day_labels:
+            column_labels.append(Counter(day_labels).most_common(1)[0][0])
+        else:
+            column_labels.append(f"nightly-dev-{day.strftime('%Y.%m.%d')}")
+
+    day_maps: dict[date, dict[str, dict[str, Any]]] = {}
+    joined_passed_by_label: dict[str, dict[str, int]] = {}
+    joined_totals_by_label: dict[str, dict[str, int]] = {}
+    joined_all_not_executed_by_label: dict[str, dict[str, bool]] = {}
+    joined_all_blocked_by_label: dict[str, dict[str, bool]] = {}
+    for day_date, day_label in zip(ordered_days, column_labels):
+        day_map = _aggregate_progress_map(progress_rows_by_day[day_date])
+        day_maps[day_date] = day_map
+        joined_passed_by_label[day_label] = {
+            cycle_label: int(day_payload["passed_cases"])
+            for cycle_label, day_payload in day_map.items()
+        }
+        joined_totals_by_label[day_label] = {
+            cycle_label: int(day_payload["total_cases"])
+            for cycle_label, day_payload in day_map.items()
+        }
+        joined_all_not_executed_by_label[day_label] = {
+            cycle_label: bool(day_payload.get("all_not_executed", False))
+            for cycle_label, day_payload in day_map.items()
+        }
+        joined_all_blocked_by_label[day_label] = {
+            cycle_label: bool(day_payload.get("all_blocked", False))
+            for cycle_label, day_payload in day_map.items()
+        }
+
+    all_cycle_labels: set[str] = set()
+    for day_map in day_maps.values():
+        all_cycle_labels.update(day_map.keys())
+    if not all_cycle_labels:
+        return target_week_start, column_labels, [], [], []
+
+    sort_key_by_cycle: dict[str, tuple[Any, ...]] = {}
+    for cycle_label in all_cycle_labels:
+        sort_candidates: list[tuple[Any, ...]] = []
+        for day_map in day_maps.values():
+            payload = day_map.get(cycle_label)
+            if payload is None:
+                continue
+            sort_candidates.append(payload["sort_key"])
+        if sort_candidates:
+            sort_key_by_cycle[cycle_label] = min(sort_candidates)
+
+    rows: list[list[str]] = []
+    cell_all_not_executed: list[list[bool]] = []
+    cell_all_blocked: list[list[bool]] = []
+    for cycle_label in sorted(
+        all_cycle_labels,
+        key=lambda label: (sort_key_by_cycle.get(label, (9_999_999, label, "", "", "")), label.lower()),
+    ):
+        total_cases = 0
+        for totals_map in joined_totals_by_label.values():
+            total_cases = max(total_cases, int(totals_map.get(cycle_label, 0)))
+        row = [cycle_label, str(total_cases)]
+        ne_flags: list[bool] = []
+        blocked_flags: list[bool] = []
+        for day_label in column_labels:
+            row.append(str(joined_passed_by_label.get(day_label, {}).get(cycle_label, 0)))
+            ne_flags.append(bool(joined_all_not_executed_by_label.get(day_label, {}).get(cycle_label, False)))
+            blocked_flags.append(bool(joined_all_blocked_by_label.get(day_label, {}).get(cycle_label, False)))
+        rows.append(row)
+        cell_all_not_executed.append(ne_flags)
+        cell_all_blocked.append(blocked_flags)
+
+    # Insert group subtotal row before each scenario group.
+    grouped_rows: list[list[str]] = []
+    grouped_ne_flags: list[list[bool]] = []
+    grouped_blocked_flags: list[list[bool]] = []
+
+    index = 0
+    while index < len(rows):
+        group_start = index
+        row = rows[index]
+        group_id = _summary_scenario_group(
+            {"cycle_index": _extract_cycle_index({"cycle_name": row[0]}), "cycle_title": row[0], "cycle_key": ""}
+        ) or "Прочее"
+        group_labels: list[str] = []
+        group_total_cases = 0
+        group_day_sums = [0] * len(column_labels)
+        while index < len(rows):
+            current = rows[index]
+            current_group_id = _summary_scenario_group(
+                {
+                    "cycle_index": _extract_cycle_index({"cycle_name": current[0]}),
+                    "cycle_title": current[0],
+                    "cycle_key": "",
+                }
+            ) or "Прочее"
+            if current_group_id != group_id:
+                break
+            group_labels.append(str(current[0]))
+            group_total_cases += int(current[1]) if len(current) > 1 else 0
+            for day_idx in range(len(column_labels)):
+                group_day_sums[day_idx] += int(current[2 + day_idx]) if 2 + day_idx < len(current) else 0
+            index += 1
+
+        group_title = _summary_group_title_from_labels(group_labels, fallback_group=group_id)
+        subtotal_row = [f"Итого: {group_title}", str(group_total_cases)]
+        subtotal_row.extend(str(value) for value in group_day_sums)
+        grouped_rows.append(subtotal_row)
+        grouped_ne_flags.append([False] * len(column_labels))
+        grouped_blocked_flags.append([False] * len(column_labels))
+
+        for copy_idx in range(group_start, index):
+            grouped_rows.append(rows[copy_idx])
+            grouped_ne_flags.append(cell_all_not_executed[copy_idx])
+            grouped_blocked_flags.append(cell_all_blocked[copy_idx])
+
+    return target_week_start, column_labels, grouped_rows, grouped_ne_flags, grouped_blocked_flags
+
+
+def _weekly_cycle_matrix_rows(report_data: dict[tuple[str, str], dict[str, Any]]) -> list[list[str]]:
+    _, _, rows, _, _ = _weekly_cycle_matrix_data(report_data)
+    return rows
+
+
+def _split_report_data_by_week(
+    report_data: dict[tuple[str, str], dict[str, Any]]
+) -> dict[date, dict[tuple[str, str], dict[str, Any]]]:
+    grouped: dict[date, dict[tuple[str, str], dict[str, Any]]] = defaultdict(dict)
+    for key, payload in report_data.items():
+        folder_id, folder_name = key
+        cycles = payload.get("cycles", {})
+        if not isinstance(cycles, dict):
+            continue
+        report_day = _resolve_folder_report_day(folder_name, cycles)
+        if report_day is None:
+            report_day = _resolve_daily_title_day(cycles)
+        if report_day is None or report_day.weekday() > 4:
+            continue
+        progress_rows = _build_cycle_progress_rows(cycles)
+        if not progress_rows:
+            continue
+        week_start = report_day - timedelta(days=report_day.weekday())
+        grouped[week_start][(folder_id, folder_name)] = payload
+    return grouped
+
+
+def _weekly_cycle_matrix_data_all(
+    report_data: dict[tuple[str, str], dict[str, Any]]
+) -> list[tuple[date | None, list[str], list[list[str]], list[list[bool]], list[list[bool]]]]:
+    by_week = _split_report_data_by_week(report_data)
+    matrices: list[tuple[date | None, list[str], list[list[str]], list[list[bool]], list[list[bool]]]] = []
+    for week_start in sorted(by_week.keys()):
+        matrices.append(_weekly_cycle_matrix_data(by_week[week_start]))
+    return matrices
+
+
+def _weekly_output_path_for_week(base_path: str, week_start: date | None) -> str:
+    if week_start is None:
+        return base_path
+    root, ext = os.path.splitext(base_path)
+    return f"{root}_{week_start.isoformat()}{ext}"
+
+
+def write_weekly_cycle_matrix_csv(path: str, weekday_labels: list[str], rows: list[list[str]]) -> bool:
+    header = [
+        "Тестовый цикл",
+        "Всего кейсов",
+    ]
+    header.extend(label for label in weekday_labels)
+    buffer = io.StringIO()
+    writer = csv.writer(buffer, lineterminator="\n")
+    writer.writerow(header)
+    writer.writerows(rows)
+    return _write_text_if_changed(path, buffer.getvalue())
+
+
+def render_weekly_html_report(
+    week_start: date | None,
+    weekday_labels: list[str],
+    rows: list[list[str]],
+    cell_all_not_executed: list[list[bool]] | None = None,
+    cell_all_blocked: list[list[bool]] | None = None,
+) -> str:
+    week_label = week_start.isoformat() if week_start else "N/A"
+    labels = list(weekday_labels)
+    col_count = 2 + len(labels)
+    header_cells = ["<th>Тестовый цикл</th>", "<th>Всего кейсов</th>"]
+    header_cells.extend(f"<th>{html.escape(label)}</th>" for label in labels)
+    sections = [
+        "<!doctype html>",
+        "<html><head><meta charset='utf-8'>",
+        f"<title>Weekly cycle matrix: {html.escape(week_label)}</title>",
+        (
+            "<style>"
+            "body{font-family:Arial,sans-serif;margin:24px;}"
+            "h1{margin-bottom:8px;}table{border-collapse:collapse;width:100%;margin-bottom:16px;table-layout:fixed;}"
+            "th,td{border:1px solid #d6d6d6;padding:6px 8px;text-align:left;vertical-align:top;overflow-wrap:anywhere;word-wrap:break-word;}"
+            "th{background:#f0f2f5;font-weight:600;}.passed-count-cell{font-weight:400;text-align:center;}"
+            ".total-cases-cell{text-align:center;}"
+            ".group-total-row td{font-weight:700;background:#ffffff;color:#1f2328;}"
+            ".group-total-row td:not(:first-child){text-align:center;}"
+            ".scenario-sep td{border:none;height:8px;padding:0;background:transparent;}"
+            "</style>"
+        ),
+        "</head><body>",
+        f"<h1>Weekly cycle matrix: {html.escape(week_label)}</h1>",
+        "<table>",
+        "<thead><tr>" + "".join(header_cells) + "</tr></thead><tbody>",
+    ]
+    for row_idx, row in enumerate(rows):
+        if str(row[0]).startswith("Итого:"):
+            total_cells = [
+                f"<td style='font-weight:700;background:#ffffff;color:#1f2328;'>{html.escape(row[0])}</td>",
+                (
+                    "<td class='total-cases-cell' "
+                    "style='font-weight:700;background:#ffffff;color:#1f2328;text-align:center;'>"
+                    f"{html.escape(row[1])}</td>"
+                ),
+            ]
+            total_cells.extend(
+                (
+                    "<td style='font-weight:700;background:#ffffff;color:#1f2328;text-align:center;'>"
+                    f"{html.escape(row[2 + idx] if 2 + idx < len(row) else '0')}</td>"
+                )
+                for idx in range(len(labels))
+            )
+            sections.append(
+                (
+                    "<tr class='group-total-row'>"
+                    + "".join(total_cells)
+                    + "</tr>"
+                )
+            )
+            continue
+        passed_cells: list[str] = []
+        ne_row = (
+            cell_all_not_executed[row_idx]
+            if cell_all_not_executed and row_idx < len(cell_all_not_executed)
+            else []
+        )
+        blocked_row = (
+            cell_all_blocked[row_idx]
+            if cell_all_blocked and row_idx < len(cell_all_blocked)
+            else []
+        )
+        for idx in range(len(labels)):
+            passed_value = int(row[2 + idx]) if 2 + idx < len(row) else 0
+            all_ne = bool(ne_row[idx]) if idx < len(ne_row) else False
+            all_blocked = bool(blocked_row[idx]) if idx < len(blocked_row) else False
+            passed_cells.append(
+                "<td class='passed-count-cell' "
+                f"style='background:{_passed_count_color(passed_value, all_not_executed=all_ne, all_blocked=all_blocked)};"
+                f"color:{_passed_count_text_color(passed_value, all_not_executed=all_ne, all_blocked=all_blocked)};"
+                "text-align:center;'>"
+                f"{passed_value}</td>"
+            )
+        sections.append(
+            (
+                "<tr>"
+                f"<td>{html.escape(row[0])}</td>"
+                f"<td class='total-cases-cell' style='text-align:center;'>{html.escape(row[1])}</td>"
+                + "".join(passed_cells)
+                + "</tr>"
+            )
+        )
+    sections.extend(["</tbody></table>", "</body></html>"])
+    return "\n".join(sections)
+
+
+def render_weekly_wiki_report(
+    week_start: date | None,
+    weekday_labels: list[str],
+    rows: list[list[str]],
+) -> str:
+    week_label = week_start.isoformat() if week_start else "N/A"
+    labels = list(weekday_labels)
+    lines = [f"h1. Weekly cycle matrix: {_wiki_escape(week_label)}", ""]
+    header_cells = ["Тестовый цикл", "Всего кейсов"]
+    header_cells.extend(f"{_wiki_escape(label)}" for label in labels)
+    lines.append("|| " + " || ".join(header_cells) + " ||")
+    for row in rows:
+        if str(row[0]).startswith("Итого:"):
+            row_values = [f"*{row[0]}*", f"*{row[1]}*"]
+            for idx in range(len(labels)):
+                row_values.append(f"*{row[2 + idx] if 2 + idx < len(row) else '0'}*")
+            lines.append("| " + " | ".join(_wiki_escape(str(value)) for value in row_values) + " |")
+            continue
+        row_values = [row[0], row[1]]
+        for idx in range(len(labels)):
+            row_values.append(row[2 + idx] if 2 + idx < len(row) else "0")
+        lines.append(
+            "| "
+            + " | ".join(_wiki_escape(str(value)) for value in row_values)
+            + " |"
+        )
+    lines.append("")
+    return "\n".join(lines)
+
+
+def write_weekly_readable_reports(
+    output_dir: str,
+    week_start: date | None,
+    weekday_labels: list[str],
+    rows: list[list[str]],
+    formats: set[str],
+    cell_all_not_executed: list[list[bool]] | None = None,
+    cell_all_blocked: list[list[bool]] | None = None,
+) -> list[str]:
+    os.makedirs(output_dir, exist_ok=True)
+    week_label = week_start.isoformat() if week_start else "unknown_week"
+    base_name = f"weekly_cycle_matrix_{week_label}"
+    updated_paths: list[str] = []
+    if "html" in formats:
+        html_path = os.path.join(output_dir, f"{base_name}.html")
+        html_body = render_weekly_html_report(
+            week_start,
+            weekday_labels,
+            rows,
+            cell_all_not_executed=cell_all_not_executed,
+            cell_all_blocked=cell_all_blocked,
+        )
+        if _write_text_if_changed(html_path, html_body):
+            updated_paths.append(html_path)
+    if "wiki" in formats:
+        wiki_path = os.path.join(output_dir, f"{base_name}.confluence.txt")
+        wiki_body = render_weekly_wiki_report(week_start, weekday_labels, rows)
+        if _write_text_if_changed(wiki_path, wiki_body):
+            updated_paths.append(wiki_path)
+    return updated_paths
+
+
 def render_daily_html_report(folder_name: str, cycles: dict[str, Any]) -> str:
     sections = [
         "<!doctype html>",
@@ -2296,6 +3195,38 @@ def render_daily_html_report(folder_name: str, cycles: dict[str, Any]) -> str:
                 "</tr>"
             )
         sections.append("</tbody></table>")
+    progress_rows = sorted(_build_cycle_progress_rows(cycles), key=_summary_sort_key)
+    sections.append("<h2>Сводка по тестовым циклам</h2>")
+    sections.append(
+        "<table>"
+        "<thead><tr>"
+        "<th>Тестовый цикл</th><th>Всего кейсов</th><th>Пройдено кейсов</th>"
+        "</tr></thead><tbody>"
+    )
+    previous_group = ""
+    for row in progress_rows:
+        current_group = _summary_scenario_group(row)
+        if previous_group and current_group and current_group != previous_group:
+            sections.append("<tr class='scenario-sep'><td colspan='3'></td></tr>")
+        cycle_label = _build_summary_cycle_label(row)
+        passed_cases = int(row["passed_cases"])
+        all_ne = bool(row.get("all_not_executed", False))
+        all_blocked = bool(row.get("all_blocked", False))
+        bg_color = _passed_count_color(
+            passed_cases, all_not_executed=all_ne, all_blocked=all_blocked
+        )
+        text_color = _passed_count_text_color(
+            passed_cases, all_not_executed=all_ne, all_blocked=all_blocked
+        )
+        sections.append(
+            "<tr>"
+            f"<td>{html.escape(cycle_label)}</td>"
+            f"<td>{row['total_cases']}</td>"
+            f"<td class='passed-count-cell' style='background:{bg_color};color:{text_color};'>{passed_cases}</td>"
+            "</tr>"
+        )
+        previous_group = current_group or previous_group
+    sections.append("</tbody></table>")
     sections.append("</body></html>")
     return "\n".join(sections)
 
@@ -2685,11 +3616,113 @@ def main() -> int:
                     )
                 else:
                     report_data = aggregate_readable_daily_reports_legacy(cycles_cases_rows)
-                written_reports = write_daily_readable_reports(
+                daily_readable_paths = write_daily_readable_reports(
                     output_dir=args.daily_readable_dir,
                     report_data=report_data,
                     formats=selected_formats,
                 )
+            needs_report_data = bool(
+                args.cycle_progress_output
+                or args.weekly_cycle_matrix_output
+                or args.export_weekly_readable
+            )
+            if needs_report_data:
+                if report_data is None:
+                    if case_steps_rows:
+                        report_data = aggregate_readable_daily_reports_from_steps(
+                            case_steps_rows, cycles_cases_rows
+                        )
+                    else:
+                        report_data = aggregate_readable_daily_reports_legacy(cycles_cases_rows)
+            if (
+                rolling_days > 0
+                and from_date is not None
+                and to_date is not None
+                and report_data is not None
+            ):
+                report_data = _filter_report_data_by_resolved_folder_day(
+                    report_data, from_date, to_date
+                )
+            cycle_progress_csv_updated: bool | None = None
+            weekly_matrix_csv_updates: list[tuple[str, bool]] = []
+            report_data_for_matrix = report_data or {}
+            if args.cycle_progress_output:
+                cycle_progress_rows = _cycle_progress_csv_rows(report_data_for_matrix)
+                cycle_progress_csv_updated = write_cycle_progress_csv(
+                    args.cycle_progress_output, cycle_progress_rows
+                )
+            weekly_cycle_week_start: date | None = None
+            weekly_cycle_weekday_labels = _default_weekday_labels()
+            weekly_cycle_rows: list[list[str]] = []
+            weekly_cycle_cell_all_ne: list[list[bool]] = []
+            weekly_cycle_cell_all_blocked: list[list[bool]] = []
+            weekly_cycle_matrices: list[
+                tuple[date | None, list[str], list[list[str]], list[list[bool]], list[list[bool]]]
+            ] = []
+            if args.weekly_cycle_matrix_output:
+                weekly_cycle_matrices = _weekly_cycle_matrix_data_all(report_data_for_matrix)
+                if weekly_cycle_matrices:
+                    (
+                        weekly_cycle_week_start,
+                        weekly_cycle_weekday_labels,
+                        weekly_cycle_rows,
+                        weekly_cycle_cell_all_ne,
+                        weekly_cycle_cell_all_blocked,
+                    ) = weekly_cycle_matrices[-1]
+                    # Keep the legacy output path as the latest week for compatibility.
+                    latest_updated = write_weekly_cycle_matrix_csv(
+                        args.weekly_cycle_matrix_output,
+                        weekly_cycle_weekday_labels,
+                        weekly_cycle_rows,
+                    )
+                    weekly_matrix_csv_updates.append((args.weekly_cycle_matrix_output, latest_updated))
+                for week_start, weekday_labels, rows, _cell_flags, _blocked_flags in weekly_cycle_matrices:
+                    week_path = _weekly_output_path_for_week(args.weekly_cycle_matrix_output, week_start)
+                    week_updated = write_weekly_cycle_matrix_csv(week_path, weekday_labels, rows)
+                    weekly_matrix_csv_updates.append((week_path, week_updated))
+            weekly_readable_paths: list[str] = []
+            if args.export_weekly_readable:
+                if not weekly_cycle_matrices:
+                    weekly_cycle_matrices = _weekly_cycle_matrix_data_all(report_data_for_matrix)
+                if weekly_cycle_matrices:
+                    (
+                        weekly_cycle_week_start,
+                        weekly_cycle_weekday_labels,
+                        weekly_cycle_rows,
+                        weekly_cycle_cell_all_ne,
+                        weekly_cycle_cell_all_blocked,
+                    ) = weekly_cycle_matrices[-1]
+                selected_weekly_formats = set(args.weekly_readable_format or ["html", "wiki"])
+                for week_start, weekday_labels, rows, cell_all_ne, cell_all_blocked in weekly_cycle_matrices:
+                    weekly_readable_paths.extend(
+                        write_weekly_readable_reports(
+                            output_dir=args.weekly_readable_dir,
+                            week_start=week_start,
+                            weekday_labels=weekday_labels,
+                            rows=rows,
+                            formats=selected_weekly_formats,
+                            cell_all_not_executed=cell_all_ne,
+                            cell_all_blocked=cell_all_blocked,
+                        )
+                    )
+            if confluence_cfg and publish_confluence_daily:
+                daily_html_paths = [p for p in daily_readable_paths if p.endswith(".html")]
+                if daily_html_paths:
+                    outcomes = publish_reports_to_confluence(daily_html_paths, confluence_cfg)
+                    print("Confluence daily publish:")
+                    for line in outcomes:
+                        print(f"- {line}")
+                else:
+                    print("Confluence daily publish skipped: no daily HTML files were generated.")
+            if confluence_cfg and publish_confluence_weekly:
+                weekly_html_paths = [p for p in weekly_readable_paths if p.endswith(".html")]
+                if weekly_html_paths:
+                    outcomes = publish_reports_to_confluence(weekly_html_paths, confluence_cfg)
+                    print("Confluence weekly publish:")
+                    for line in outcomes:
+                        print(f"- {line}")
+                else:
+                    print("Confluence weekly publish skipped: no weekly HTML files were generated.")
             print(f"Saved summary CSV: {args.output}")
             print(f"Saved per-folder CSV directory: {args.per_folder_dir}")
             if args.export_cycles_cases:
@@ -2698,7 +3731,29 @@ def main() -> int:
                 print(f"Saved case steps CSV: {args.case_steps_output}")
             if args.export_daily_readable:
                 print(f"Saved daily readable reports: {args.daily_readable_dir}")
-                print(f"Readable files written: {written_reports}")
+                print(f"Daily readable files updated: {len(daily_readable_paths)}")
+            if args.cycle_progress_output:
+                status = (
+                    "content changed"
+                    if cycle_progress_csv_updated
+                    else "unchanged (skipped write)"
+                )
+                print(f"Cycle progress CSV: {args.cycle_progress_output} ({status})")
+            if args.weekly_cycle_matrix_output:
+                if not weekly_matrix_csv_updates:
+                    print(f"Weekly cycle matrix CSV: {args.weekly_cycle_matrix_output} (no data)")
+                else:
+                    changed_count = sum(1 for _path, updated in weekly_matrix_csv_updates if updated)
+                    print(
+                        "Weekly cycle matrix CSV files: "
+                        f"{len(weekly_matrix_csv_updates)} total, {changed_count} updated"
+                    )
+                    for out_path, updated in weekly_matrix_csv_updates:
+                        status = "content changed" if updated else "unchanged (skipped write)"
+                        print(f"- {out_path} ({status})")
+            if args.export_weekly_readable:
+                print(f"Saved weekly readable reports: {args.weekly_readable_dir}")
+                print(f"Weekly readable files updated: {len(weekly_readable_paths)}")
             print(f"Processed folders: {len(folder_rows)}")
             print(f"Fetched executions: {total_executions}")
             if total_skipped:
