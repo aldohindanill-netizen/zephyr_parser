@@ -9,19 +9,25 @@ and computes normalized pass rate for reporting.
 from __future__ import annotations
 
 import argparse
+import base64
+import io
 import csv
 import html
 import json
+import math
+import mimetypes
 import os
 import re
 import sys
+import uuid
+import zlib
 import urllib.error
 import urllib.parse
 import urllib.request
 from collections import Counter, defaultdict
 from dataclasses import dataclass
-from datetime import date, datetime
-from typing import Any
+from datetime import date, datetime, timedelta
+from typing import Any, Callable
 
 
 DEFAULT_DATE_FIELDS = [
@@ -50,6 +56,21 @@ class FolderNode:
     parent_id: str | None
     full_path: str = ""
     is_leaf: bool = False
+
+
+@dataclass
+class ConfluencePublishConfig:
+    base_url: str
+    user: str
+    api_token: str
+    space_key: str
+    parent_page_id: str | None = None
+    title_prefix: str = ""
+    api_prefix: str = "rest/api"
+    auth_scheme: str = "basic"
+    update_existing: bool = False
+    publish_daily: bool = False
+    publish_weekly: bool = False
 
 
 def parse_args() -> argparse.Namespace:
@@ -311,6 +332,70 @@ def parse_args() -> argparse.Namespace:
         help="Readable report format. Can repeat; default is both html and wiki.",
     )
     parser.add_argument(
+        "--cycle-progress-output",
+        default=None,
+        help="Optional CSV path for per-cycle progress export (folder discovery mode).",
+    )
+    parser.add_argument(
+        "--weekly-cycle-matrix-output",
+        default=None,
+        help="Optional CSV path for weekly cycle matrix export (folder discovery mode).",
+    )
+    parser.add_argument(
+        "--export-weekly-readable",
+        action="store_true",
+        help="Export weekly readable HTML/wiki reports (folder discovery mode).",
+    )
+    parser.add_argument(
+        "--weekly-readable-dir",
+        default="reports/weekly_readable",
+        help="Directory for weekly readable reports.",
+    )
+    parser.add_argument(
+        "--weekly-readable-format",
+        action="append",
+        choices=("html", "wiki"),
+        default=[],
+        help="Weekly readable format. Can repeat; default is both html and wiki.",
+    )
+    parser.add_argument(
+        "--readable-template-dir",
+        default=None,
+        help=(
+            "Directory with report_templates/readable layout for HTML/wiki snippets. "
+            "Overrides env ZEPHYR_READABLE_TEMPLATE_DIR when set. "
+            "Daily Confluence publish inserts Zephyr TEST_RESULTS_SUMMARY_BY_STATUS from cycle keys in HTML "
+            "(optional overrides: ZEPHYR_CONFLUENCE_ZEPHYR_APP_ID, ZEPHYR_PROJECT_ID, ZEPHYR_JIRA_PROJECT_KEY, "
+            "ZEPHYR_JIRA_PROJECT_DISPLAY_NAME). "
+            "Daily wiki only: optional ZEPHYR_CONFLUENCE_TEST_EXEC_MACRO overrides the execution macro snippet."
+        ),
+    )
+    parser.add_argument(
+        "--weekly-readable-per-folder",
+        action="store_true",
+        help=(
+            "Also emit weekly readable reports per folder (separate files; "
+            "does not replace merged all-folders output)."
+        ),
+    )
+    parser.add_argument(
+        "--rolling-days",
+        type=int,
+        default=0,
+        help=(
+            "When >0 with --from-date and --to-date, filter aggregated readable "
+            "report_data by resolved folder day."
+        ),
+    )
+    parser.add_argument(
+        "--regenerate-last-7-days",
+        action="store_true",
+        help=(
+            "Optional convenience mode: set --from-date/--to-date to the last 7 days "
+            "(today inclusive) and apply --rolling-days=7 when not provided."
+        ),
+    )
+    parser.add_argument(
         "--create-folder-first",
         action="store_true",
         help="Before report generation, ensure target Zephyr folder exists (create if missing).",
@@ -493,6 +578,522 @@ def request_json(
         ) from exc
     except urllib.error.URLError as exc:
         raise RuntimeError(f"Network error while requesting '{url}': {exc}") from exc
+
+
+def _parse_bool_env(value: str | None) -> bool:
+    if value is None:
+        return False
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _load_confluence_publish_config() -> ConfluencePublishConfig | None:
+    base_url = (os.getenv("ZEPHYR_CONFLUENCE_BASE_URL") or "").strip().rstrip("/")
+    user = (os.getenv("ZEPHYR_CONFLUENCE_USER") or "").strip()
+    api_token = (os.getenv("ZEPHYR_CONFLUENCE_API_TOKEN") or "").strip()
+    space_key = (os.getenv("ZEPHYR_CONFLUENCE_SPACE_KEY") or "").strip()
+    parent_page_id = (os.getenv("ZEPHYR_CONFLUENCE_PARENT_PAGE_ID") or "").strip() or None
+    title_prefix = (os.getenv("ZEPHYR_CONFLUENCE_TITLE_PREFIX") or "").strip()
+    api_prefix = (os.getenv("ZEPHYR_CONFLUENCE_API_PREFIX") or "rest/api").strip().strip("/")
+    auth_scheme = (os.getenv("ZEPHYR_CONFLUENCE_AUTH_SCHEME") or "basic").strip().lower()
+    publish_daily = _parse_bool_env(os.getenv("ZEPHYR_CONFLUENCE_PUBLISH_DAILY"))
+    publish_weekly = _parse_bool_env(os.getenv("ZEPHYR_CONFLUENCE_PUBLISH_WEEKLY"))
+    update_existing = _parse_bool_env(os.getenv("ZEPHYR_CONFLUENCE_UPDATE_EXISTING"))
+    if not (publish_daily or publish_weekly):
+        return None
+    if auth_scheme not in {"basic", "bearer"}:
+        raise ValueError(
+            "Unsupported ZEPHYR_CONFLUENCE_AUTH_SCHEME. Use 'basic' or 'bearer'."
+        )
+    required: list[tuple[str, str]] = [
+        ("ZEPHYR_CONFLUENCE_BASE_URL", base_url),
+        ("ZEPHYR_CONFLUENCE_API_TOKEN", api_token),
+        ("ZEPHYR_CONFLUENCE_SPACE_KEY", space_key),
+    ]
+    if auth_scheme == "basic":
+        required.append(("ZEPHYR_CONFLUENCE_USER", user))
+    missing = [name for name, val in required if not val]
+    if missing:
+        raise ValueError(
+            "Confluence publishing enabled but missing env vars: " + ", ".join(missing)
+        )
+    return ConfluencePublishConfig(
+        base_url=base_url,
+        user=user,
+        api_token=api_token,
+        space_key=space_key,
+        parent_page_id=parent_page_id,
+        title_prefix=title_prefix,
+        api_prefix=api_prefix,
+        auth_scheme=auth_scheme,
+        update_existing=update_existing,
+        publish_daily=publish_daily,
+        publish_weekly=publish_weekly,
+    )
+
+
+def _confluence_auth_headers(cfg: ConfluencePublishConfig) -> dict[str, str]:
+    scheme = (cfg.auth_scheme or "basic").lower()
+    if scheme == "bearer":
+        auth_value = f"Bearer {cfg.api_token}"
+    else:
+        token = base64.b64encode(f"{cfg.user}:{cfg.api_token}".encode("utf-8")).decode("ascii")
+        auth_value = f"Basic {token}"
+    return {
+        "Authorization": auth_value,
+        "Accept": "application/json",
+    }
+
+
+def _confluence_request_json(
+    cfg: ConfluencePublishConfig,
+    endpoint: str,
+    *,
+    method: str = "GET",
+    params: dict[str, str] | None = None,
+    body: dict[str, Any] | None = None,
+    extra_headers: dict[str, str] | None = None,
+) -> Any:
+    query = urllib.parse.urlencode(params or {}, doseq=True)
+    url = f"{cfg.base_url}/{endpoint.lstrip('/')}"
+    if query and method.upper() == "GET":
+        url = f"{url}?{query}"
+    headers = _confluence_auth_headers(cfg)
+    if extra_headers:
+        headers.update(extra_headers)
+    payload: bytes | None = None
+    if body is not None:
+        payload = json.dumps(body).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    request = urllib.request.Request(url, headers=headers, method=method.upper(), data=payload)
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            raw = response.read().decode("utf-8")
+            return json.loads(raw) if raw else {}
+    except urllib.error.HTTPError as exc:
+        err_body = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(
+            f"Confluence HTTP {exc.code} for '{url}' [{method.upper()}]. Response: {err_body}"
+        ) from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"Confluence network error for '{url}': {exc}") from exc
+
+
+def _confluence_page_title_for_file(path: str, cfg: ConfluencePublishConfig) -> str:
+    base = os.path.basename(path)
+    name, _ext = os.path.splitext(base)
+    title = name.replace("_", " ")
+    if cfg.title_prefix:
+        return f"{cfg.title_prefix} {title}".strip()
+    return title
+
+
+def _extract_html_title(raw_html: str) -> str:
+    match = re.search(r"<title[^>]*>(.*?)</title>", raw_html, flags=re.IGNORECASE | re.DOTALL)
+    if not match:
+        return ""
+    value = re.sub(r"\s+", " ", match.group(1)).strip()
+    return html.unescape(value)
+
+
+def _normalize_html_for_confluence_storage(raw_html: str) -> str:
+    text = str(raw_html or "").strip()
+    if not text:
+        return ""
+    # Confluence storage does not accept XML/DOCTYPE directives in the payload.
+    text = re.sub(r"^\ufeff", "", text)
+    text = re.sub(r"<\?xml[^>]*\?>", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"<!doctype[^>]*>", "", text, flags=re.IGNORECASE)
+    body_match = re.search(r"<body\b[^>]*>(.*?)</body>", text, flags=re.IGNORECASE | re.DOTALL)
+    if body_match:
+        text = body_match.group(1)
+    text = re.sub(r"<html\b[^>]*>", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"</html>", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"<head\b[^>]*>.*?</head>", "", text, flags=re.IGNORECASE | re.DOTALL)
+    text = re.sub(r"<body\b[^>]*>", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"</body>", "", text, flags=re.IGNORECASE)
+    # Confluence storage parser is XHTML-like: void tags must be self-closing.
+    for tag in ("area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"):
+        text = re.sub(
+            rf"<{tag}(\s[^>/]*?)?>",
+            lambda m: f"<{tag}{m.group(1) or ''} />",
+            text,
+            flags=re.IGNORECASE,
+        )
+    return text.strip()
+
+
+def _append_confluence_attachment_image(storage_html: str, file_name: str) -> str:
+    safe_name = html.escape(str(file_name or "").strip(), quote=True)
+    if not safe_name:
+        return storage_html
+    if safe_name in storage_html:
+        return storage_html
+    image_macro = (
+        "<p><ac:image ac:width='260'>"
+        f"<ri:attachment ri:filename='{safe_name}'/>"
+        "</ac:image></p>"
+    )
+    return f"{storage_html}\n{image_macro}" if storage_html else image_macro
+
+
+def _confluence_find_page_by_title(
+    cfg: ConfluencePublishConfig, title: str
+) -> tuple[str, int] | None:
+    payload = _confluence_request_json(
+        cfg,
+        f"{cfg.api_prefix}/content",
+        params={"spaceKey": cfg.space_key, "title": title, "expand": "version"},
+    )
+    results = payload.get("results") if isinstance(payload, dict) else None
+    if not isinstance(results, list) or not results:
+        return None
+    first = results[0]
+    page_id = str(first.get("id") or "").strip()
+    version = int(first.get("version", {}).get("number") or 1)
+    if not page_id:
+        return None
+    return (page_id, version)
+
+
+def _confluence_upsert_storage_page(
+    cfg: ConfluencePublishConfig,
+    title: str,
+    storage_html: str,
+    *,
+    legacy_title: str | None = None,
+) -> tuple[str, str]:
+    existing = _confluence_find_page_by_title(cfg, title)
+    if (
+        existing is None
+        and cfg.update_existing
+        and legacy_title
+        and legacy_title != title
+    ):
+        existing = _confluence_find_page_by_title(cfg, legacy_title)
+    if existing:
+        page_id, current_version = existing
+        body = {
+            "id": page_id,
+            "type": "page",
+            "title": title,
+            "space": {"key": cfg.space_key},
+            "version": {"number": current_version + 1},
+            "body": {"storage": {"value": storage_html, "representation": "storage"}},
+        }
+        _confluence_request_json(cfg, f"{cfg.api_prefix}/content/{page_id}", method="PUT", body=body)
+        return page_id, "updated"
+    create_body: dict[str, Any] = {
+        "type": "page",
+        "title": title,
+        "space": {"key": cfg.space_key},
+        "body": {"storage": {"value": storage_html, "representation": "storage"}},
+    }
+    if cfg.parent_page_id:
+        create_body["ancestors"] = [{"id": cfg.parent_page_id}]
+    created = _confluence_request_json(
+        cfg, f"{cfg.api_prefix}/content", method="POST", body=create_body
+    )
+    page_id = str(created.get("id") or "").strip()
+    if not page_id:
+        raise RuntimeError(f"Confluence page create returned no id for title '{title}'")
+    return page_id, "created"
+
+
+def _confluence_upload_attachment(
+    cfg: ConfluencePublishConfig, page_id: str, file_path: str
+) -> str:
+    file_name = os.path.basename(file_path)
+    boundary = f"----CursorForm{uuid.uuid4().hex}"
+    ctype = mimetypes.guess_type(file_name)[0] or "application/octet-stream"
+    with open(file_path, "rb") as source:
+        raw = source.read()
+    body = (
+        f"--{boundary}\r\n"
+        f"Content-Disposition: form-data; name=\"file\"; filename=\"{file_name}\"\r\n"
+        f"Content-Type: {ctype}\r\n\r\n"
+    ).encode("utf-8") + raw + f"\r\n--{boundary}--\r\n".encode("utf-8")
+    endpoint = f"{cfg.api_prefix}/content/{page_id}/child/attachment"
+    headers = _confluence_auth_headers(cfg)
+    headers.update(
+        {
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+            "X-Atlassian-Token": "no-check",
+        }
+    )
+    url = f"{cfg.base_url}/{endpoint}"
+    req = urllib.request.Request(url, headers=headers, method="POST", data=body)
+    try:
+        with urllib.request.urlopen(req, timeout=30):
+            return file_name
+    except urllib.error.HTTPError as exc:
+        # 409/400 can mean attachment already exists depending on instance settings; ignore as non-fatal.
+        if exc.code in (400, 409):
+            return file_name
+        err_body = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(
+            f"Confluence attachment upload failed for '{file_name}' (HTTP {exc.code}): {err_body}"
+        ) from exc
+
+
+def _extract_zephyr_status_counts_from_html(raw_html: str) -> dict[str, int] | None:
+    match = re.search(
+        r'<div\s+id=["\']zephyr-status-counts-json["\'][^>]*>(.*?)</div>',
+        raw_html,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+    if not match:
+        return None
+    try:
+        data = json.loads(html.unescape(match.group(1).strip()))
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    out: dict[str, int] = {}
+    for key, value in data.items():
+        try:
+            out[str(key)] = int(value)
+        except (TypeError, ValueError):
+            continue
+    return out or None
+
+
+def _strip_zephyr_status_counts_json_div(body_html: str) -> str:
+    return re.sub(
+        r'<div\s+id=["\']zephyr-status-counts-json["\'][^>]*>.*?</div>',
+        "",
+        body_html,
+        count=1,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+
+
+def _extract_zephyr_cycle_key_objects_from_html(
+    raw_html: str,
+) -> list[dict[str, Any]] | None:
+    match = re.search(
+        r'<div\s+id=["\']zephyr-cycle-keys-json["\'][^>]*>(.*?)</div>',
+        raw_html,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+    if not match:
+        return None
+    try:
+        data = json.loads(html.unescape(match.group(1).strip()))
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(data, list):
+        return None
+    out: list[dict[str, Any]] = []
+    for item in data:
+        if isinstance(item, dict) and str(item.get("id") or "").strip():
+            out.append(item)
+    return out
+
+
+def _strip_zephyr_cycle_keys_json_div(body_html: str) -> str:
+    return re.sub(
+        r'<div\s+id=["\']zephyr-cycle-keys-json["\'][^>]*>.*?</div>',
+        "",
+        body_html,
+        count=1,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+
+
+def _strip_daily_pie_visual_block(body_html: str) -> str:
+    """Remove global summary pie (section 3) before inserting Zephyr/Chart macro on publish."""
+    result = body_html
+    for pattern in (
+        "<div class='daily-pie-wrap daily-pie-strip-publish'>",
+        '<div class="daily-pie-wrap daily-pie-strip-publish">',
+    ):
+        while True:
+            start = result.find(pattern)
+            if start == -1:
+                break
+            pos = start + len(pattern)
+            depth = 1
+            while depth > 0 and pos < len(result):
+                sub = result[pos:]
+                open_m = re.search(r"<div\b", sub, flags=re.IGNORECASE)
+                close_m = re.search(r"</div>", sub, flags=re.IGNORECASE)
+                if close_m is None:
+                    return result
+                open_pos = open_m.start() if open_m else len(sub) + 1
+                close_pos = close_m.start()
+                if open_m is not None and open_pos < close_pos:
+                    depth += 1
+                    pos += open_m.end()
+                else:
+                    depth -= 1
+                    pos += close_m.end()
+            result = result[:start] + result[pos:]
+    result = re.sub(
+        r"<p\s+class=['\"]pie-empty['\"][^>]*>.*?</p>",
+        "",
+        result,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+    return result
+
+
+def _inject_confluence_anchor_macros(storage_html: str) -> str:
+    """Ensure #fragment links work in Confluence storage by using anchor macros."""
+
+    pattern = re.compile(
+        r"<(?P<tag>h[1-6])(?P<before>[^>]*?)\s+id\s*=\s*['\"](?P<id>[^'\"]+)['\"](?P<after>[^>]*)>"
+        r"(?P<text>.*?)</(?P=tag)>",
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+
+    def _repl(match: re.Match[str]) -> str:
+        tag = match.group("tag")
+        anchor_id = match.group("id")
+        attrs = (match.group("before") or "") + (match.group("after") or "")
+        text = match.group("text")
+        anchor_macro = (
+            '<ac:structured-macro ac:name="anchor">'
+            f'<ac:parameter ac:name="">{html.escape(anchor_id)}</ac:parameter>'
+            "</ac:structured-macro>"
+        )
+        return f"{anchor_macro}<{tag}{attrs}>{text}</{tag}>"
+
+    return pattern.sub(_repl, storage_html)
+
+
+def _convert_fragment_links_to_confluence(storage_html: str) -> str:
+    """Convert local #fragment links to native Confluence anchor links."""
+    pattern = re.compile(
+        r"<a(?P<attrs>[^>]*?)\s+href\s*=\s*['\"]#(?P<anchor>[^'\"]+)['\"](?P<tail>[^>]*)>"
+        r"(?P<body>.*?)</a>",
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+
+    def _repl(match: re.Match[str]) -> str:
+        anchor = match.group("anchor").strip()
+        body = (match.group("body") or "").strip()
+        if not anchor or not body:
+            return match.group(0)
+        return (
+            f'<ac:link ac:anchor="{html.escape(anchor, quote=True)}">'
+            f"<ac:link-body>{body}</ac:link-body>"
+            "</ac:link>"
+        )
+
+    return pattern.sub(_repl, storage_html)
+
+
+def _insert_block_after_scenarios_heading(storage_html: str, block: str) -> str:
+    # Preferred anchor: raw HTML heading before Confluence anchor conversion.
+    pattern_raw = re.compile(
+        r"(<h2\b[^>]*\bid\s*=\s*['\"]scenarios['\"][^>]*>.*?</h2>)",
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    match_raw = pattern_raw.search(storage_html)
+    if match_raw:
+        end = match_raw.end()
+        return f"{storage_html[:end]}\n{block}{storage_html[end:]}"
+
+    # Fallback: after _inject_confluence_anchor_macros, anchor macro precedes heading.
+    pattern_anchor_macro = re.compile(
+        r"(<ac:structured-macro\s+ac:name=['\"]anchor['\"][^>]*>"
+        r".*?<ac:parameter\s+ac:name=['\"][^'\"]*['\"]>\s*scenarios\s*</ac:parameter>"
+        r".*?</ac:structured-macro>\s*<h2\b[^>]*>.*?</h2>)",
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    match_macro = pattern_anchor_macro.search(storage_html)
+    if match_macro:
+        end = match_macro.end()
+        return f"{storage_html[:end]}\n{block}{storage_html[end:]}"
+
+    return f"{storage_html}\n{block}" if storage_html else block
+
+
+def _replace_scenario_result_cells_with_zephyr_macro(storage_html: str) -> str:
+    pattern = re.compile(
+        r"(?P<open><td\b[^>]*\bclass\s*=\s*['\"][^'\"]*scenario-result-cell[^'\"]*['\"][^>]*>)"
+        r"(?P<body>.*?)"
+        r"<span\b[^>]*\bclass\s*=\s*['\"]scenario-result-macro-marker['\"][^>]*"
+        r"\bdata-cycle-key\s*=\s*['\"](?P<key>[^'\"]+)['\"]"
+        r"(?:[^>]*\bdata-cycle-name\s*=\s*['\"](?P<name>[^'\"]*)['\"])?[^>]*></span>"
+        r".*?(?P<close></td>)",
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+
+    def _repl(match: re.Match[str]) -> str:
+        key = html.unescape((match.group("key") or "").strip())
+        name = html.unescape((match.group("name") or "").strip())
+        if not key:
+            return match.group(0)
+        cycle_objects = [{"id": key, "name": name}] if name else [{"id": key}]
+        macro = _daily_zephyr_test_results_summary_storage_macro(cycle_objects)
+        if not macro:
+            return match.group(0)
+        return f"{match.group('open')}{macro}{match.group('close')}"
+
+    return pattern.sub(_repl, storage_html)
+
+
+def publish_reports_to_confluence(
+    html_paths: list[str], cfg: ConfluencePublishConfig
+) -> list[str]:
+    outcomes: list[str] = []
+    for html_path in html_paths:
+        with open(html_path, encoding="utf-8") as source:
+            raw_html = source.read()
+        cycle_objects_raw = _extract_zephyr_cycle_key_objects_from_html(raw_html)
+        cycle_objects: list[dict[str, Any]] = (
+            cycle_objects_raw if cycle_objects_raw is not None else []
+        )
+        zephyr_storage = _daily_zephyr_test_results_summary_storage_macro(cycle_objects)
+        counts = _extract_zephyr_status_counts_from_html(raw_html)
+        chart_storage = _daily_status_chart_storage_macro(counts) if counts else ""
+        use_zephyr_macro = bool(zephyr_storage)
+        use_native_chart = bool(chart_storage) and not use_zephyr_macro
+
+        body_html = _normalize_html_for_confluence_storage(raw_html)
+        body_html = _inject_confluence_anchor_macros(body_html)
+        body_html = _convert_fragment_links_to_confluence(body_html)
+        body_html = _replace_scenario_result_cells_with_zephyr_macro(body_html)
+        if use_zephyr_macro or use_native_chart:
+            body_html = _strip_daily_pie_visual_block(body_html)
+            body_html = _strip_zephyr_status_counts_json_div(body_html)
+            body_html = _strip_zephyr_cycle_keys_json_div(body_html)
+            if use_zephyr_macro:
+                chart_block = "<p class='daily-tab'>\t</p>" + zephyr_storage
+            else:
+                chart_block = "<p class='daily-tab'>\t</p>" + chart_storage
+            body_html = _insert_block_after_scenarios_heading(body_html, chart_block)
+
+        chart_path = html_path.replace(".html", "_conclusion_pie.png")
+        chart_name = os.path.basename(chart_path)
+        if os.path.exists(chart_path) and not use_native_chart and not use_zephyr_macro:
+            body_html = _append_confluence_attachment_image(body_html, chart_name)
+        title_from_html = _extract_html_title(raw_html).strip()
+        title_from_file = _confluence_page_title_for_file(html_path, cfg)
+        primary_title = title_from_html or title_from_file
+        legacy_title = (
+            title_from_file
+            if title_from_html and title_from_html != title_from_file
+            else None
+        )
+        page_id, action = _confluence_upsert_storage_page(
+            cfg,
+            primary_title,
+            body_html,
+            legacy_title=legacy_title,
+        )
+        attachment_note = ""
+        if os.path.exists(chart_path) and not use_native_chart and not use_zephyr_macro:
+            attachment_name = _confluence_upload_attachment(cfg, page_id, chart_path)
+            attachment_note = f", attachment: {attachment_name}"
+        elif use_zephyr_macro:
+            attachment_note = ", chart: Zephyr TEST_RESULTS_SUMMARY_BY_STATUS macro"
+        elif use_native_chart:
+            attachment_note = ", chart: native macro"
+        outcomes.append(f"{action}: {primary_title} (page id {page_id}{attachment_note})")
+    return outcomes
 
 
 def fetch_executions(
@@ -1980,9 +2581,11 @@ def aggregate_readable_daily_reports_from_steps(
         if m["cycle_objective"]:
             cycle_bucket["cycle_objective"] = m["cycle_objective"]
 
+        # Prefer test-result status over per-step status:
+        # step rows are often "Not Executed" even when the overall case result is Pass/Fail.
         result = (
-            m["step_status_name"]
-            or m["test_result_status_name"]
+            m["test_result_status_name"]
+            or m["step_status_name"]
             or fallback_status.get((folder_id, test_run_id), "")
         )
         cycle_bucket["cases"][test_case_key] = {
@@ -2048,6 +2651,93 @@ def aggregate_readable_daily_reports_legacy(
 
 def _wiki_escape(value: str) -> str:
     return value.replace("|", "\\|").replace("\n", "\\\\")
+
+
+def _load_readable_template_file(template_dir: str | None, *parts: str) -> str | None:
+    if not template_dir:
+        return None
+    path = os.path.join(template_dir, *parts)
+    if not os.path.isfile(path):
+        return None
+    with open(path, encoding="utf-8") as f:
+        return f.read()
+
+
+def _resolve_readable_template(
+    template_dir: str | None,
+    kind: str,
+    format_name: str,
+    folder_id: str | None,
+) -> str | None:
+    if not template_dir or format_name not in ("html", "wiki"):
+        return None
+    subdir = "html" if format_name == "html" else "wiki"
+    ext = ".html" if format_name == "html" else ".confluence.txt"
+    if folder_id:
+        text = _load_readable_template_file(
+            template_dir, kind, subdir, f"{folder_id}{ext}"
+        )
+        if text is not None:
+            return text
+    return _load_readable_template_file(template_dir, kind, subdir, f"default{ext}")
+
+
+def _apply_readable_template_placeholders(raw: str, mapping: dict[str, str]) -> str:
+    out = raw
+    for key, value in mapping.items():
+        out = out.replace("{" + key + "}", value)
+    return out
+
+
+def _readable_template_mapping(
+    folder_id: str,
+    folder_name: str,
+    week_start: date | None,
+    escape: Callable[[str], str],
+) -> dict[str, str]:
+    week_label = week_start.isoformat() if week_start else "N/A"
+    return {
+        "folder_id": escape(str(folder_id)),
+        "folder_name": escape(str(folder_name)),
+        "folder_name_slug": escape(slugify(folder_name)),
+        "week_start": escape(week_label),
+        "week_label": escape(week_label),
+    }
+
+
+def _format_readable_html_preamble(
+    template_dir: str | None,
+    kind: str,
+    folder_id_resolve: str | None,
+    folder_id_mapping: str,
+    folder_name: str,
+    week_start: date | None,
+) -> str:
+    raw = _resolve_readable_template(template_dir, kind, "html", folder_id_resolve)
+    if not raw or not raw.strip():
+        return ""
+    mapping = _readable_template_mapping(
+        folder_id_mapping, folder_name, week_start, html.escape
+    )
+    body = _apply_readable_template_placeholders(raw.strip(), mapping)
+    return f"<div class='report-preamble'>{body}</div>"
+
+
+def _format_readable_wiki_preamble(
+    template_dir: str | None,
+    kind: str,
+    folder_id_resolve: str | None,
+    folder_id_mapping: str,
+    folder_name: str,
+    week_start: date | None,
+) -> str:
+    raw = _resolve_readable_template(template_dir, kind, "wiki", folder_id_resolve)
+    if not raw or not raw.strip():
+        return ""
+    mapping = _readable_template_mapping(
+        folder_id_mapping, folder_name, week_start, _wiki_escape
+    )
+    return _apply_readable_template_placeholders(raw.strip(), mapping)
 
 
 _URL_PATTERN = re.compile(r"(https?://[^\s<>'\"|]+)")
@@ -2126,20 +2816,10 @@ def _plain_from_html_like(text: str) -> str:
     return html.unescape(no_tags).strip()
 
 
-def _status_badge_html(status: str) -> str:
-    normalized = (status or "").strip().lower()
-    status_to_class = {
-        "not executed": "st-not-executed",
-        "not_executed": "st-not-executed",
-        "untested": "st-not-executed",
-        "in progress": "st-in-progress",
-        "in_progress": "st-in-progress",
-        "pass": "st-pass",
-        "passed": "st-pass",
-        "done": "st-pass",
-        "fail": "st-fail",
-        "failed": "st-fail",
-        "blocked": "st-blocked",
+def _status_bucket_css_class(status_raw: str | None) -> str:
+    raw = (status_raw or "").strip()
+    raw_lower = raw.lower()
+    exact = {
         "can't test": "st-cant-test",
         "cant test": "st-cant-test",
         "not tested in this pi": "st-not-tested-pi",
@@ -2148,8 +2828,102 @@ def _status_badge_html(status: str) -> str:
         "cant reproduce": "st-cant-reproduce",
         "false positive": "st-false-positive",
     }
-    cls = status_to_class.get(normalized, "st-unknown")
-    return f"<span class='status-badge {cls}'>{html.escape(status or '')}</span>"
+    if raw_lower in exact:
+        return exact[raw_lower]
+    bucket = normalize_status(status_raw)
+    if bucket == "passed":
+        return "st-pass"
+    if bucket == "failed":
+        return "st-fail"
+    if bucket == "blocked":
+        return "st-blocked"
+    if bucket == "not_executed":
+        if "progress" in raw_lower or raw_lower in {"wip", "in progress", "in_progress"}:
+            return "st-in-progress"
+        return "st-not-executed"
+    return "st-unknown"
+
+
+def _wiki_status_color_hex(status_raw: str | None) -> str:
+    cls = _status_bucket_css_class(status_raw)
+    return {
+        "st-pass": "#33c24d",
+        "st-fail": "#e53935",
+        "st-not-executed": "#6c757d",
+        "st-in-progress": "#f0ad4e",
+        "st-blocked": "#4a90e2",
+        "st-cant-test": "#9c27ff",
+        "st-not-tested-pi": "#8d7cc3",
+        "st-danger": "#4f6078",
+        "st-cant-reproduce": "#f08f78",
+        "st-false-positive": "#ecd96b",
+        "st-unknown": "#adb5bd",
+    }.get(cls, "#adb5bd")
+
+
+def _wiki_status_macro_color(status_raw: str | None) -> str:
+    cls = _status_bucket_css_class(status_raw)
+    return {
+        "st-pass": "Green",
+        "st-fail": "Red",
+        "st-blocked": "Blue",
+        "st-not-executed": "Grey",
+        "st-in-progress": "Yellow",
+        "st-cant-test": "Purple",
+        "st-not-tested-pi": "Purple",
+        "st-danger": "Grey",
+        "st-cant-reproduce": "Yellow",
+        "st-false-positive": "Yellow",
+    }.get(cls, "Grey")
+
+
+def _status_text_color_hex(status_raw: str | None) -> str:
+    cls = _status_bucket_css_class(status_raw)
+    return {
+        "st-not-executed": "#2f2f2f",
+        "st-in-progress": "#2f2f2f",
+        "st-cant-reproduce": "#2f2f2f",
+        "st-false-positive": "#2f2f2f",
+        "st-unknown": "#172b4d",
+    }.get(cls, "#ffffff")
+
+
+def _render_report_date(case: dict[str, Any]) -> str:
+    raw = _resolve_case_display_date(case)
+    day = _parse_display_date(raw)
+    if day is not None:
+        return day.strftime("%d.%m.%Y")
+    return str(raw or "").strip()
+
+
+def _wiki_status_markup(status_raw: str | None) -> str:
+    raw_text = str(status_raw or "").strip()
+    if not raw_text:
+        return ""
+    macro_color = _wiki_status_macro_color(status_raw)
+    # Keep title minimally sanitized so status macro is parsed,
+    # while avoiding wiki escaping that can break macro rendering.
+    macro_title = raw_text.replace("|", "/").replace("}", ")")
+    # Confluence status macro renders a rounded colored badge with bold text.
+    return f"{{status:colour={macro_color}|title={macro_title}}}"
+
+
+def _status_badge_html(status: str) -> str:
+    raw = status or ""
+    cls = _status_bucket_css_class(raw)
+    bg = _wiki_status_color_hex(raw)
+    fg = _status_text_color_hex(raw)
+    return (
+        f"<span class='status-badge {cls}' "
+        "style='display:inline-block;"
+        "padding:2px 8px;"
+        "border-radius:10px;"
+        "font-size:12px;"
+        "font-weight:700;"
+        "line-height:1.35;"
+        f"background:{bg};color:{fg};'>"
+        f"{html.escape(raw)}</span>"
+    )
 
 
 def _render_cycle_info_html(cycle: dict[str, Any]) -> str:
@@ -2569,6 +3343,19 @@ def _cycle_progress_csv_rows(
     return rows
 
 
+def _write_text_if_changed(path: str, text: str) -> bool:
+    if os.path.isfile(path):
+        with open(path, encoding="utf-8") as f:
+            if f.read() == text:
+                return False
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text)
+    return True
+
+
 def write_cycle_progress_csv(path: str, rows: list[list[str]]) -> bool:
     header = [
         "folder_id",
@@ -2605,6 +3392,15 @@ def _default_weekday_labels() -> list[str]:
     return ["База", "Вт", "Ср", "Чт", "Пт"]
 
 
+def _release_week_start(day: date) -> date:
+    offset = (day.weekday() - 3) % 7
+    return day - timedelta(days=offset)
+
+
+def _release_week_end(start: date) -> date:
+    return start + timedelta(days=7)
+
+
 def _parse_report_day_from_folder_name(folder_name: str) -> date | None:
     raw_name = str(folder_name or "").strip()
     if not raw_name:
@@ -2634,6 +3430,58 @@ def _parse_weekly_column_label_from_folder_name(folder_name: str) -> str | None:
     return match.group(1)
 
 
+def _normalize_display_date(raw_value: str) -> str:
+    value = str(raw_value or "").strip()
+    if not value:
+        return ""
+    try:
+        return parse_datetime(value).date().isoformat()
+    except ValueError:
+        return value
+
+
+def _resolve_display_date(actual_start_date: str, fallback_date: str) -> str:
+    actual = _normalize_display_date(actual_start_date)
+    if actual:
+        return actual
+    return _normalize_display_date(fallback_date)
+
+
+def _parse_display_date(value: str) -> date | None:
+    normalized = _normalize_display_date(value)
+    if not normalized:
+        return None
+    try:
+        return date.fromisoformat(normalized)
+    except ValueError:
+        return None
+
+
+def _resolve_case_display_date(case: dict[str, Any]) -> str:
+    return _resolve_display_date(
+        str(case.get("actual_start_date") or ""),
+        str(case.get("execution_date", case.get("cycle_updated_on", ""))),
+    )
+
+
+def _resolve_daily_title_date(cycles: dict[str, Any]) -> str:
+    date_counter: Counter[str] = Counter()
+    for cycle in cycles.values():
+        if not isinstance(cycle, dict):
+            continue
+        for case in cycle.get("cases", {}).values():
+            if not isinstance(case, dict):
+                continue
+            display_date = _resolve_case_display_date(case)
+            if display_date:
+                date_counter[display_date] += 1
+    if not date_counter:
+        return ""
+    top_count = max(date_counter.values())
+    candidates = sorted(value for value, count in date_counter.items() if count == top_count)
+    return candidates[0]
+
+
 def _resolve_folder_dominant_actual_date(cycles: dict[str, Any]) -> date | None:
     date_counter: Counter[date] = Counter()
     for cycle in cycles.values():
@@ -2658,6 +3506,10 @@ def _resolve_daily_title_day(cycles: dict[str, Any]) -> date | None:
     if not title_date:
         return None
     return _parse_display_date(title_date)
+
+
+def _daily_document_title(folder_name: str) -> str:
+    return f"[{folder_name}] Отчёт теста ML planner'а на полигонах"
 
 
 def _normalize_weekly_cycle_label(label: str) -> tuple[str, bool]:
@@ -2697,6 +3549,21 @@ def _filter_report_data_by_resolved_folder_day(
     return out
 
 
+def _filter_tree_folders_by_report_day(
+    folders: list[FolderNode], from_date: date, to_date: date
+) -> list[FolderNode]:
+    out: list[FolderNode] = []
+    for folder in folders:
+        folder_day = _parse_report_day_from_folder_name(folder.folder_name)
+        if folder_day is None:
+            # Keep unknown names to avoid accidental data loss.
+            out.append(folder)
+            continue
+        if from_date <= folder_day <= to_date:
+            out.append(folder)
+    return out
+
+
 def _weekly_cycle_matrix_data(
     report_data: dict[tuple[str, str], dict[str, Any]]
 ) -> tuple[date | None, list[str], list[list[str]], list[list[bool]], list[list[bool]]]:
@@ -2708,12 +3575,12 @@ def _weekly_cycle_matrix_data(
         report_day = _resolve_folder_report_day(folder_name, cycles)
         if report_day is None:
             report_day = _resolve_daily_title_day(cycles)
-        if report_day is None or report_day.weekday() > 4:
+        if report_day is None:
             continue
         progress_rows = _build_cycle_progress_rows(cycles)
         if not progress_rows:
             continue
-        week_start = report_day - timedelta(days=report_day.weekday())
+        week_start = _release_week_start(report_day)
         weekly_groups[week_start].append(
             {
                 "folder_id": str(folder_id),
@@ -2724,7 +3591,7 @@ def _weekly_cycle_matrix_data(
         )
 
     if not weekly_groups:
-        return None, [], [], []
+        return None, [], [], [], []
 
     def _aggregate_progress_map(
         progress_rows: list[dict[str, Any]],
@@ -2922,12 +3789,12 @@ def _split_report_data_by_week(
         report_day = _resolve_folder_report_day(folder_name, cycles)
         if report_day is None:
             report_day = _resolve_daily_title_day(cycles)
-        if report_day is None or report_day.weekday() > 4:
+        if report_day is None:
             continue
         progress_rows = _build_cycle_progress_rows(cycles)
         if not progress_rows:
             continue
-        week_start = report_day - timedelta(days=report_day.weekday())
+        week_start = _release_week_start(report_day)
         grouped[week_start][(folder_id, folder_name)] = payload
     return grouped
 
@@ -2962,22 +3829,59 @@ def write_weekly_cycle_matrix_csv(path: str, weekday_labels: list[str], rows: li
     return _write_text_if_changed(path, buffer.getvalue())
 
 
+def _weekly_matrix_title_text(week_start: date | None, weekday_labels: list[str]) -> str:
+    week_label = week_start.isoformat() if week_start else "N/A"
+    labels = list(weekday_labels)
+    present_days: list[date] = []
+    for label in labels:
+        match = re.search(r"\b(\d{4}\.\d{2}\.\d{2})\b", str(label))
+        if not match:
+            continue
+        try:
+            present_days.append(datetime.strptime(match.group(1), "%Y.%m.%d").date())
+        except ValueError:
+            continue
+    if present_days:
+        range_start = min(present_days)
+        range_end = max(present_days)
+        week_no = int(range_start.isocalendar()[1])
+        title_start = range_start + timedelta(days=1)
+        title_end = range_end + timedelta(days=1)
+        return (
+            f"Weekly W_{week_no:02d}. {title_start.strftime('%d.%m.%Y')} - "
+            f"{title_end.strftime('%d.%m.%Y')}"
+        )
+    return f"Weekly W_??. {week_label}"
+
+
 def render_weekly_html_report(
     week_start: date | None,
     weekday_labels: list[str],
     rows: list[list[str]],
     cell_all_not_executed: list[list[bool]] | None = None,
     cell_all_blocked: list[list[bool]] | None = None,
+    *,
+    template_dir: str | None = None,
+    folder_id_resolve: str | None = None,
+    folder_id_mapping: str = "",
+    folder_name_mapping: str = "",
 ) -> str:
-    week_label = week_start.isoformat() if week_start else "N/A"
     labels = list(weekday_labels)
-    col_count = 2 + len(labels)
+    title_text = _weekly_matrix_title_text(week_start, weekday_labels)
     header_cells = ["<th>Тестовый цикл</th>", "<th>Всего кейсов</th>"]
     header_cells.extend(f"<th>{html.escape(label)}</th>" for label in labels)
+    preamble = _format_readable_html_preamble(
+        template_dir,
+        "weekly",
+        folder_id_resolve,
+        folder_id_mapping,
+        folder_name_mapping,
+        week_start,
+    )
     sections = [
         "<!doctype html>",
         "<html><head><meta charset='utf-8'>",
-        f"<title>Weekly cycle matrix: {html.escape(week_label)}</title>",
+        f"<title>{html.escape(title_text)}</title>",
         (
             "<style>"
             "body{font-family:Arial,sans-serif;margin:24px;}"
@@ -2988,13 +3892,20 @@ def render_weekly_html_report(
             ".group-total-row td{font-weight:700;background:#ffffff;color:#1f2328;}"
             ".group-total-row td:not(:first-child){text-align:center;}"
             ".scenario-sep td{border:none;height:8px;padding:0;background:transparent;}"
+            ".report-preamble{margin:12px 0 20px;}"
             "</style>"
         ),
         "</head><body>",
-        f"<h1>Weekly cycle matrix: {html.escape(week_label)}</h1>",
-        "<table>",
-        "<thead><tr>" + "".join(header_cells) + "</tr></thead><tbody>",
+        f"<h1>{html.escape(title_text)}</h1>",
     ]
+    if preamble:
+        sections.append(preamble)
+    sections.extend(
+        [
+            "<table>",
+            "<thead><tr>" + "".join(header_cells) + "</tr></thead><tbody>",
+        ]
+    )
     for row_idx, row in enumerate(rows):
         if str(row[0]).startswith("Итого:"):
             total_cells = [
@@ -3059,10 +3970,26 @@ def render_weekly_wiki_report(
     week_start: date | None,
     weekday_labels: list[str],
     rows: list[list[str]],
+    *,
+    template_dir: str | None = None,
+    folder_id_resolve: str | None = None,
+    folder_id_mapping: str = "",
+    folder_name_mapping: str = "",
 ) -> str:
-    week_label = week_start.isoformat() if week_start else "N/A"
+    title_text = _weekly_matrix_title_text(week_start, weekday_labels)
     labels = list(weekday_labels)
-    lines = [f"h1. Weekly cycle matrix: {_wiki_escape(week_label)}", ""]
+    lines = [f"h1. {_wiki_escape(title_text)}", ""]
+    wiki_pre = _format_readable_wiki_preamble(
+        template_dir,
+        "weekly",
+        folder_id_resolve,
+        folder_id_mapping,
+        folder_name_mapping,
+        week_start,
+    )
+    if wiki_pre:
+        lines.extend(wiki_pre.splitlines())
+        lines.append("")
     header_cells = ["Тестовый цикл", "Всего кейсов"]
     header_cells.extend(f"{_wiki_escape(label)}" for label in labels)
     lines.append("|| " + " || ".join(header_cells) + " ||")
@@ -3093,10 +4020,16 @@ def write_weekly_readable_reports(
     formats: set[str],
     cell_all_not_executed: list[list[bool]] | None = None,
     cell_all_blocked: list[list[bool]] | None = None,
+    *,
+    template_dir: str | None = None,
+    folder_id_resolve: str | None = None,
+    folder_id_mapping: str = "",
+    folder_name_mapping: str = "",
+    filename_suffix: str = "",
 ) -> list[str]:
     os.makedirs(output_dir, exist_ok=True)
     week_label = week_start.isoformat() if week_start else "unknown_week"
-    base_name = f"weekly_cycle_matrix_{week_label}"
+    base_name = f"weekly_cycle_matrix_{week_label}{filename_suffix}"
     updated_paths: list[str] = []
     if "html" in formats:
         html_path = os.path.join(output_dir, f"{base_name}.html")
@@ -3106,29 +4039,762 @@ def write_weekly_readable_reports(
             rows,
             cell_all_not_executed=cell_all_not_executed,
             cell_all_blocked=cell_all_blocked,
+            template_dir=template_dir,
+            folder_id_resolve=folder_id_resolve,
+            folder_id_mapping=folder_id_mapping,
+            folder_name_mapping=folder_name_mapping,
         )
         if _write_text_if_changed(html_path, html_body):
             updated_paths.append(html_path)
     if "wiki" in formats:
         wiki_path = os.path.join(output_dir, f"{base_name}.confluence.txt")
-        wiki_body = render_weekly_wiki_report(week_start, weekday_labels, rows)
+        wiki_body = render_weekly_wiki_report(
+            week_start,
+            weekday_labels,
+            rows,
+            template_dir=template_dir,
+            folder_id_resolve=folder_id_resolve,
+            folder_id_mapping=folder_id_mapping,
+            folder_name_mapping=folder_name_mapping,
+        )
         if _write_text_if_changed(wiki_path, wiki_body):
             updated_paths.append(wiki_path)
     return updated_paths
 
 
-def render_daily_html_report(folder_name: str, cycles: dict[str, Any]) -> str:
+def _daily_sanitize_cycle_title(title: str) -> str:
+    """Remove cloned markers from Zephyr cycle titles for daily readable output."""
+    t = str(title or "").strip()
+    if not t:
+        return ""
+    t = re.sub(r"\s*\((?:cloned|клонированный)\)\s*$", "", t, flags=re.IGNORECASE).strip()
+    t = re.sub(r"(?i)\s+\bcloned\s*$", "", t).strip()
+    return t
+
+
+def _daily_strip_cycle_title_suffix(title: str) -> str:
+    return _daily_sanitize_cycle_title(title)
+
+
+def _daily_progress_row_for_display(row: dict[str, Any]) -> dict[str, Any]:
+    out = dict(row)
+    out["cycle_title"] = _daily_sanitize_cycle_title(str(out.get("cycle_title") or ""))
+    return out
+
+
+def _daily_display_cycle_index(cycle: dict[str, Any]) -> str | None:
+    idx = _extract_cycle_index(cycle)
+    if idx and re.match(r"^\d+\.\d+$", idx):
+        return f"3.{idx}"
+    return None
+
+
+def _daily_cycle_anchor_id(display_index: str | None, cycle: dict[str, Any]) -> str:
+    if display_index:
+        return "cycle-" + display_index.replace(".", "-")
+    slug = slugify(
+        str(cycle.get("cycle_key") or cycle.get("cycle_name") or cycle.get("cycle_id") or "cycle")
+    )
+    return f"cycle-{slug}"
+
+
+def _daily_cycle_heading_parts(cycle: dict[str, Any]) -> tuple[str, str]:
+    display_idx = _daily_display_cycle_index(cycle)
+    anchor = _daily_cycle_anchor_id(display_idx, cycle)
+    heading = _daily_toc_child_label(cycle)
+    return anchor, heading
+
+
+def _daily_wiki_anchor_name(html_anchor_id: str) -> str:
+    return html_anchor_id.replace("-", "_")
+
+
+def _daily_cycle_to_label_row(cycle: dict[str, Any]) -> dict[str, Any]:
+    cycle_title = str(cycle.get("cycle_name") or cycle.get("cycle_key") or cycle.get("cycle_id") or "")
+    return {
+        "cycle_title": _daily_sanitize_cycle_title(cycle_title),
+        "cycle_index": _extract_cycle_index(cycle),
+        "cycle_key": str(cycle.get("cycle_key") or ""),
+    }
+
+
+def _daily_toc_group_sort_key(gid: str) -> tuple[int, int | str]:
+    if gid == "_other":
+        return (2, 0)
+    if gid.isdigit():
+        return (0, int(gid))
+    return (1, gid.lower())
+
+
+def _daily_toc_groups_from_sorted_cycles(
+    sorted_cycles: list[dict[str, Any]],
+) -> list[tuple[str, str, list[dict[str, Any]]]]:
+    """
+    Group cycles by major index (first digit of X.Y). Returns
+    (group_id, group_heading_plain, cycles) sorted like conclusion groups.
+    """
+    groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    order: list[str] = []
+    for cycle in sorted_cycles:
+        idx = _extract_cycle_index(cycle)
+        m = re.match(r"^(\d+)\.(\d+)$", idx or "")
+        gid = m.group(1) if m else "_other"
+        if gid not in groups:
+            order.append(gid)
+            groups[gid] = []
+        groups[gid].append(cycle)
+
+    result: list[tuple[str, str, list[dict[str, Any]]]] = []
+    for gid in sorted(order, key=_daily_toc_group_sort_key):
+        group_cycles = groups[gid]
+        rows = [_daily_cycle_to_label_row(c) for c in group_cycles]
+        labels = [_build_summary_cycle_label(r) for r in rows]
+        title = _summary_group_title_from_labels(labels, fallback_group=gid)
+        if gid == "_other":
+            heading = title
+        else:
+            heading = f"3.{gid} {title}"
+        result.append((gid, heading, group_cycles))
+    return result
+
+
+def _daily_toc_child_label(cycle: dict[str, Any]) -> str:
+    idx = _extract_cycle_index(cycle)
+    raw_title = cycle.get("cycle_name") or cycle.get("cycle_key") or cycle.get("cycle_id") or ""
+    stripped = _daily_sanitize_cycle_title(str(raw_title))
+    stripped = re.sub(r"(?i)^test\s+cycle:\s*", "", stripped).strip()
+    tail = stripped
+    if idx and re.match(r"^\d+\.\d+$", idx):
+        tail = re.sub(rf"^\s*{re.escape(idx)}\s+", "", tail).strip()
+        tail = re.sub(r"^\s*\d+\.\d+\s+", "", tail).strip()
+    if idx and re.match(r"^\d+\.\d+$", idx):
+        return f"{idx} {tail}".strip() if tail else idx
+    return tail or stripped or "Unnamed cycle"
+
+
+def _daily_render_html_toc(sorted_cycles: list[dict[str, Any]]) -> str:
+    groups = _daily_toc_groups_from_sorted_cycles(sorted_cycles)
+    scenarios_anchor = "#scenarios"
+    parts: list[str] = [
+        "<nav class='report-toc'><p class='report-toc-title'><strong>Оглавление</strong></p><ul>",
+        "<li><a href='#sec-object'><strong>1. Объект тестирования</strong></a></li>",
+        "<li><a href='#sec-environment'><strong>2. Условия окружения</strong></a></li>",
+        f"<li><a href='{html.escape(scenarios_anchor, quote=True)}'><strong>3. Результаты тестирования</strong></a></li>",
+    ]
+    for _gid, heading, group_cycles in groups:
+        first = group_cycles[0]
+        anchor, _ = _daily_cycle_heading_parts(first)
+        parts.append(
+            "<li>"
+            f"<a href='#{html.escape(anchor, quote=True)}'>"
+            f"&nbsp;&nbsp;&nbsp;&nbsp;{html.escape(heading)}</a>"
+            "</li>"
+        )
+    parts.append("<li><a href='#conclusion'><strong>4. Заключение</strong></a></li>")
+    parts.append("</ul></nav>")
+    return "".join(parts)
+
+
+def _daily_aggregate_case_status_counts(cycles: dict[str, Any]) -> dict[str, int]:
+    counts: defaultdict[str, int] = defaultdict(int)
+    for cycle in cycles.values():
+        for case in cycle.get("cases", {}).values():
+            counts[normalize_status(case.get("result", case.get("test_case_status", "")))] += 1
+    return dict(counts)
+
+
+def _daily_aggregate_case_status_counts_for_cycle(cycle: dict[str, Any]) -> dict[str, int]:
+    return _daily_aggregate_case_status_counts({"_": cycle})
+
+
+def _daily_global_passed_total(cycles: dict[str, Any]) -> tuple[int, int]:
+    total_y = 0
+    total_x = 0
+    for cycle in cycles.values():
+        for case in cycle.get("cases", {}).values():
+            total_y += 1
+            if normalize_status(case.get("result", case.get("test_case_status", ""))) == "passed":
+                total_x += 1
+    return total_x, total_y
+
+
+def _daily_scenario_group_lines(progress_rows: list[dict[str, Any]]) -> list[str]:
+    groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in progress_rows:
+        g = _summary_scenario_group(row)
+        if not g:
+            g = "_other"
+        groups[g].append(row)
+
+    def gid_sort(gid: str) -> tuple[int, int | str]:
+        if gid == "_other":
+            return (2, 0)
+        if gid.isdigit():
+            return (0, int(gid))
+        return (1, gid.lower())
+
+    lines: list[str] = []
+    for gid in sorted(groups.keys(), key=gid_sort):
+        group_rows = groups[gid]
+        labels = [_build_summary_cycle_label(r) for r in group_rows]
+        title = _summary_group_title_from_labels(labels, fallback_group=gid)
+        passed_sum = sum(int(r["passed_cases"]) for r in group_rows)
+        total_sum = sum(int(r["total_cases"]) for r in group_rows)
+        lines.append(f"{title} - выполняется {passed_sum}/{total_sum}")
+    return lines
+
+
+def _daily_status_pie_svg(
+    counts: dict[str, int],
+    *,
+    size: int = 220,
+    extra_wrap_class: str = "",
+) -> str:
+    order: list[tuple[str, str, str]] = [
+        ("passed", "#33c24d", "Пройден"),
+        ("failed", "#e53935", "Не пройден"),
+        ("not_executed", "#c9c9c2", "Не выполнен"),
+        ("blocked", "#4a90e2", "Заблокирован"),
+        ("other", "#adb5bd", "Прочее"),
+    ]
+    total = sum(counts.get(k, 0) for k, _, _ in order)
+    if total <= 0:
+        return "<p class='pie-empty'>Нет данных по статусам</p>"
+    cx = cy = size / 2
+    r = size / 2 - 12
+    angle = -math.pi / 2
+    paths: list[str] = []
+    for key, color, _lbl in order:
+        val = counts.get(key, 0)
+        if val <= 0:
+            continue
+        slice_angle = 2 * math.pi * val / total
+        x0 = cx + r * math.cos(angle)
+        y0 = cy + r * math.sin(angle)
+        x1 = cx + r * math.cos(angle + slice_angle)
+        y1 = cy + r * math.sin(angle + slice_angle)
+        large_arc = 1 if slice_angle > math.pi else 0
+        paths.append(
+            f"<path d='M {cx:.2f} {cy:.2f} L {x0:.2f} {y0:.2f} A {r:.2f} {r:.2f} 0 {large_arc} 1 "
+            f"{x1:.2f} {y1:.2f} Z' fill='{html.escape(color)}' stroke='#ffffff' stroke-width='1'/>"
+        )
+        angle += slice_angle
+    legend_items: list[str] = []
+    for key, color, label in order:
+        val = counts.get(key, 0)
+        if val <= 0:
+            continue
+        pct = 100.0 * val / total
+        legend_items.append(
+            "<span class='pie-legend-item'><span class='pie-swatch' "
+            f"style='background:{html.escape(color)}'></span>"
+            f"{html.escape(label)}: {val} ({pct:.1f}%)</span>"
+        )
+    legend = "<div class='pie-legend'>" + " ".join(legend_items) + "</div>"
+    svg_inner = "\n".join(paths)
+    wrap_class = "daily-pie-wrap"
+    ext = extra_wrap_class.strip()
+    if ext:
+        wrap_class = f"{wrap_class} {ext}"
+    return (
+        f"<div class='{wrap_class}'><svg xmlns='http://www.w3.org/2000/svg' "
+        f"width='{size}' height='{size}' viewBox='0 0 {size} {size}' role='img' "
+        f"aria-label='Распределение статусов по кейсам'>{svg_inner}</svg>{legend}</div>"
+    )
+
+
+def _daily_status_summary_lines(counts: dict[str, int]) -> list[str]:
+    ordered: list[tuple[str, str]] = [
+        ("passed", "Пройден"),
+        ("failed", "Не пройден"),
+        ("not_executed", "Не выполнен"),
+        ("blocked", "Заблокирован"),
+        ("other", "Прочее"),
+    ]
+    total = sum(int(counts.get(key, 0)) for key, _ in ordered)
+    if total <= 0:
+        return ["Статусы: нет данных"]
+    lines: list[str] = []
+    for key, label in ordered:
+        value = int(counts.get(key, 0))
+        if value <= 0:
+            continue
+        pct = (value / total) * 100.0
+        lines.append(f"{label}: {value} ({pct:.1f}%)")
+    return lines
+
+
+def _daily_status_chart_wiki_block(counts: dict[str, int]) -> str:
+    """Confluence wiki: table + native Chart macro (pie)."""
+    ordered: list[tuple[str, str]] = [
+        ("passed", "Пройден"),
+        ("failed", "Не пройден"),
+        ("not_executed", "Не выполнен"),
+        ("blocked", "Заблокирован"),
+        ("other", "Прочее"),
+    ]
+    row_lines: list[str] = []
+    for key, label in ordered:
+        value = int(counts.get(key, 0))
+        if value <= 0:
+            continue
+        row_lines.append(f"| {_wiki_escape(label)} | {value} |")
+    if not row_lines:
+        return ""
+    title = _wiki_escape("Распределение статусов (по кейсам)")
+    header = "|| Категория || Количество ||"
+    table_block = "\n".join([header] + row_lines)
+    return (
+        f"{{chart:type=pie|title={title}|width=420|height=320}}\n"
+        f"{table_block}\n"
+        f"{{chart}}"
+    )
+
+
+def _daily_zephyr_normalize_cycle_value_objects(
+    cycle_objects: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    normalized: list[dict[str, Any]] = []
+    for obj in cycle_objects:
+        oid = str(obj.get("id") or "").strip()
+        if not oid:
+            continue
+        name = str(obj.get("name") or "").strip()
+        if name:
+            normalized.append({"id": oid, "name": name})
+        else:
+            normalized.append({"id": oid})
+    return normalized
+
+
+def _daily_zephyr_build_conditions_info(
+    cycle_value_objects: list[dict[str, Any]],
+    *,
+    project_id: int,
+    project_key: str,
+    project_display_name: str,
+) -> dict[str, Any]:
+    """conditionsInfo JSON for Zephyr Reporting TEST_RESULTS_SUMMARY_BY_STATUS (storage)."""
+    proj_entry = {
+        "id": project_key,
+        "name": project_display_name,
+        "projectId": project_id,
+    }
+
+    def _exec_between(alias: str = "testResult") -> dict[str, Any]:
+        return {
+            "alias": alias,
+            "field": "executionDate",
+            "comparisonOperator": "between",
+        }
+
+    def _last_result(alias: str) -> dict[str, Any]:
+        return {
+            "alias": alias,
+            "field": "onlyLastTestResult",
+            "comparisonOperator": "IS",
+            "value": {"id": True},
+        }
+
+    return {
+        "filterByOption": "FILTER_BY_TEST_RUN",
+        "projectCondition": {
+            "alias": "testResult",
+            "field": "projectId",
+            "comparisonOperator": "IN",
+            "value": [proj_entry],
+        },
+        "noneCondition": {
+            "testResultExecutionDateCondition": _exec_between(),
+            "lastTestResultCondition": _last_result("testCase"),
+        },
+        "testRunCondition": {
+            "testRunKeyCondition": {
+                "alias": "testRun",
+                "field": "key",
+                "comparisonOperator": "IN",
+                "value": cycle_value_objects,
+            },
+            "testResultExecutionDateCondition": _exec_between(),
+            "lastTestResultCondition": _last_result("testRun"),
+        },
+        "testPlanCondition": {
+            "testPlanKeyCondition": {
+                "alias": "testPlan",
+                "field": "key",
+                "comparisonOperator": "IN",
+            },
+            "testResultExecutionDateCondition": _exec_between(),
+            "lastTestResultCondition": _last_result("testPlan"),
+        },
+        "iterationCondition": {
+            "testRunIterationCondition": {
+                "alias": "testRun",
+                "field": "iterationName",
+                "comparisonOperator": "IN",
+            },
+            "testResultExecutionDateCondition": _exec_between(),
+            "lastTestResultCondition": _last_result("testRun"),
+        },
+        "versionCondition": {
+            "testRunVersionCondition": {
+                "alias": "testRun",
+                "field": "versionId",
+                "comparisonOperator": "IN",
+            },
+            "testResultExecutionDateCondition": _exec_between(),
+            "lastTestResultCondition": _last_result("testRun"),
+        },
+        "folderCondition": {
+            "testCaseFolderCondition": {
+                "alias": "testCase",
+                "field": "folderName",
+                "options": {},
+                "comparisonOperator": "IN",
+            },
+            "testResultExecutionDateCondition": _exec_between(),
+            "lastTestResultCondition": _last_result("testCase"),
+        },
+        "issueCondition": {
+            "favoriteFilterCondition": {
+                "alias": "issue",
+                "queryLanguage": "JQL",
+                "field": "favoriteFilter",
+            },
+            "lastTestResultCondition": _last_result("testCase"),
+        },
+        "epicCondition": {
+            "favoriteFilterCondition": {
+                "alias": "epic",
+                "queryLanguage": "JQL",
+                "field": "favoriteFilter",
+            },
+            "lastTestResultCondition": _last_result("testCase"),
+        },
+        "customCondition": {
+            "testCaseConditions": [],
+            "testRunConditions": [],
+            "testPlanConditions": [],
+            "testResultConditions": [],
+            "lastTestResultCondition": _last_result("testRun"),
+        },
+        "traceabilityCustomTreeCondition": {
+            "lastTestResultCondition": _last_result("testCase"),
+        },
+    }
+
+
+def _daily_zephyr_test_results_summary_storage_macro(
+    cycle_objects: list[dict[str, Any]],
+) -> str:
+    """Confluence storage XML: Zephyr Reporting macro replacing Chart on publish."""
+    normalized = _daily_zephyr_normalize_cycle_value_objects(cycle_objects)
+    if not normalized:
+        return ""
+
+    app_id = (
+        os.getenv("ZEPHYR_CONFLUENCE_ZEPHYR_APP_ID")
+        or "7eb1ea68-9ea9-315e-abbf-042a60da5b3b"
+    ).strip()
+    project_id_raw = (os.getenv("ZEPHYR_PROJECT_ID") or "10904").strip()
+    try:
+        project_id = int(project_id_raw)
+    except ValueError:
+        project_id = 10904
+    project_key = (os.getenv("ZEPHYR_JIRA_PROJECT_KEY") or "QA").strip()
+    project_name = (os.getenv("ZEPHYR_JIRA_PROJECT_DISPLAY_NAME") or "T&V").strip()
+
+    settings = {
+        "displayUnit": "COUNT",
+        "traceabilityReportOption": "COVERAGE_TEST_CASES",
+        "traceabilityTreeOption": "COVERAGE_TEST_CASES",
+        "traceabilityCustomTreeDisplayOption": "CONDENSED",
+        "traceabilityMatrixOption": "COVERAGE_TEST_CASES",
+        "period": "MONTH",
+        "scorecardOption": "EXECUTION_RESULTS",
+    }
+    conditions = _daily_zephyr_build_conditions_info(
+        normalized,
+        project_id=project_id,
+        project_key=project_key,
+        project_display_name=project_name,
+    )
+
+    settings_json = json.dumps(settings, ensure_ascii=False, separators=(",", ":"))
+    conditions_json = json.dumps(conditions, ensure_ascii=False, separators=(",", ":"))
+    extra_json = "{}"
+
+    return (
+        '<ac:structured-macro ac:name="TEST_RESULTS_SUMMARY_BY_STATUS" '
+        'ac:schema-version="1">'
+        f'<ac:parameter ac:name="settings">{html.escape(settings_json, quote=True)}</ac:parameter>'
+        f'<ac:parameter ac:name="appId">{html.escape(app_id, quote=True)}</ac:parameter>'
+        f'<ac:parameter ac:name="conditionsInfo">{html.escape(conditions_json, quote=True)}</ac:parameter>'
+        f'<ac:parameter ac:name="extraParams">{html.escape(extra_json, quote=True)}</ac:parameter>'
+        '<ac:parameter ac:name="reportKey">TEST_RESULTS_SUMMARY_BY_STATUS</ac:parameter>'
+        "</ac:structured-macro>"
+    )
+
+
+def _daily_status_chart_storage_macro(counts: dict[str, int]) -> str:
+    """Confluence storage XML: Chart macro (pie) + data table for REST publish."""
+    ordered: list[tuple[str, str, str]] = [
+        ("passed", "Пройден", "#33c24d"),
+        ("failed", "Не пройден", "#e53935"),
+        ("not_executed", "Не выполнен", "#c9c9c2"),
+        ("blocked", "Заблокирован", "#4a90e2"),
+        ("other", "Прочее", "#adb5bd"),
+    ]
+    row_cells: list[str] = []
+    colors: list[str] = []
+    for key, label, color in ordered:
+        value = int(counts.get(key, 0))
+        if value <= 0:
+            continue
+        colors.append(color)
+        row_cells.append(
+            "<tr>"
+            f"<td>{html.escape(label)}</td>"
+            f"<td>{value}</td>"
+            "</tr>"
+        )
+    if not row_cells:
+        return ""
+    title = html.escape("Распределение статусов (по кейсам)")
+    header_row = (
+        "<tr><th>Категория</th><th>Количество</th></tr>"
+    )
+    table = (
+        "<table><tbody>"
+        + header_row
+        + "".join(row_cells)
+        + "</tbody></table>"
+    )
+    colors_csv = html.escape(",".join(colors))
+    return (
+        '<ac:structured-macro ac:name="chart">'
+        '<ac:parameter ac:name="type">pie</ac:parameter>'
+        f'<ac:parameter ac:name="title">{title}</ac:parameter>'
+        f'<ac:parameter ac:name="colors">{colors_csv}</ac:parameter>'
+        '<ac:parameter ac:name="dataOrientation">vertical</ac:parameter>'
+        '<ac:parameter ac:name="legend">true</ac:parameter>'
+        '<ac:parameter ac:name="pieSectionLabel"></ac:parameter>'
+        f"<ac:rich-text-body>{table}</ac:rich-text-body>"
+        "</ac:structured-macro>"
+    )
+
+
+def _daily_status_palette() -> list[tuple[str, tuple[int, int, int]]]:
+    return [
+        ("passed", (51, 194, 77)),
+        ("failed", (229, 57, 53)),
+        ("not_executed", (201, 201, 194)),
+        ("blocked", (74, 144, 226)),
+        ("other", (173, 181, 189)),
+    ]
+
+
+def _write_daily_pie_png(path: str, counts: dict[str, int], *, size: int = 240) -> bool:
+    ordered = _daily_status_palette()
+    total = sum(counts.get(key, 0) for key, _ in ordered)
+    if total <= 0:
+        return False
+
+    cx = cy = size // 2
+    radius = (size // 2) - 8
+    inner_radius = 0
+    img = bytearray([255] * (size * size * 3))
+
+    slices: list[tuple[float, float, tuple[int, int, int]]] = []
+    angle = -math.pi / 2
+    for key, color in ordered:
+        value = counts.get(key, 0)
+        if value <= 0:
+            continue
+        portion = 2 * math.pi * value / total
+        slices.append((angle, angle + portion, color))
+        angle += portion
+
+    for y in range(size):
+        dy = y - cy
+        for x in range(size):
+            dx = x - cx
+            dist2 = dx * dx + dy * dy
+            if dist2 > radius * radius or dist2 < inner_radius * inner_radius:
+                continue
+            a = math.atan2(dy, dx)
+            # Normalize to [start, start+2pi) window
+            if a < -math.pi / 2:
+                a += 2 * math.pi
+            for start, end, color in slices:
+                adj_end = end
+                if adj_end < start:
+                    adj_end += 2 * math.pi
+                aa = a
+                if aa < start:
+                    aa += 2 * math.pi
+                if start <= aa <= adj_end:
+                    idx = (y * size + x) * 3
+                    img[idx : idx + 3] = bytes(color)
+                    break
+
+    # White separators for cleaner slices.
+    for y in range(size):
+        dy = y - cy
+        for x in range(size):
+            dx = x - cx
+            d = math.sqrt(dx * dx + dy * dy)
+            if abs(d - radius) <= 0.7:
+                idx = (y * size + x) * 3
+                img[idx : idx + 3] = b"\xff\xff\xff"
+
+    rows = bytearray()
+    stride = size * 3
+    for y in range(size):
+        rows.append(0)  # no filter
+        start = y * stride
+        rows.extend(img[start : start + stride])
+
+    def _chunk(tag: bytes, payload: bytes) -> bytes:
+        return (
+            len(payload).to_bytes(4, "big")
+            + tag
+            + payload
+            + zlib.crc32(tag + payload).to_bytes(4, "big")
+        )
+
+    signature = b"\x89PNG\r\n\x1a\n"
+    ihdr = _chunk(
+        b"IHDR",
+        size.to_bytes(4, "big")
+        + size.to_bytes(4, "big")
+        + b"\x08\x02\x00\x00\x00",
+    )
+    idat = _chunk(b"IDAT", zlib.compress(bytes(rows), level=9))
+    iend = _chunk(b"IEND", b"")
+    payload = signature + ihdr + idat + iend
+    if os.path.exists(path):
+        try:
+            with open(path, "rb") as current:
+                if current.read() == payload:
+                    return False
+        except OSError:
+            pass
+    with open(path, "wb") as target:
+        target.write(payload)
+    return True
+
+
+def _load_daily_confluence_execution_macro(template_dir: str | None) -> str:
+    env_val = (os.getenv("ZEPHYR_CONFLUENCE_TEST_EXEC_MACRO") or "").strip()
+    if env_val:
+        return env_val
+    candidates: list[str] = []
+    if template_dir:
+        candidates.append(
+            os.path.join(template_dir, "daily", "wiki", "confluence_execution_macro.txt")
+        )
+    here = os.path.dirname(os.path.abspath(__file__))
+    candidates.append(
+        os.path.join(here, "report_templates", "readable", "daily", "wiki", "confluence_execution_macro.txt")
+    )
+    for path in candidates:
+        if path and os.path.isfile(path):
+            try:
+                with open(path, encoding="utf-8") as f:
+                    text = f.read().strip()
+            except OSError:
+                continue
+            if text:
+                return text
+    return ""
+
+
+def _daily_cycle_keys_from_cycles(cycles: dict[str, Any]) -> list[str]:
+    keys: list[str] = []
+    seen: set[str] = set()
+    for cycle in sorted(cycles.values(), key=_cycle_sort_key):
+        cycle_key = str(cycle.get("cycle_key") or "").strip()
+        if not cycle_key or cycle_key in seen:
+            continue
+        seen.add(cycle_key)
+        keys.append(cycle_key)
+    return keys
+
+
+def _render_daily_confluence_execution_macro(
+    template_dir: str | None, folder_name: str, cycles: dict[str, Any]
+) -> str:
+    """
+    Render optional Zephyr macro text with cycle placeholders.
+
+    Supported placeholders in env/template macro text:
+    - {CYCLE_KEYS_CSV}  -> QA-1,QA-2,QA-3
+    - {CYCLE_KEYS_PIPE} -> QA-1|QA-2|QA-3
+    - {CYCLE_KEYS_JSON} -> ["QA-1","QA-2","QA-3"]
+    - {CYCLE_KEYS_OBJECTS_JSON} -> [{"id":"QA-1"},{"id":"QA-2"}]
+    - {FOLDER_NAME}     -> raw folder name from current report
+    """
+    macro = _load_daily_confluence_execution_macro(template_dir)
+    if not macro:
+        return ""
+    cycle_keys = _daily_cycle_keys_from_cycles(cycles)
+    cycle_key_objects_json = json.dumps(
+        [{"id": key} for key in cycle_keys], ensure_ascii=False, separators=(",", ":")
+    )
+    repl = {
+        "{CYCLE_KEYS_CSV}": ",".join(cycle_keys),
+        "{CYCLE_KEYS_PIPE}": "|".join(cycle_keys),
+        "{CYCLE_KEYS_JSON}": json.dumps(cycle_keys, ensure_ascii=False),
+        "{CYCLE_KEYS_OBJECTS_JSON}": cycle_key_objects_json,
+        "{FOLDER_NAME}": folder_name,
+    }
+    out = macro
+    for token, value in repl.items():
+        out = out.replace(token, value)
+    return out
+
+
+def render_daily_html_report(
+    folder_name: str,
+    cycles: dict[str, Any],
+    *,
+    folder_id: str,
+    template_dir: str | None = None,
+) -> str:
+    doc_title = _daily_document_title(folder_name)
+    preamble = _format_readable_html_preamble(
+        template_dir,
+        "daily",
+        folder_id,
+        folder_id,
+        folder_name,
+        None,
+    )
+    sorted_cycles = sorted(cycles.values(), key=_cycle_sort_key)
+    status_counts = _daily_aggregate_case_status_counts(cycles)
+    toc_html = _daily_render_html_toc(sorted_cycles)
     sections = [
         "<!doctype html>",
         "<html><head><meta charset='utf-8'>",
-        f"<title>Daily report: {html.escape(folder_name)}</title>",
+        f"<title>{html.escape(doc_title)}</title>",
         (
             "<style>"
             "body{font-family:Arial,sans-serif;margin:24px;}"
-            "h1{margin-bottom:8px;}h2{margin-top:24px;margin-bottom:8px;}"
+            "h1{margin-bottom:8px;}h2{margin-top:24px;margin-bottom:8px;font-weight:700;}"
             "table{border-collapse:collapse;width:100%;margin-bottom:16px;table-layout:fixed;}"
             "th,td{border:1px solid #d6d6d6;padding:6px 8px;text-align:left;vertical-align:top;overflow-wrap:anywhere;word-wrap:break-word;}"
             "th{background:#f0f2f5;font-weight:600;}"
+            ".report-preamble{margin:12px 0 20px;}"
+            ".report-toc{border:1px solid #e1e4e8;padding:12px 16px;margin:16px 0;background:#fafbfc;border-radius:6px;}"
+            ".report-toc ul{margin:8px 0;padding-left:20px;}"
+            ".report-toc a{text-decoration:none;color:#0969da;}"
+            ".report-toc a:hover{text-decoration:underline;}"
+            ".report-toc-title{margin:0 0 8px;font-size:1rem;}"
+            ".report-toc>li{margin:6px 0;}"
+            ".report-toc a.report-toc-main-link{font-weight:700;}"
+            ".report-toc a.report-toc-group-link{font-weight:600;color:#0969da;}"
+            ".report-toc a.report-toc-sub-link{display:inline-block;margin-left:20px;}"
             ".status-badge{display:inline-block;padding:2px 8px;border-radius:10px;font-size:12px;font-weight:700;line-height:1.4;}"
             ".st-pass{background:#33c24d;color:#ffffff;}"
             ".st-fail{background:#e53935;color:#ffffff;}"
@@ -3141,29 +4807,52 @@ def render_daily_html_report(folder_name: str, cycles: dict[str, Any]) -> str:
             ".st-cant-reproduce{background:#f08f78;color:#2f2f2f;}"
             ".st-false-positive{background:#ecd96b;color:#2f2f2f;}"
             ".st-unknown{background:#f4f5f7;color:#172b4d;}"
+            ".daily-pie-wrap{display:flex;flex-wrap:wrap;align-items:flex-start;gap:16px;margin:12px 0;}"
+            ".pie-legend{display:flex;flex-wrap:wrap;gap:12px;align-items:center;font-size:13px;max-width:520px;}"
+            ".pie-swatch{display:inline-block;width:12px;height:12px;border-radius:2px;margin-right:6px;vertical-align:middle;}"
+            ".pie-empty{color:#666;margin:8px 0;}"
+            ".daily-conclusion-score{font-size:1.05rem;font-weight:700;margin:8px 0 12px;}"
+            ".daily-scenario-line{font-weight:700;margin:4px 0;}"
+            ".daily-tab{margin:0 0 8px;white-space:pre;}"
+            ".scenario-result-cell{vertical-align:middle;text-align:center;}"
+            ".scenario-result-cell .daily-pie-wrap{justify-content:center;margin:0 auto;}"
+            ".scenario-result-cell .pie-legend{font-size:11px;gap:6px;max-width:280px;}"
             "</style>"
         ),
         "</head><body>",
-        f"<h1>Daily report: {html.escape(folder_name)}</h1>",
+        toc_html,
     ]
-    for cycle in sorted(cycles.values(), key=lambda item: (item["cycle_key"], item["cycle_name"])):
-        cycle_title = cycle["cycle_name"] or cycle["cycle_key"] or cycle["cycle_id"] or "Unnamed cycle"
-        cycle_cell_html = _render_cycle_info_html(cycle)
-        sections.append(f"<h2>Test cycle: {html.escape(cycle_title)}</h2>")
+    sections.append("<p class='daily-tab'>\t</p>")
+    if preamble:
+        sections.append(preamble)
+    sections.append("<h2 id='scenarios'><strong>3. Результаты тестирования</strong></h2>")
+    sections.append("<p class='daily-tab'>\t</p>")
+    sections.append(
+        _daily_status_pie_svg(
+            status_counts, extra_wrap_class="daily-pie-strip-publish"
+        )
+    )
+    for cycle in sorted_cycles:
+        anchor, heading_plain = _daily_cycle_heading_parts(cycle)
+        heading_display = re.sub(r"^\s*\d+\.\d+\s+", "", heading_plain).strip() or heading_plain
+        sections.append(
+            f"<h2 id='{html.escape(anchor, quote=True)}'><strong>{html.escape(heading_display)}</strong></h2>"
+        )
         sections.append(
             "<table>"
             "<colgroup>"
-            "<col style='width:20%'>"
-            "<col style='width:30%'>"
+            "<col style='width:17%'>"
+            "<col style='width:22%'>"
+            "<col style='width:9%'>"
+            "<col style='width:8%'>"
+            "<col style='width:8%'>"
+            "<col style='width:8%'>"
             "<col style='width:10%'>"
-            "<col style='width:10%'>"
-            "<col style='width:10%'>"
-            "<col style='width:15%'>"
-            "<col style='width:5%'>"
+            "<col style='width:14%'>"
             "</colgroup>"
             "<thead><tr>"
             "<th>Название</th><th>Критерий валидации</th><th>Тестовый прогон</th>"
-            "<th>Статус</th><th>Дата</th><th>Комментарий</th><th>Задачи</th>"
+            "<th>Статус</th><th>Дата</th><th>Комментарий</th><th>Задачи</th><th>Результат</th>"
             "</tr></thead><tbody>"
         )
         sorted_cases, criterion_spans = _prepare_cycle_cases_with_groups(cycle)
@@ -3175,28 +4864,64 @@ def render_daily_html_report(folder_name: str, cycles: dict[str, Any]) -> str:
                 f"<a href='{html.escape(cycle_url, quote=True)}' target='_blank' rel='noopener'>"
                 f"{html.escape(cycle_key_value)}</a>"
             )
-        for idx, case in enumerate(sorted_cases):
-            result_value = case.get("result", case.get("test_case_status", ""))
-            criterion_cell = ""
-            if criterion_spans[idx] > 0:
-                criterion_text = case.get("_criterion_display", "")
-                criterion_cell = (
-                    f"<td rowspan='{criterion_spans[idx]}'>{_html_comment_cell(criterion_text)}</td>"
-                )
+        cycle_counts = _daily_aggregate_case_status_counts_for_cycle(cycle)
+        n_rows = len(sorted_cases)
+        if n_rows == 0:
+            marker = (
+                "<span class='scenario-result-macro-marker' "
+                f"data-cycle-key='{html.escape(cycle_key_value, quote=True)}' "
+                f"data-cycle-name='{html.escape(str(cycle.get('cycle_name') or ''), quote=True)}'></span>"
+            )
             sections.append(
                 "<tr>"
-                f"<td>{html.escape(case['test_case_name'])}</td>"
-                f"{criterion_cell}"
-                f"<td>{cycle_cell_html}</td>"
-                f"<td>{_status_badge_html(result_value)}</td>"
-                f"<td>{html.escape(case.get('execution_date', case.get('cycle_updated_on', '')))}</td>"
-                f"<td>{_html_comment_cell(case.get('comment', ''))}</td>"
-                f"<td>{_html_comment_cell(case.get('tasks', ''))}</td>"
+                "<td colspan='7'>Нет кейсов в этом цикле</td>"
+                "<td class='scenario-result-cell'>"
+                f"{marker}"
+                f"{_daily_status_pie_svg(cycle_counts, size=168)}"
+                "</td>"
                 "</tr>"
             )
+        else:
+            for idx, case in enumerate(sorted_cases):
+                result_value = case.get("result", case.get("test_case_status", ""))
+                display_date = _render_report_date(case)
+                criterion_cell = ""
+                if criterion_spans[idx] > 0:
+                    criterion_text = case.get("_criterion_display", "")
+                    criterion_cell = (
+                        f"<td rowspan='{criterion_spans[idx]}'>"
+                        f"{_html_comment_cell(criterion_text)}</td>"
+                    )
+                result_col = ""
+                if idx == 0:
+                    marker = (
+                        "<span class='scenario-result-macro-marker' "
+                        f"data-cycle-key='{html.escape(cycle_key_value, quote=True)}' "
+                        f"data-cycle-name='{html.escape(str(cycle.get('cycle_name') or ''), quote=True)}'></span>"
+                    )
+                    result_col = (
+                        "<td "
+                        f"rowspan='{n_rows}' class='scenario-result-cell'>"
+                        f"{marker}"
+                        f"{_daily_status_pie_svg(cycle_counts, size=168)}"
+                        "</td>"
+                    )
+                sections.append(
+                    "<tr>"
+                    f"<td>{html.escape(case['test_case_name'])}</td>"
+                    f"{criterion_cell}"
+                    f"<td>{cycle_cell_html}</td>"
+                    f"<td>{_status_badge_html(result_value)}</td>"
+                    f"<td>{html.escape(display_date)}</td>"
+                    f"<td>{_html_comment_cell(case.get('comment', ''))}</td>"
+                    f"<td>{_html_comment_cell(case.get('tasks', ''))}</td>"
+                    f"{result_col}"
+                    "</tr>"
+                )
         sections.append("</tbody></table>")
-    progress_rows = sorted(_build_cycle_progress_rows(cycles), key=_summary_sort_key)
-    sections.append("<h2>Сводка по тестовым циклам</h2>")
+    progress_rows_raw = sorted(_build_cycle_progress_rows(cycles), key=_summary_sort_key)
+    progress_rows = [_daily_progress_row_for_display(r) for r in progress_rows_raw]
+    sections.append("<h2 id='summary'><strong>Сводка по тестовым циклам</strong></h2>")
     sections.append(
         "<table>"
         "<thead><tr>"
@@ -3227,27 +4952,105 @@ def render_daily_html_report(folder_name: str, cycles: dict[str, Any]) -> str:
         )
         previous_group = current_group or previous_group
     sections.append("</tbody></table>")
+    total_x, total_y = _daily_global_passed_total(cycles)
+    status_summary_lines = _daily_status_summary_lines(status_counts)
+    scenario_lines = _daily_scenario_group_lines(progress_rows)
+    sections.append("<h2 id='conclusion'><strong>4. Заключение</strong></h2>")
+    sections.append(
+        "<p class='daily-conclusion-score'>"
+        f"Итоговый score nightly-dev-{html.escape(folder_name)}, {total_x}/{total_y}</p>"
+    )
+    _counts_json = html.escape(
+        json.dumps(status_counts, ensure_ascii=True, sort_keys=True)
+    )
+    sections.append(
+        f'<div id="zephyr-status-counts-json" style="display:none">{_counts_json}</div>'
+    )
+    cycle_objs_for_macro: list[dict[str, Any]] = []
+    for cycle in sorted_cycles:
+        ck = str(cycle.get("cycle_key") or "").strip()
+        if not ck:
+            continue
+        cn = str(cycle.get("cycle_name") or "").strip()
+        if cn:
+            cycle_objs_for_macro.append({"id": ck, "name": cn})
+        else:
+            cycle_objs_for_macro.append({"id": ck})
+    _cycle_keys_json = html.escape(
+        json.dumps(cycle_objs_for_macro, ensure_ascii=True)
+    )
+    sections.append(
+        f'<div id="zephyr-cycle-keys-json" style="display:none">{_cycle_keys_json}</div>'
+    )
+    for line in status_summary_lines:
+        sections.append(f"<p class='daily-scenario-line'>{html.escape(line)}</p>")
+    for line in scenario_lines:
+        sections.append(f"<p class='daily-scenario-line'>{html.escape(line)}</p>")
     sections.append("</body></html>")
     return "\n".join(sections)
 
 
-def render_daily_wiki_report(folder_name: str, cycles: dict[str, Any]) -> str:
-    lines = [f"h1. Daily report: {_wiki_escape(folder_name)}", ""]
-    for cycle in sorted(cycles.values(), key=lambda item: (item["cycle_key"], item["cycle_name"])):
-        cycle_title = cycle["cycle_name"] or cycle["cycle_key"] or cycle["cycle_id"] or "Unnamed cycle"
+def render_daily_wiki_report(
+    folder_name: str,
+    cycles: dict[str, Any],
+    *,
+    folder_id: str,
+    template_dir: str | None = None,
+) -> str:
+    sorted_cycles = sorted(cycles.values(), key=_cycle_sort_key)
+    status_counts = _daily_aggregate_case_status_counts(cycles)
+    grouped_cycles = _daily_toc_groups_from_sorted_cycles(sorted_cycles)
+    toc_lines = ["h3. Оглавление"]
+    toc_lines.append(f"* [{_wiki_escape('1. Объект тестирования')}|#sec_object]")
+    toc_lines.append(f"* [{_wiki_escape('2. Условия окружения')}|#sec_environment]")
+    toc_lines.append(f"* [{_wiki_escape('3. Результаты тестирования')}|#scenarios]")
+    for _gid, heading, group_cycles in grouped_cycles:
+        first = group_cycles[0]
+        anchor, _ = _daily_cycle_heading_parts(first)
+        w_anchor = _daily_wiki_anchor_name(anchor)
+        toc_lines.append(f"** [{_wiki_escape(heading)}|#{w_anchor}]")
+    toc_lines.append(f"* [{_wiki_escape('4. Заключение')}|#conclusion]")
+    lines: list[str] = []
+    lines.extend(toc_lines)
+    lines.append("")
+    lines.append("\t")
+    wiki_pre = _format_readable_wiki_preamble(
+        template_dir,
+        "daily",
+        folder_id,
+        folder_id,
+        folder_name,
+        None,
+    )
+    if wiki_pre:
+        lines.extend(wiki_pre.splitlines())
+        lines.append("")
+    lines.append("{anchor:scenarios}")
+    lines.append("h2. *3. Результаты тестирования*")
+    lines.append("")
+    chart_section = _daily_status_chart_wiki_block(status_counts)
+    if chart_section:
+        lines.append("\t")
+        lines.extend(chart_section.splitlines())
+        lines.append("")
+    for cycle in sorted_cycles:
+        anchor, heading_plain = _daily_cycle_heading_parts(cycle)
+        heading_display = re.sub(r"^\s*\d+\.\d+\s+", "", heading_plain).strip() or heading_plain
+        w_anchor = _daily_wiki_anchor_name(anchor)
+        lines.append(f"{{anchor:{w_anchor}}}")
+        lines.append(f"h2. *{_wiki_escape(heading_display)}*")
         cycle_key_value = str(cycle.get("cycle_key") or "")
         cycle_cell_wiki = _wiki_escape(cycle_key_value)
         if cycle_key_value:
             cycle_url = _jira_cycle_url(cycle_key_value)
             cycle_cell_wiki = f"[{cycle_key_value}|{cycle_url}]"
-        lines.append(f"h2. Test cycle: {_wiki_escape(cycle_title)}")
         lines.append(
             "|| Название || Критерий валидации || Тестовый прогон || Статус || Дата || Комментарий || Задачи ||"
         )
         sorted_cases, criterion_spans = _prepare_cycle_cases_with_groups(cycle)
         for idx, case in enumerate(sorted_cases):
             res = case.get("result", case.get("test_case_status", ""))
-            exd = case.get("execution_date", case.get("cycle_updated_on", ""))
+            exd = _render_report_date(case)
             cmt = _wiki_text_with_links(case.get("comment", ""))
             tasks = _wiki_text_with_links(case.get("tasks", ""))
             criterion_cell_wiki = ""
@@ -3260,7 +5063,7 @@ def render_daily_wiki_report(folder_name: str, cycles: dict[str, Any]) -> str:
                         _wiki_escape(case["test_case_name"]),
                         criterion_cell_wiki,
                         cycle_cell_wiki,
-                        _wiki_escape(res),
+                        _wiki_status_markup(res),
                         _wiki_escape(exd),
                         cmt,
                         tasks,
@@ -3268,7 +5071,58 @@ def render_daily_wiki_report(folder_name: str, cycles: dict[str, Any]) -> str:
                 )
                 + " |"
             )
+        cycle_chart_wiki = _daily_status_chart_wiki_block(
+            _daily_aggregate_case_status_counts_for_cycle(cycle)
+        )
+        if cycle_chart_wiki:
+            lines.append("")
+            lines.extend(cycle_chart_wiki.splitlines())
         lines.append("")
+    progress_rows_raw = sorted(_build_cycle_progress_rows(cycles), key=_summary_sort_key)
+    progress_rows = [_daily_progress_row_for_display(r) for r in progress_rows_raw]
+    lines.append("{anchor:summary}")
+    lines.append("h2. Сводка по тестовым циклам")
+    lines.append("|| Тестовый цикл || Всего кейсов || Пройдено кейсов ||")
+    previous_group = ""
+    for row in progress_rows:
+        current_group = _summary_scenario_group(row)
+        if previous_group and current_group and current_group != previous_group:
+            lines.append("")
+        cycle_label = _build_summary_cycle_label(row)
+        passed_cases = int(row["passed_cases"])
+        lines.append(
+            "| "
+            + " | ".join(
+                [
+                    _wiki_escape(cycle_label),
+                    str(row["total_cases"]),
+                    str(passed_cases),
+                ]
+            )
+            + " |"
+        )
+        previous_group = current_group or previous_group
+    lines.append("")
+    total_x, total_y = _daily_global_passed_total(cycles)
+    status_summary_lines = _daily_status_summary_lines(status_counts)
+    scenario_lines = _daily_scenario_group_lines(progress_rows)
+    macro_body = _render_daily_confluence_execution_macro(template_dir, folder_name, cycles)
+    lines.append("{anchor:conclusion}")
+    lines.append("h2. 4. Заключение")
+    lines.append("")
+    lines.append(
+        f"*Итоговый score nightly-dev-{_wiki_escape(folder_name)}, {total_x}/{total_y}*"
+    )
+    if macro_body:
+        lines.append("")
+        lines.append(macro_body)
+    if status_summary_lines:
+        lines.append("")
+        for line in status_summary_lines:
+            lines.append(f"*{_wiki_escape(line)}*")
+    lines.append("")
+    for line in scenario_lines:
+        lines.append(_wiki_escape(line))
     return "\n".join(lines)
 
 
@@ -3276,23 +5130,78 @@ def write_daily_readable_reports(
     output_dir: str,
     report_data: dict[tuple[str, str], dict[str, Any]],
     formats: set[str],
-) -> int:
+    *,
+    template_dir: str | None = None,
+) -> list[str]:
     os.makedirs(output_dir, exist_ok=True)
-    written = 0
+    written_paths: list[str] = []
     for (folder_id, folder_name), payload in sorted(report_data.items(), key=lambda item: item[0][1]):
         base_name = f"{slugify(folder_name)}_{folder_id}"
         cycles = payload["cycles"]
+        fid = str(folder_id)
         if "html" in formats:
             html_path = os.path.join(output_dir, f"{base_name}.html")
-            with open(html_path, "w", encoding="utf-8") as f:
-                f.write(render_daily_html_report(folder_name, cycles))
-            written += 1
+            body = render_daily_html_report(
+                folder_name, cycles, folder_id=fid, template_dir=template_dir
+            )
+            if _write_text_if_changed(html_path, body):
+                written_paths.append(html_path)
         if "wiki" in formats:
             wiki_path = os.path.join(output_dir, f"{base_name}.confluence.txt")
-            with open(wiki_path, "w", encoding="utf-8") as f:
-                f.write(render_daily_wiki_report(folder_name, cycles))
-            written += 1
-    return written
+            chart_name = f"{base_name}_conclusion_pie.png"
+            chart_path = os.path.join(output_dir, chart_name)
+            chart_written = _write_daily_pie_png(
+                chart_path, _daily_aggregate_case_status_counts(cycles)
+            )
+            body = render_daily_wiki_report(
+                folder_name,
+                cycles,
+                folder_id=fid,
+                template_dir=template_dir,
+            )
+            if _write_text_if_changed(wiki_path, body):
+                written_paths.append(wiki_path)
+            if chart_written:
+                written_paths.append(chart_path)
+    return written_paths
+
+
+def _expected_daily_readable_html_paths(
+    output_dir: str,
+    report_data: dict[tuple[str, str], dict[str, Any]],
+) -> list[str]:
+    paths: list[str] = []
+    for (folder_id, folder_name), _payload in sorted(
+        report_data.items(), key=lambda item: item[0][1]
+    ):
+        base_name = f"{slugify(folder_name)}_{folder_id}"
+        paths.append(os.path.join(output_dir, f"{base_name}.html"))
+    return paths
+
+
+def _expected_weekly_readable_html_paths(
+    output_dir: str,
+    report_data: dict[tuple[str, str], dict[str, Any]],
+    *,
+    per_folder: bool,
+) -> list[str]:
+    paths: list[str] = []
+    for week_start, _wl, _rows, _ne, _blk in _weekly_cycle_matrix_data_all(report_data):
+        week_label = week_start.isoformat() if week_start else "unknown_week"
+        base_name = f"weekly_cycle_matrix_{week_label}"
+        paths.append(os.path.join(output_dir, f"{base_name}.html"))
+    if per_folder:
+        for folder_key, payload in report_data.items():
+            folder_id_pf, _folder_name_pf = folder_key
+            suffix = f"_folder_{folder_id_pf}"
+            single_folder_data = {folder_key: payload}
+            for week_start, _wl, _rows, _ne, _blk in _weekly_cycle_matrix_data_all(
+                single_folder_data
+            ):
+                week_label = week_start.isoformat() if week_start else "unknown_week"
+                base_name = f"weekly_cycle_matrix_{week_label}{suffix}"
+                paths.append(os.path.join(output_dir, f"{base_name}.html"))
+    return paths
 
 
 def print_readable_report(weekly: dict[date, Counter[str]]) -> None:
@@ -3326,6 +5235,25 @@ def print_readable_report(weekly: dict[date, Counter[str]]) -> None:
 def main() -> int:
     args = parse_args()
     try:
+        effective_rolling_days = args.rolling_days
+        if args.regenerate_last_7_days:
+            if args.from_date or args.to_date:
+                raise ValueError(
+                    "--regenerate-last-7-days cannot be used together with "
+                    "--from-date/--to-date"
+                )
+            today = date.today()
+            from_override = today - timedelta(days=6)
+            to_override = today
+            args.from_date = from_override.isoformat()
+            args.to_date = to_override.isoformat()
+            if effective_rolling_days <= 0:
+                effective_rolling_days = 7
+            print(
+                "Date window override: last 7 days "
+                f"({args.from_date} .. {args.to_date}), "
+                f"rolling-days={effective_rolling_days}"
+            )
         token = args.token or os.getenv("ZEPHYR_API_TOKEN")
         if not token:
             raise ValueError(
@@ -3377,6 +5305,18 @@ def main() -> int:
             folder_rows: list[tuple[FolderNode, dict[date, Counter[str]]]] = []
             cycles_cases_rows: list[list[str]] = []
             case_steps_rows: list[list[str]] = []
+            report_data: dict[tuple[str, str], dict[str, Any]] | None = None
+            daily_readable_paths: list[str] = []
+            daily_html_publish_paths: list[str] = []
+            weekly_html_publish_paths: list[str] = []
+            readable_template_dir = args.readable_template_dir or os.getenv(
+                "ZEPHYR_READABLE_TEMPLATE_DIR"
+            )
+            if readable_template_dir:
+                readable_template_dir = os.path.expanduser(readable_template_dir.strip()) or None
+            confluence_cfg = _load_confluence_publish_config()
+            publish_confluence_daily = bool(confluence_cfg and confluence_cfg.publish_daily)
+            publish_confluence_weekly = bool(confluence_cfg and confluence_cfg.publish_weekly)
             need_cycles_cases_data = args.export_cycles_cases or args.export_daily_readable
             collect_case_steps = args.export_case_steps or args.export_daily_readable
             total_executions = 0
@@ -3536,11 +5476,42 @@ def main() -> int:
                     name_pattern=tree_name_pattern,
                     root_path_pattern=tree_root_path_pattern,
                 )
+                if from_date is not None and to_date is not None:
+                    selected_before_day_filter = len(selected_folders)
+                    selected_folders = _filter_tree_folders_by_report_day(
+                        selected_folders, from_date, to_date
+                    )
+                    if len(selected_folders) != selected_before_day_filter:
+                        print(
+                            "Tree selected folders after day window filter "
+                            f"({from_date} .. {to_date}): {len(selected_folders)}"
+                        )
                 print(
                     f"Tree folders discovered: {len(folders)}; selected after filters: {len(selected_folders)}"
                 )
 
-                for folder in selected_folders:
+                n_selected = len(selected_folders)
+                if n_selected:
+                    roadmap_parts: list[str] = [
+                        f"fetching executions for {n_selected} folder(s)",
+                    ]
+                    if need_cycles_cases_data:
+                        roadmap_parts.append("building cycles/cases detail rows")
+                    if collect_case_steps:
+                        roadmap_parts.append("building case-step rows")
+                    if args.export_cycles_cases:
+                        roadmap_parts.append("writing cycles/cases CSV")
+                    if args.export_case_steps:
+                        roadmap_parts.append("writing case steps CSV")
+                    if args.export_daily_readable:
+                        roadmap_parts.append("building daily readable reports")
+                    if publish_confluence_daily:
+                        roadmap_parts.append("Confluence daily publish")
+                    if publish_confluence_weekly:
+                        roadmap_parts.append("Confluence weekly publish")
+                    print("Next: " + ", then ".join(roadmap_parts) + ".")
+
+                for idx, folder in enumerate(selected_folders, start=1):
                     per_folder_params = dict(extra_params)
                     per_folder_params["query"] = sanitize_tql_query(
                         fill_template(
@@ -3549,6 +5520,10 @@ def main() -> int:
                             folder.folder_id,
                             "--query-template",
                         )
+                    )
+                    print(
+                        f"[{idx}/{n_selected}] Folder {folder.folder_id} ({folder.folder_name}): "
+                        "fetching executions..."
                     )
                     try:
                         executions = fetch_executions(
@@ -3590,13 +5565,19 @@ def main() -> int:
                                     synthetic_cycle_ids=args.synthetic_cycle_ids,
                                 )
                             )
+                        print(
+                            f"[{idx}/{n_selected}] Folder {folder.folder_id} ({folder.folder_name}): "
+                            f"done ({len(executions)} execution(s))"
+                        )
                     except Exception as exc:  # pylint: disable=broad-except
                         message = f"Folder {folder.folder_id} ({folder.folder_name}) failed: {exc}"
                         if args.continue_on_folder_error:
                             errors.append(message)
+                            print(f"[{idx}/{n_selected}] FAILED (continuing): {message}")
                             continue
                         raise RuntimeError(message) from exc
 
+            print("Writing per-folder weekly CSVs...")
             os.makedirs(args.per_folder_dir, exist_ok=True)
             for folder, weekly in folder_rows:
                 file_name = f"{slugify(folder.folder_name)}_{folder.folder_id}.csv"
@@ -3616,11 +5597,21 @@ def main() -> int:
                     )
                 else:
                     report_data = aggregate_readable_daily_reports_legacy(cycles_cases_rows)
+                fmt_join = ", ".join(sorted(selected_formats))
+                print(
+                    f"Building daily readable reports for {len(report_data)} folder payload(s) "
+                    f"(formats: {fmt_join})..."
+                )
                 daily_readable_paths = write_daily_readable_reports(
                     output_dir=args.daily_readable_dir,
                     report_data=report_data,
                     formats=selected_formats,
+                    template_dir=readable_template_dir,
                 )
+                if "html" in selected_formats:
+                    daily_html_publish_paths = _expected_daily_readable_html_paths(
+                        args.daily_readable_dir, report_data
+                    )
             needs_report_data = bool(
                 args.cycle_progress_output
                 or args.weekly_cycle_matrix_output
@@ -3635,7 +5626,7 @@ def main() -> int:
                     else:
                         report_data = aggregate_readable_daily_reports_legacy(cycles_cases_rows)
             if (
-                rolling_days > 0
+                effective_rolling_days > 0
                 and from_date is not None
                 and to_date is not None
                 and report_data is not None
@@ -3703,26 +5694,121 @@ def main() -> int:
                             formats=selected_weekly_formats,
                             cell_all_not_executed=cell_all_ne,
                             cell_all_blocked=cell_all_blocked,
+                            template_dir=readable_template_dir,
                         )
                     )
+                if args.weekly_readable_per_folder:
+                    for folder_key, payload in report_data_for_matrix.items():
+                        folder_id_pf, folder_name_pf = folder_key
+                        single_folder_data = {folder_key: payload}
+                        per_folder_matrices = _weekly_cycle_matrix_data_all(single_folder_data)
+                        suffix = f"_folder_{folder_id_pf}"
+                        for (
+                            week_start_pf,
+                            weekday_labels_pf,
+                            rows_pf,
+                            cell_all_ne_pf,
+                            cell_all_blocked_pf,
+                        ) in per_folder_matrices:
+                            weekly_readable_paths.extend(
+                                write_weekly_readable_reports(
+                                    output_dir=args.weekly_readable_dir,
+                                    week_start=week_start_pf,
+                                    weekday_labels=weekday_labels_pf,
+                                    rows=rows_pf,
+                                    formats=selected_weekly_formats,
+                                    cell_all_not_executed=cell_all_ne_pf,
+                                    cell_all_blocked=cell_all_blocked_pf,
+                                    template_dir=readable_template_dir,
+                                    folder_id_resolve=str(folder_id_pf),
+                                    folder_id_mapping=str(folder_id_pf),
+                                    folder_name_mapping=str(folder_name_pf),
+                                    filename_suffix=suffix,
+                                )
+                            )
+                if "html" in selected_weekly_formats:
+                    weekly_html_publish_paths = _expected_weekly_readable_html_paths(
+                        args.weekly_readable_dir,
+                        report_data_for_matrix,
+                        per_folder=args.weekly_readable_per_folder,
+                    )
             if confluence_cfg and publish_confluence_daily:
-                daily_html_paths = [p for p in daily_readable_paths if p.endswith(".html")]
-                if daily_html_paths:
-                    outcomes = publish_reports_to_confluence(daily_html_paths, confluence_cfg)
-                    print("Confluence daily publish:")
-                    for line in outcomes:
-                        print(f"- {line}")
+                if not args.export_daily_readable:
+                    print(
+                        "Confluence daily publish skipped: --export-daily-readable not enabled."
+                    )
+                elif not daily_html_publish_paths:
+                    daily_fmt = set(args.daily_readable_format or ["html", "wiki"])
+                    if "html" not in daily_fmt:
+                        print(
+                            "Confluence daily publish skipped: daily readable format does not "
+                            "include html."
+                        )
+                    else:
+                        print(
+                            "Confluence daily publish skipped: no folder payloads (empty report_data)."
+                        )
                 else:
-                    print("Confluence daily publish skipped: no daily HTML files were generated.")
+                    existing_daily_html = [p for p in daily_html_publish_paths if os.path.isfile(p)]
+                    missing_daily = [p for p in daily_html_publish_paths if not os.path.isfile(p)]
+                    if missing_daily:
+                        print(
+                            "Confluence publish warning: "
+                            f"{len(missing_daily)} expected daily HTML file(s) missing on disk."
+                        )
+                    if existing_daily_html:
+                        outcomes = publish_reports_to_confluence(
+                            existing_daily_html, confluence_cfg
+                        )
+                        print("Confluence daily publish:")
+                        for line in outcomes:
+                            print(f"- {line}")
+                    else:
+                        print(
+                            "Confluence daily publish skipped: no HTML files found on disk at "
+                            "expected paths."
+                        )
             if confluence_cfg and publish_confluence_weekly:
-                weekly_html_paths = [p for p in weekly_readable_paths if p.endswith(".html")]
-                if weekly_html_paths:
-                    outcomes = publish_reports_to_confluence(weekly_html_paths, confluence_cfg)
-                    print("Confluence weekly publish:")
-                    for line in outcomes:
-                        print(f"- {line}")
+                if not args.export_weekly_readable:
+                    print(
+                        "Confluence weekly publish skipped: --export-weekly-readable not enabled."
+                    )
+                elif not weekly_html_publish_paths:
+                    weekly_fmt = set(args.weekly_readable_format or ["html", "wiki"])
+                    if "html" not in weekly_fmt:
+                        print(
+                            "Confluence weekly publish skipped: weekly readable format does not "
+                            "include html."
+                        )
+                    else:
+                        print(
+                            "Confluence weekly publish skipped: no weekly matrix data for "
+                            "report_data."
+                        )
                 else:
-                    print("Confluence weekly publish skipped: no weekly HTML files were generated.")
+                    existing_weekly_html = [
+                        p for p in weekly_html_publish_paths if os.path.isfile(p)
+                    ]
+                    missing_weekly = [
+                        p for p in weekly_html_publish_paths if not os.path.isfile(p)
+                    ]
+                    if missing_weekly:
+                        print(
+                            "Confluence publish warning: "
+                            f"{len(missing_weekly)} expected weekly HTML file(s) missing on disk."
+                        )
+                    if existing_weekly_html:
+                        outcomes = publish_reports_to_confluence(
+                            existing_weekly_html, confluence_cfg
+                        )
+                        print("Confluence weekly publish:")
+                        for line in outcomes:
+                            print(f"- {line}")
+                    else:
+                        print(
+                            "Confluence weekly publish skipped: no HTML files found on disk at "
+                            "expected paths."
+                        )
             print(f"Saved summary CSV: {args.output}")
             print(f"Saved per-folder CSV directory: {args.per_folder_dir}")
             if args.export_cycles_cases:
