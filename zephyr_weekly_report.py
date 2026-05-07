@@ -894,6 +894,14 @@ def _extract_html_body_for_confluence(raw_html: str) -> str:
     return body_content
 
 
+def _extract_html_title(raw_html: str) -> str:
+    match = re.search(r"<title[^>]*>(.*?)</title>", raw_html, flags=re.IGNORECASE | re.DOTALL)
+    if not match:
+        return ""
+    value = re.sub(r"\s+", " ", match.group(1)).strip()
+    return html.unescape(value)
+
+
 def _confluence_title_from_report_path(path: str) -> str:
     file_name = os.path.basename(path)
     stem = file_name.rsplit(".", 1)[0]
@@ -942,10 +950,17 @@ def _confluence_find_page(
 def publish_html_report_to_confluence(path: str, cfg: ConfluenceConfig) -> str:
     with open(path, "r", encoding="utf-8") as report_file:
         report_html = report_file.read()
-    title = _confluence_title_from_report_path(path)
+    title_from_html = _extract_html_title(report_html)
+    title_from_path = _confluence_title_from_report_path(path)
+    title = title_from_html or title_from_path
     storage_html = _extract_html_body_for_confluence(report_html)
     if cfg.dry_run:
         action = "upsert" if cfg.update_existing else "create"
+        if title_from_html and title_from_path and title_from_html != title_from_path:
+            return (
+                f"DRY-RUN {action} page '{title_from_html}' "
+                f"(rename from '{title_from_path}') from {path}"
+            )
         return f"DRY-RUN {action} page '{title}' from {path}"
     candidate_urls = _confluence_content_api_candidates(cfg.base_url)
     auth_headers_candidates = _build_confluence_auth_headers_candidates(cfg)
@@ -954,6 +969,15 @@ def publish_html_report_to_confluence(path: str, cfg: ConfluenceConfig) -> str:
         for content_url in candidate_urls:
             try:
                 existing = _confluence_find_page(content_url, cfg, headers, title)
+                if (
+                    existing is None
+                    and cfg.update_existing
+                    and title_from_html
+                    and title_from_path
+                    and title_from_html != title_from_path
+                ):
+                    # Migration: if a page exists under the old title, update it and rename.
+                    existing = _confluence_find_page(content_url, cfg, headers, title_from_path)
                 if existing:
                     if not cfg.update_existing:
                         return f"SKIP already exists '{title}'"
@@ -1828,10 +1852,38 @@ def _resolve_daily_title_date(cycles: dict[str, Any]) -> str:
 
 
 def _build_daily_report_title(folder_name: str, cycles: dict[str, Any]) -> str:
-    report_date = _resolve_daily_title_date(cycles)
-    if report_date:
-        return f"nightly-dev-{folder_name} ({report_date})"
-    return f"nightly-dev-{folder_name} (unknown-date)"
+    # Daily title format:
+    # nightly-dev-YYYY.MM.DD, dow, dd.mm.yyyy
+    left = _parse_weekly_column_label_from_folder_name(folder_name)
+    left_date = left.replace("nightly-dev-", "", 1) if left else ""
+    left_day: date | None = None
+    if left_date:
+        try:
+            left_day = datetime.strptime(left_date, "%Y.%m.%d").date()
+        except ValueError:
+            left_day = None
+    right_day = _parse_report_day_from_folder_name(folder_name)
+    if right_day is None:
+        right_day = _resolve_folder_dominant_actual_date(cycles)
+    if right_day is None:
+        report_date = _resolve_daily_title_date(cycles)
+        right_day = _parse_display_date(report_date) if report_date else None
+
+    # Shift title dates by +1 day (titles/pages only; report columns unchanged).
+    if left_day is not None:
+        left_day = left_day + timedelta(days=1)
+    if right_day is not None:
+        right_day = right_day + timedelta(days=1)
+
+    dow_map = ["пн", "вт", "ср", "чт", "пт", "сб", "вс"]
+    dow = dow_map[right_day.weekday()] if right_day else ""
+    right_str = right_day.strftime("%d.%m.%Y") if right_day else "unknown-date"
+    left_str = (
+        left_day.strftime("%Y.%m.%d")
+        if left_day is not None
+        else (left_date or str(folder_name or "").strip() or "unknown-date")
+    )
+    return f"nightly-dev-{left_str}, {dow}, {right_str}".strip().rstrip(",")
 
 
 def _build_daily_report_base_name(folder_id: str, folder_name: str, cycles: dict[str, Any]) -> str:
@@ -3207,6 +3259,17 @@ def _default_weekday_labels() -> list[str]:
     return ["База", "Вт", "Ср", "Чт", "Пт"]
 
 
+def _release_week_start(day: date) -> date:
+    # Release-week is Thursday -> next Thursday.
+    # Python weekday(): Mon=0 ... Thu=3 ... Sun=6
+    offset = (day.weekday() - 3) % 7
+    return day - timedelta(days=offset)
+
+
+def _release_week_end(start: date) -> date:
+    return start + timedelta(days=7)
+
+
 def _parse_report_day_from_folder_name(folder_name: str) -> date | None:
     raw_name = str(folder_name or "").strip()
     if not raw_name:
@@ -3310,12 +3373,12 @@ def _weekly_cycle_matrix_data(
         report_day = _resolve_folder_report_day(folder_name, cycles)
         if report_day is None:
             report_day = _resolve_daily_title_day(cycles)
-        if report_day is None or report_day.weekday() > 4:
+        if report_day is None:
             continue
         progress_rows = _build_cycle_progress_rows(cycles)
         if not progress_rows:
             continue
-        week_start = report_day - timedelta(days=report_day.weekday())
+        week_start = _release_week_start(report_day)
         weekly_groups[week_start].append(
             {
                 "folder_id": str(folder_id),
@@ -3326,7 +3389,7 @@ def _weekly_cycle_matrix_data(
         )
 
     if not weekly_groups:
-        return None, [], [], []
+        return None, [], [], [], []
 
     def _aggregate_progress_map(
         progress_rows: list[dict[str, Any]],
@@ -3524,12 +3587,12 @@ def _split_report_data_by_week(
         report_day = _resolve_folder_report_day(folder_name, cycles)
         if report_day is None:
             report_day = _resolve_daily_title_day(cycles)
-        if report_day is None or report_day.weekday() > 4:
+        if report_day is None:
             continue
         progress_rows = _build_cycle_progress_rows(cycles)
         if not progress_rows:
             continue
-        week_start = report_day - timedelta(days=report_day.weekday())
+        week_start = _release_week_start(report_day)
         grouped[week_start][(folder_id, folder_name)] = payload
     return grouped
 
@@ -3572,14 +3635,35 @@ def render_weekly_html_report(
     cell_all_blocked: list[list[bool]] | None = None,
 ) -> str:
     week_label = week_start.isoformat() if week_start else "N/A"
+    # Weekly title format: Weekly W_NN. dd.mm.yyyy - dd.mm.yyyy (range from actual present days).
     labels = list(weekday_labels)
     col_count = 2 + len(labels)
     header_cells = ["<th>Тестовый цикл</th>", "<th>Всего кейсов</th>"]
     header_cells.extend(f"<th>{html.escape(label)}</th>" for label in labels)
+    # Determine actual day range from weekday labels (nightly-dev-YYYY.MM.DD columns).
+    present_days: list[date] = []
+    for label in labels:
+        match = re.search(r"\b(\d{4}\.\d{2}\.\d{2})\b", str(label))
+        if not match:
+            continue
+        try:
+            present_days.append(datetime.strptime(match.group(1), "%Y.%m.%d").date())
+        except ValueError:
+            continue
+    if present_days:
+        range_start = min(present_days)
+        range_end = max(present_days)
+        week_no = int(range_start.isocalendar()[1])
+        title_start = range_start + timedelta(days=1)
+        title_end = range_end + timedelta(days=1)
+        title_text = f"Weekly W_{week_no:02d}. {title_start.strftime('%d.%m.%Y')} - {title_end.strftime('%d.%m.%Y')}"
+    else:
+        title_text = f"Weekly W_??. {week_label}"
+
     sections = [
         "<!doctype html>",
         "<html><head><meta charset='utf-8'>",
-        f"<title>Weekly cycle matrix: {html.escape(week_label)}</title>",
+        f"<title>{html.escape(title_text)}</title>",
         (
             "<style>"
             "body{font-family:Arial,sans-serif;margin:24px;}"
@@ -3593,7 +3677,7 @@ def render_weekly_html_report(
             "</style>"
         ),
         "</head><body>",
-        f"<h1>Weekly cycle matrix: {html.escape(week_label)}</h1>",
+        f"<h1>{html.escape(title_text)}</h1>",
         "<table>",
         "<thead><tr>" + "".join(header_cells) + "</tr></thead><tbody>",
     ]
@@ -3664,7 +3748,26 @@ def render_weekly_wiki_report(
 ) -> str:
     week_label = week_start.isoformat() if week_start else "N/A"
     labels = list(weekday_labels)
-    lines = [f"h1. Weekly cycle matrix: {_wiki_escape(week_label)}", ""]
+    present_days: list[date] = []
+    for label in labels:
+        match = re.search(r"\b(\d{4}\.\d{2}\.\d{2})\b", str(label))
+        if not match:
+            continue
+        try:
+            present_days.append(datetime.strptime(match.group(1), "%Y.%m.%d").date())
+        except ValueError:
+            continue
+    if present_days:
+        range_start = min(present_days)
+        range_end = max(present_days)
+        week_no = int(range_start.isocalendar()[1])
+        title_start = range_start + timedelta(days=1)
+        title_end = range_end + timedelta(days=1)
+        title_text = f"Weekly W_{week_no:02d}. {title_start.strftime('%d.%m.%Y')} - {title_end.strftime('%d.%m.%Y')}"
+    else:
+        title_text = f"Weekly W_??. {week_label}"
+
+    lines = [f"h1. {_wiki_escape(title_text)}", ""]
     header_cells = ["Тестовый цикл", "Всего кейсов"]
     header_cells.extend(f"{_wiki_escape(label)}" for label in labels)
     lines.append("|| " + " || ".join(header_cells) + " ||")
