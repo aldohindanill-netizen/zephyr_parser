@@ -5,5 +5,12 @@ infra/.env.nocodb-n8n
 infra/.zephyr_writeback_15m.runtime.json
 infra/.zephyr_ingest_15m.runtime.json
 weekly_zephyr_report.csv
+# generated report artifacts
+reports/by_folder/
+reports/daily_readable/
+reports/weekly_readable/
+reports/_verify_weekly/
+reports/case_steps.csv
+reports/cycles_and_cases.csv
 *.pyc
 __pycache__/
