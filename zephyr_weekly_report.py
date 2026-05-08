@@ -26,7 +26,7 @@ import urllib.parse
 import urllib.request
 from collections import Counter, defaultdict
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from typing import Any, Callable
 
 
@@ -484,6 +484,299 @@ def parse_datetime(value: str) -> datetime:
     raise ValueError(f"Unable to parse datetime '{value}'")
 
 
+def _parse_int_env(name: str, default: int, minimum: int = 1, maximum: int = 1000) -> int:
+    raw = str(os.getenv(name, "") or "").strip()
+    if not raw:
+        return default
+    try:
+        parsed = int(raw)
+    except ValueError:
+        return default
+    return max(minimum, min(maximum, parsed))
+
+
+def _to_datetime(value: str | None) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return parse_datetime(text)
+    except ValueError:
+        return None
+
+
+def _coerce_utc_naive(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value
+    return value.astimezone(UTC).replace(tzinfo=None)
+
+
+_SUMMARY_DATE_PATTERNS: list[re.Pattern[str]] = [
+    re.compile(r"\b(\d{4})[._-](\d{2})[._-](\d{2})\b"),
+    re.compile(r"\b(\d{2})[._-](\d{2})[._-](\d{4})\b"),
+]
+
+
+def parse_date_from_summary(summary: str | None) -> datetime | None:
+    text = str(summary or "").strip()
+    if not text:
+        return None
+    for pattern in _SUMMARY_DATE_PATTERNS:
+        match = pattern.search(text)
+        if not match:
+            continue
+        g1, g2, g3 = match.groups()
+        try:
+            if len(g1) == 4:
+                return datetime(int(g1), int(g2), int(g3))
+            return datetime(int(g3), int(g2), int(g1))
+        except ValueError:
+            continue
+    return None
+
+
+def _extract_text_nodes(value: Any) -> list[str]:
+    out: list[str] = []
+    if isinstance(value, str):
+        text = value.strip()
+        if text:
+            out.append(text)
+        return out
+    if isinstance(value, dict):
+        text_value = value.get("text")
+        if isinstance(text_value, str):
+            text = text_value.strip()
+            if text:
+                out.append(text)
+        for nested in value.values():
+            out.extend(_extract_text_nodes(nested))
+        return out
+    if isinstance(value, list):
+        for item in value:
+            out.extend(_extract_text_nodes(item))
+    return out
+
+
+def _description_to_text(description: Any) -> str:
+    if isinstance(description, str):
+        return description
+    if description is None:
+        return ""
+    parts = _extract_text_nodes(description)
+    if parts:
+        return "\n".join(parts)
+    try:
+        return json.dumps(description, ensure_ascii=False, default=str)
+    except Exception:  # noqa: BLE001
+        return str(description)
+
+
+_POINT_A_LINE_RE = re.compile(
+    r"^\s*(?:[-*]\s*)?(?:[\(\[]\s*)?[AАaа](?:\s*[\)\]])?\s*[\)\.\:\-]\s*(.+?)\s*$"
+)
+_POINT_HEADER_RE = re.compile(
+    r"^\s*(?:[-*]\s*)?(?:[\(\[]\s*)?[A-Za-zА-Яа-я](?:\s*[\)\]])?\s*[\)\.\:\-]\s*"
+)
+_BUILDS_SECTION_HEADER_RE = re.compile(r"(?:сборк|build)", re.IGNORECASE)
+_BUILD_PREFIX_RE = re.compile(
+    r"^\s*(?:название\s+сборки|сборка|build(?:\s+name)?)\s*[:\-]\s*",
+    re.IGNORECASE,
+)
+
+
+def extract_build_from_description_point_a(description: Any) -> str:
+    text = _description_to_text(description).replace("\r\n", "\n").replace("\r", "\n")
+    if not text.strip():
+        return ""
+    lines = text.split("\n")
+    section_start = 0
+    for idx, raw_line in enumerate(lines):
+        if _BUILDS_SECTION_HEADER_RE.search(raw_line or ""):
+            section_start = idx
+            break
+    for idx, raw_line in enumerate(lines[section_start:], start=section_start):
+        match = _POINT_A_LINE_RE.match(raw_line)
+        if not match:
+            continue
+        fragments = [match.group(1).strip()]
+        for next_line in lines[idx + 1 :]:
+            clean_next = next_line.strip()
+            if not clean_next:
+                if fragments and fragments[-1]:
+                    break
+                continue
+            if _POINT_HEADER_RE.match(clean_next) or _BUILDS_SECTION_HEADER_RE.search(clean_next):
+                break
+            fragments.append(clean_next)
+        candidate = " ".join(part for part in fragments if part).strip()
+        candidate = _BUILD_PREFIX_RE.sub("", candidate).strip()
+        candidate = candidate.strip(" .,:;")
+        if candidate:
+            return candidate
+    return ""
+
+
+def pick_latest_issue(candidates: list[dict[str, Any]]) -> dict[str, Any] | None:
+    best_issue: dict[str, Any] | None = None
+    best_key: tuple[datetime, datetime] | None = None
+    min_dt = datetime.min
+    for issue in candidates:
+        if not isinstance(issue, dict):
+            continue
+        fields = issue.get("fields") or {}
+        if not isinstance(fields, dict):
+            fields = {}
+        created_dt = _coerce_utc_naive(_to_datetime(fields.get("created")))
+        summary_dt = _coerce_utc_naive(parse_date_from_summary(fields.get("summary")))
+        effective_dt = max(created_dt or min_dt, summary_dt or min_dt)
+        sort_key = (effective_dt, created_dt or min_dt)
+        if best_key is None or sort_key > best_key:
+            best_key = sort_key
+            best_issue = issue
+    return best_issue
+
+
+def pick_latest_issue_with_point_a_build(
+    candidates: list[dict[str, Any]],
+) -> tuple[dict[str, Any] | None, str]:
+    """Pick latest Jira issue among those that have build in description point A.
+
+    Returns (issue, build_name). If no candidate has build in point A, returns
+    (None, "") so caller can fallback to generic latest-issue selection.
+    """
+    best_issue: dict[str, Any] | None = None
+    best_build = ""
+    best_key: tuple[datetime, datetime] | None = None
+    min_dt = datetime.min
+    for issue in candidates:
+        if not isinstance(issue, dict):
+            continue
+        fields = issue.get("fields") or {}
+        if not isinstance(fields, dict):
+            fields = {}
+        build_name = extract_build_from_description_point_a(fields.get("description"))
+        if not build_name:
+            continue
+        created_dt = _coerce_utc_naive(_to_datetime(fields.get("created")))
+        summary_dt = _coerce_utc_naive(parse_date_from_summary(fields.get("summary")))
+        effective_dt = max(created_dt or min_dt, summary_dt or min_dt)
+        sort_key = (effective_dt, created_dt or min_dt)
+        if best_key is None or sort_key > best_key:
+            best_key = sort_key
+            best_issue = issue
+            best_build = build_name
+    return best_issue, best_build
+
+
+_AUTOFLEET_ABTEST_BUILD_CACHE: dict[str, str] = {}
+_AUTOFLEET_ABTEST_CONTEXT_CACHE: dict[str, dict[str, Any]] = {}
+
+
+def fetch_autofleet_abtest_candidates(
+    *,
+    base_url: str,
+    auth_headers: dict[str, str] | None,
+) -> list[dict[str, Any]]:
+    if not base_url or not auth_headers:
+        return []
+    jql = str(os.getenv("ZEPHYR_AUTOFLEET_ABTEST_JQL", "labels = autofleet_abtest")).strip()
+    if not jql:
+        return []
+    max_results = _parse_int_env("ZEPHYR_AUTOFLEET_ABTEST_MAX_RESULTS", 100, 1, 500)
+    try:
+        payload = request_json(
+            base_url,
+            "/rest/api/2/search",
+            auth_headers,
+            params={
+                "jql": jql,
+                "fields": "summary,description,created",
+                "maxResults": str(max_results),
+            },
+        )
+    except Exception as exc:  # noqa: BLE001
+        sys.stderr.write(f"[weekly] Autofleet ABTest Jira lookup failed: {exc}\n")
+        return []
+    issues = payload.get("issues") if isinstance(payload, dict) else None
+    if not isinstance(issues, list):
+        return []
+    return [issue for issue in issues if isinstance(issue, dict)]
+
+
+def fetch_autofleet_abtest_build_name(
+    *,
+    base_url: str,
+    auth_headers: dict[str, str] | None,
+) -> str:
+    enabled = _parse_bool_env(os.getenv("ZEPHYR_AUTOFLEET_ABTEST_ENABLED", "true"))
+    if not enabled:
+        return ""
+    jql = str(os.getenv("ZEPHYR_AUTOFLEET_ABTEST_JQL", "labels = autofleet_abtest")).strip()
+    max_results = _parse_int_env("ZEPHYR_AUTOFLEET_ABTEST_MAX_RESULTS", 100, 1, 500)
+    cache_key = f"{base_url}|{jql}|{max_results}"
+    if cache_key in _AUTOFLEET_ABTEST_BUILD_CACHE:
+        return _AUTOFLEET_ABTEST_BUILD_CACHE[cache_key]
+    issues = fetch_autofleet_abtest_candidates(base_url=base_url, auth_headers=auth_headers)
+    latest, build_name = pick_latest_issue_with_point_a_build(issues)
+    if not build_name and isinstance(latest, dict):
+        fields = latest.get("fields") or {}
+        if isinstance(fields, dict):
+            build_name = extract_build_from_description_point_a(fields.get("description"))
+    if not build_name:
+        latest = pick_latest_issue(issues)
+        if isinstance(latest, dict):
+            fields = latest.get("fields") or {}
+            if isinstance(fields, dict):
+                build_name = extract_build_from_description_point_a(fields.get("description"))
+    _AUTOFLEET_ABTEST_BUILD_CACHE[cache_key] = build_name
+    return build_name
+
+
+def fetch_autofleet_abtest_best_branch_context(
+    *,
+    base_url: str,
+    auth_headers: dict[str, str] | None,
+) -> dict[str, Any]:
+    """Return {'name': str, 'effective_date': date|None, 'week_start': date|None}."""
+    enabled = _parse_bool_env(os.getenv("ZEPHYR_AUTOFLEET_ABTEST_ENABLED", "true"))
+    if not enabled:
+        return {}
+    jql = str(os.getenv("ZEPHYR_AUTOFLEET_ABTEST_JQL", "labels = autofleet_abtest")).strip()
+    max_results = _parse_int_env("ZEPHYR_AUTOFLEET_ABTEST_MAX_RESULTS", 100, 1, 500)
+    cache_key = f"{base_url}|{jql}|{max_results}|context"
+    cached = _AUTOFLEET_ABTEST_CONTEXT_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    issues = fetch_autofleet_abtest_candidates(base_url=base_url, auth_headers=auth_headers)
+    latest, branch_name = pick_latest_issue_with_point_a_build(issues)
+    if not isinstance(latest, dict):
+        latest = pick_latest_issue(issues)
+    if not isinstance(latest, dict):
+        _AUTOFLEET_ABTEST_CONTEXT_CACHE[cache_key] = {}
+        return {}
+    fields = latest.get("fields") or {}
+    if not isinstance(fields, dict):
+        fields = {}
+    created_dt = _coerce_utc_naive(_to_datetime(fields.get("created")))
+    summary_dt = _coerce_utc_naive(parse_date_from_summary(fields.get("summary")))
+    min_dt = datetime.min
+    effective_dt = max(created_dt or min_dt, summary_dt or min_dt)
+    if not branch_name:
+        branch_name = extract_build_from_description_point_a(fields.get("description"))
+    effective_date = effective_dt.date() if effective_dt != min_dt else None
+    week_start = _release_week_start(effective_date) if effective_date is not None else None
+    context = {
+        "name": branch_name,
+        "effective_date": effective_date,
+        "week_start": week_start,
+        "issue_key": str(latest.get("key") or "").strip(),
+    }
+    _AUTOFLEET_ABTEST_CONTEXT_CACHE[cache_key] = context
+    return context
+
+
 def get_by_path(data: dict[str, Any], path: str) -> Any:
     current: Any = data
     for part in path.split("."):
@@ -720,6 +1013,139 @@ def _normalize_html_for_confluence_storage(raw_html: str) -> str:
             flags=re.IGNORECASE,
         )
     return text.strip()
+
+
+_WEEKLY_OVERALL_GRID_OPEN_RE = re.compile(
+    r"<div\b[^>]*\bclass=(?:'|\")[^'\"]*\bweekly-overall-grid\b[^'\"]*(?:'|\")[^>]*>",
+    flags=re.IGNORECASE,
+)
+_WEEKLY_OVERALL_CELL_OPEN_RE = re.compile(
+    r"<div\b(?P<attrs>[^>]*\bclass=(?:'|\")[^'\"]*\bweekly-overall-cell\b[^'\"]*(?:'|\")[^>]*)>",
+    flags=re.IGNORECASE,
+)
+_WEEKLY_DIV_TOKEN_RE = re.compile(r"<(/?)div\b[^>]*>", flags=re.IGNORECASE)
+_WEEKLY_CYCLE_KEYS_ATTR_RE = re.compile(
+    r'data-zephyr-cycle-keys=(?:"([^"]*)"|\'([^\']*)\')',
+    flags=re.IGNORECASE,
+)
+_WEEKLY_CELL_H4_RE = re.compile(
+    r"<h4[^>]*>(?P<text>.*?)</h4>", flags=re.DOTALL | re.IGNORECASE
+)
+
+
+def _find_matching_close_div(text: str, body_start: int) -> tuple[int, int]:
+    """Return (body_end_index, end_of_close_index) for the </div> that closes
+    a <div ...> opened just before `body_start`. (-1, -1) on malformed input."""
+    depth = 1
+    for token in _WEEKLY_DIV_TOKEN_RE.finditer(text, body_start):
+        if token.group(1) == "/":
+            depth -= 1
+            if depth == 0:
+                return token.start(), token.end()
+        else:
+            depth += 1
+    return -1, -1
+
+
+def _strip_inner_tags(html_fragment: str) -> str:
+    return re.sub(r"<[^>]+>", "", html_fragment).strip()
+
+
+def _replace_weekly_overall_cells_with_zephyr_macro(body_html: str) -> str:
+    """For Confluence publish: rewrite the per-build pie grid into a single
+    one-row table where each cell contains the Zephyr Reporting storage macro
+    (built from data-zephyr-cycle-keys). The build label sits in the table
+    header so all builds line up horizontally side by side.
+
+    If a cell has no cycle keys it falls back to a placeholder text. The
+    surrounding <div class='weekly-overall-grid'> is replaced entirely.
+    """
+    if not body_html or "weekly-overall-grid" not in body_html:
+        return body_html
+
+    out_parts: list[str] = []
+    cursor = 0
+    while True:
+        grid_open = _WEEKLY_OVERALL_GRID_OPEN_RE.search(body_html, cursor)
+        if grid_open is None:
+            out_parts.append(body_html[cursor:])
+            break
+        out_parts.append(body_html[cursor:grid_open.start()])
+        grid_body_start = grid_open.end()
+        grid_body_end, grid_end = _find_matching_close_div(body_html, grid_body_start)
+        if grid_body_end == -1:
+            out_parts.append(body_html[grid_open.start():])
+            break
+
+        grid_inner = body_html[grid_body_start:grid_body_end]
+        # Walk every weekly-overall-cell inside the grid.
+        headers: list[str] = []
+        cells: list[str] = []
+        scan = 0
+        while True:
+            cell_open = _WEEKLY_OVERALL_CELL_OPEN_RE.search(grid_inner, scan)
+            if cell_open is None:
+                break
+            attrs_text = cell_open.group("attrs") or ""
+            cell_body_start = cell_open.end()
+            cell_body_end, cell_end = _find_matching_close_div(grid_inner, cell_body_start)
+            if cell_body_end == -1:
+                break
+            cell_inner = grid_inner[cell_body_start:cell_body_end]
+
+            h4_match = _WEEKLY_CELL_H4_RE.search(cell_inner)
+            label_text = (
+                _strip_inner_tags(h4_match.group("text"))
+                if h4_match
+                else ""
+            )
+            headers.append(html.escape(label_text))
+
+            macro = ""
+            keys_attr = _WEEKLY_CYCLE_KEYS_ATTR_RE.search(attrs_text)
+            if keys_attr:
+                raw_json = keys_attr.group(1) or keys_attr.group(2) or ""
+                try:
+                    decoded = json.loads(html.unescape(raw_json))
+                except json.JSONDecodeError:
+                    decoded = None
+                if isinstance(decoded, list) and decoded:
+                    macro = _daily_zephyr_test_results_summary_storage_macro(decoded)
+            if not macro:
+                macro = "<p><em>Нет данных</em></p>"
+            cells.append(macro)
+            scan = cell_end
+
+        if not headers:
+            out_parts.append(body_html[grid_open.start():grid_end])
+        else:
+            n_cols = len(headers)
+            col_pct = 100.0 / n_cols if n_cols else 100.0
+            colgroup_html = "<colgroup>" + "".join(
+                f'<col style="width:{col_pct:.4f}%;" />' for _ in range(n_cols)
+            ) + "</colgroup>"
+            cell_style = (
+                f'style="width:{col_pct:.4f}%;'
+                "vertical-align:top;text-align:center;"
+                'padding:6px 8px;"'
+            )
+            th_style = (
+                f'style="width:{col_pct:.4f}%;text-align:center;'
+                'font-weight:600;"'
+            )
+            header_html = "".join(f"<th {th_style}>{h}</th>" for h in headers)
+            cell_html = "".join(f"<td {cell_style}>{c}</td>" for c in cells)
+            table_html = (
+                '<table class="weekly-overall-table" '
+                'style="table-layout:fixed;width:100%;">'
+                + colgroup_html
+                + "<thead><tr>" + header_html + "</tr></thead>"
+                + "<tbody><tr>" + cell_html + "</tr></tbody>"
+                + "</table>"
+            )
+            out_parts.append(table_html)
+        cursor = grid_end
+    return "".join(out_parts)
 
 
 def _append_confluence_attachment_image(storage_html: str, file_name: str) -> str:
@@ -1042,6 +1468,31 @@ def publish_reports_to_confluence(
     for html_path in html_paths:
         with open(html_path, encoding="utf-8") as source:
             raw_html = source.read()
+        is_weekly = os.path.basename(html_path).startswith("weekly_cycle_matrix")
+        if is_weekly:
+            body_html = _normalize_html_for_confluence_storage(raw_html)
+            body_html = _inject_confluence_anchor_macros(body_html)
+            body_html = _convert_fragment_links_to_confluence(body_html)
+            body_html = _replace_weekly_overall_cells_with_zephyr_macro(body_html)
+            body_html = _replace_weekly_jira_key_spans_with_confluence_macro(body_html)
+            body_html = _replace_legacy_weekly_table_macros_with_excerpt(body_html)
+            body_html = _wrap_weekly_scenario_block_with_excerpt_macro(body_html)
+            title_from_html = _extract_html_title(raw_html).strip()
+            title_from_file = _confluence_page_title_for_file(html_path, cfg)
+            primary_title = title_from_html or title_from_file
+            legacy_title = (
+                title_from_file
+                if title_from_html and title_from_html != title_from_file
+                else None
+            )
+            page_id, action = _confluence_upsert_storage_page(
+                cfg,
+                primary_title,
+                body_html,
+                legacy_title=legacy_title,
+            )
+            outcomes.append(f"{action}: {primary_title} (page id {page_id})")
+            continue
         cycle_objects_raw = _extract_zephyr_cycle_key_objects_from_html(raw_html)
         cycle_objects: list[dict[str, Any]] = (
             cycle_objects_raw if cycle_objects_raw is not None else []
@@ -2085,13 +2536,88 @@ def fetch_testrun_items(
     base_url: str, headers: dict[str, str], test_run_id: str
 ) -> list[dict[str, Any]]:
     endpoint = f"rest/tests/1.0/testrun/{test_run_id}/testrunitems"
-    params = {"fields": "id,index,issueCount,$lastTestResult"}
+    # Pull link-shaped fields too: depending on Zephyr deployment the
+    # linked Jira issues may sit on the run item (`traceLinks`/`issueLinks`/
+    # `defects`) instead of the test result. issueCount is kept as a
+    # sanity check — non-zero with empty links == we still missed a field.
+    params = {
+        "fields": (
+            "id,index,issueCount,traceLinks,issueLinks,defects,$lastTestResult"
+        )
+    }
     payload = request_json(base_url, endpoint, headers, params=params, method="GET")
     if isinstance(payload, dict):
         items = payload.get("testRunItems")
         if isinstance(items, list):
             return [item for item in items if isinstance(item, dict)]
     return []
+
+
+def _fetch_links_endpoint_silent(
+    base_url: str, headers: dict[str, str], endpoint: str
+) -> Any:
+    """GET helper that swallows network/HTTP errors for optional endpoints.
+
+    Several Zephyr deployments expose linked-issue data via auxiliary
+    endpoints whose exact path varies (`tracelink/testresult/{id}`,
+    `testrunitem/{id}` without field filter, etc). We probe a few of them
+    and ignore failures so the main flow stays unaffected.
+    """
+    try:
+        return request_json(base_url, endpoint, headers, method="GET")
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def fetch_links_for_run_item(
+    base_url: str,
+    headers: dict[str, str],
+    *,
+    item_id: str,
+    test_result_id: str,
+) -> list[str]:
+    """Try a handful of well-known Zephyr endpoints to collect linked issue keys.
+
+    Returns whatever was found across all probes. Best-effort: empty list
+    when nothing matches, never raises.
+    """
+    seen: set[str] = set()
+    out: list[str] = []
+    candidates: list[str] = []
+    if test_result_id:
+        candidates.extend(
+            [
+                f"rest/tests/1.0/tracelink/testresult/{test_result_id}",
+                f"rest/tests/1.0/testresult/{test_result_id}",
+                f"rest/tests/1.0/testresult/{test_result_id}/tracelinks",
+                f"rest/tests/1.0/testresult/{test_result_id}/issuelinks",
+            ]
+        )
+    if item_id:
+        candidates.extend(
+            [
+                f"rest/tests/1.0/tracelink/testrunitem/{item_id}",
+                f"rest/tests/1.0/testrunitem/{item_id}",
+                f"rest/tests/1.0/testrunitem/{item_id}/tracelinks",
+                f"rest/tests/1.0/testrunitem/{item_id}/issuelinks",
+            ]
+        )
+    for endpoint in candidates:
+        payload = _fetch_links_endpoint_silent(base_url, headers, endpoint)
+        if payload is None:
+            continue
+        _maybe_debug_task_links_payload(f"probe {endpoint}", payload)
+        candidate_links = _collect_task_links(payload)
+        if not candidate_links and isinstance(payload, dict):
+            for nested_key in ("traceLinks", "issueLinks", "links", "defects"):
+                candidate_links.extend(_collect_task_links(payload.get(nested_key)))
+        for key in candidate_links:
+            if key and key not in seen:
+                seen.add(key)
+                out.append(key)
+        if out:
+            break
+    return out
 
 
 def fetch_test_results_for_item(
@@ -2101,11 +2627,20 @@ def fetch_test_results_for_item(
     item_id: str,
 ) -> list[dict[str, Any]]:
     endpoint = f"rest/tests/1.0/testrun/{test_run_id}/testresults"
+    # Some Zephyr deployments expose linked Jira issues as `traceLinks`,
+    # others as `issueLinks`, `defects`, or even on the testCase itself
+    # (e.g. when the user attached the issue at testCase level rather than
+    # at execution level). Request all of them and let `_collect_task_links`
+    # normalise the response.
     params = {
         "fields": (
             "id,testResultStatusId,executionDate,comment,"
-            "traceLinks,"
-            "testScriptResults(id,testResultStatusId,executionDate,comment,index,description,expectedResult,testData,traceLinks)"
+            "traceLinks,issueLinks,defects,"
+            "testCase(id,key,issueLinks,traceLinks,defects),"
+            "testScriptResults("
+            "id,testResultStatusId,executionDate,comment,index,description,"
+            "expectedResult,testData,traceLinks,issueLinks,defects"
+            ")"
         ),
         "itemId": item_id,
     }
@@ -2119,22 +2654,207 @@ def fetch_test_results_for_item(
     return []
 
 
+_ISSUE_KEY_INLINE_PATTERN = re.compile(r"\b[A-Z][A-Z0-9]+-\d+\b")
+
+
+def _extract_key_from_entry(entry: dict[str, Any]) -> str:
+    """Try multiple Zephyr/Jira-style fields to find a Jira-issue key in a single link entry.
+
+    Zephyr Squad / Scale return links in different shapes depending on
+    whether the link sits on a testResult (`traceLinks`) or on a testCase
+    (`issueLinks`/`defects`). We probe the common variants and finally fall
+    back to scanning any URL/href for the canonical KEY-123 token.
+    """
+    direct_keys = (
+        "issueKey",
+        "displayKey",
+        "key",
+        "fromIssueKey",
+        "toIssueKey",
+        "backwardIssueKey",
+        "forwardIssueKey",
+    )
+    for field in direct_keys:
+        value = entry.get(field)
+        if isinstance(value, str) and value.strip():
+            text = value.strip()
+            match = _ISSUE_KEY_INLINE_PATTERN.search(text)
+            if match:
+                return match.group(0)
+            return text
+
+    for nested_field in ("issue", "target", "source", "defect"):
+        nested = entry.get(nested_field)
+        if isinstance(nested, dict):
+            nested_key = _extract_key_from_entry(nested)
+            if nested_key:
+                return nested_key
+
+    for url_field in ("url", "href", "link", "self"):
+        url_value = entry.get(url_field)
+        if isinstance(url_value, str) and url_value.strip():
+            match = _ISSUE_KEY_INLINE_PATTERN.search(url_value)
+            if match:
+                return match.group(0)
+
+    name_value = entry.get("name") or entry.get("displayName")
+    if isinstance(name_value, str):
+        match = _ISSUE_KEY_INLINE_PATTERN.search(name_value)
+        if match:
+            return match.group(0)
+
+    # Zephyr Test Player traceLinks deliver only the numeric Jira issue id
+    # (e.g. {"issueId": 286915, "type": {...}}). Encode it as "id:N" so the
+    # caller can batch-resolve via Jira REST and replace it with the key.
+    for id_field in ("issueId", "issue_id", "fromIssueId", "toIssueId"):
+        value = entry.get(id_field)
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text.isdigit():
+            return f"id:{text}"
+    return ""
+
+
+_TASK_LINKS_DEBUG_REMAINING = 3
+
+
+def _maybe_debug_task_links_payload(label: str, payload: Any) -> None:
+    """Dump the first few non-empty link payloads to stderr when debug is on.
+
+    Enable with ZEPHYR_DEBUG_TASK_LINKS=true to investigate cases where
+    Zephyr returns linked issues in a non-standard shape and our parser
+    misses them.
+    """
+    global _TASK_LINKS_DEBUG_REMAINING
+    if _TASK_LINKS_DEBUG_REMAINING <= 0:
+        return
+    if not _parse_bool_env(os.getenv("ZEPHYR_DEBUG_TASK_LINKS")):
+        return
+    if not payload:
+        return
+    try:
+        rendered = json.dumps(payload, ensure_ascii=False, default=str)[:1200]
+    except Exception:  # noqa: BLE001
+        rendered = repr(payload)[:1200]
+    sys.stderr.write(f"[task-links debug] {label}: {rendered}\n")
+    _TASK_LINKS_DEBUG_REMAINING -= 1
+
+
 def _collect_task_links(raw_links: Any) -> list[str]:
     links: list[str] = []
+    if isinstance(raw_links, dict):
+        for nested_key in ("traceLinks", "issueLinks", "links", "defects", "items"):
+            nested = raw_links.get(nested_key)
+            if isinstance(nested, list):
+                links.extend(_collect_task_links(nested))
+        return links
     if not isinstance(raw_links, list):
         return links
+    _maybe_debug_task_links_payload("link list", raw_links)
     for entry in raw_links:
-        if isinstance(entry, str) and entry.strip():
-            links.append(entry.strip())
+        if isinstance(entry, str):
+            text = entry.strip()
+            if not text:
+                continue
+            match = _ISSUE_KEY_INLINE_PATTERN.search(text)
+            links.append(match.group(0) if match else text)
             continue
         if not isinstance(entry, dict):
             continue
-        key = str(entry.get("key") or "").strip()
-        url = str(entry.get("url") or entry.get("href") or "").strip()
-        text = key or url
+        text = _extract_key_from_entry(entry)
         if text:
             links.append(text)
     return links
+
+
+_JIRA_ID_TO_KEY_CACHE: dict[str, str] = {}
+
+
+def _resolve_jira_issue_keys(
+    base_url: str, headers: dict[str, str], ids: set[str]
+) -> dict[str, str]:
+    """Batch-resolve numeric Jira issue ids to keys. Cached per process.
+
+    Zephyr Test Player traceLinks come with numeric `issueId` only, so we
+    fan out a single `/rest/api/2/search?jql=id in (...)` per chunk to map
+    them back to canonical keys (e.g. 286915 -> CSD-46501). Failures are
+    swallowed: unresolved ids are kept as-is by the caller.
+    """
+    out: dict[str, str] = {}
+    if not ids or not base_url:
+        return out
+    pending: list[str] = []
+    for raw in ids:
+        text = str(raw or "").strip()
+        if not text or not text.isdigit():
+            continue
+        if text in _JIRA_ID_TO_KEY_CACHE:
+            out[text] = _JIRA_ID_TO_KEY_CACHE[text]
+            continue
+        pending.append(text)
+    if not pending:
+        return out
+    chunk_size = 100
+    for start in range(0, len(pending), chunk_size):
+        chunk = pending[start : start + chunk_size]
+        try:
+            payload = request_json(
+                base_url,
+                "/rest/api/2/search",
+                headers,
+                params={
+                    "jql": f"id in ({','.join(chunk)})",
+                    "fields": "summary",
+                    "maxResults": str(len(chunk)),
+                },
+            )
+        except Exception as exc:  # noqa: BLE001
+            sys.stderr.write(
+                f"[task-links] Jira id resolution failed for {len(chunk)} id(s): {exc}\n"
+            )
+            continue
+        issues = payload.get("issues") if isinstance(payload, dict) else None
+        if not isinstance(issues, list):
+            continue
+        for issue in issues:
+            if not isinstance(issue, dict):
+                continue
+            issue_id = str(issue.get("id") or "").strip()
+            issue_key = str(issue.get("key") or "").strip()
+            if not issue_id or not issue_key:
+                continue
+            _JIRA_ID_TO_KEY_CACHE[issue_id] = issue_key
+            out[issue_id] = issue_key
+    return out
+
+
+def _resolve_id_markers_in_links(
+    text: str, id_to_key: dict[str, str]
+) -> str:
+    """Replace 'id:N' tokens inside a comma-joined task_links string."""
+    if not text or "id:" not in text:
+        return text
+    parts: list[str] = []
+    seen: set[str] = set()
+    for raw in text.split(","):
+        token = raw.strip()
+        if not token:
+            continue
+        if token.startswith("id:"):
+            num = token[3:]
+            resolved = id_to_key.get(num, "")
+            if resolved:
+                token = resolved
+            else:
+                # keep id:N so the user can still see something rather than an
+                # empty cell; downstream key extraction ignores non-KEY tokens.
+                token = f"id:{num}"
+        if token in seen:
+            continue
+        seen.add(token)
+        parts.append(token)
+    return ", ".join(parts)
 
 
 def _join_unique(values: list[str]) -> str:
@@ -2202,6 +2922,23 @@ def build_case_step_rows(
                     case_key = str(nested_case.get("key") or "")
                     case_name = str(nested_case.get("name") or "")
                     case_objective = str(nested_case.get("objective") or "")
+            # Issues attached at testRunItem level (some Zephyr deployments
+            # surface "Defects" against the run item rather than the result).
+            run_item_links = (
+                _collect_task_links(run_item.get("traceLinks"))
+                + _collect_task_links(run_item.get("issueLinks"))
+                + _collect_task_links(run_item.get("defects"))
+            )
+            issue_count_raw = run_item.get("issueCount")
+            try:
+                issue_count_int = int(issue_count_raw) if issue_count_raw is not None else 0
+            except (TypeError, ValueError):
+                issue_count_int = 0
+            if issue_count_int > 0 and not run_item_links:
+                _maybe_debug_task_links_payload(
+                    f"runItem {item_id} issueCount={issue_count_int} but no parsed links",
+                    run_item,
+                )
 
             try:
                 test_results = fetch_test_results_for_item(
@@ -2220,7 +2957,28 @@ def build_case_step_rows(
                     test_result_status_id, test_result_status_id
                 )
                 result_execution_date = str(test_result.get("executionDate") or "")
-                test_result_links = _collect_task_links(test_result.get("traceLinks"))
+                test_result_links = (
+                    _collect_task_links(test_result.get("traceLinks"))
+                    + _collect_task_links(test_result.get("issueLinks"))
+                    + _collect_task_links(test_result.get("defects"))
+                )
+                tr_test_case = test_result.get("testCase")
+                if isinstance(tr_test_case, dict):
+                    test_result_links.extend(
+                        _collect_task_links(tr_test_case.get("traceLinks"))
+                        + _collect_task_links(tr_test_case.get("issueLinks"))
+                        + _collect_task_links(tr_test_case.get("defects"))
+                    )
+                test_result_links = run_item_links + test_result_links
+                if not test_result_links and (
+                    issue_count_int > 0 or _parse_bool_env(os.getenv("ZEPHYR_DEBUG_TASK_LINKS"))
+                ):
+                    test_result_links = fetch_links_for_run_item(
+                        base_url,
+                        headers,
+                        item_id=item_id,
+                        test_result_id=test_result_id,
+                    )
                 script_results = test_result.get("testScriptResults")
 
                 if isinstance(script_results, list) and script_results:
@@ -2229,7 +2987,11 @@ def build_case_step_rows(
                             continue
                         step_status_id = str(step.get("testResultStatusId") or "")
                         step_status = status_names.get(step_status_id, step_status_id)
-                        step_links = _collect_task_links(step.get("traceLinks"))
+                        step_links = (
+                            _collect_task_links(step.get("traceLinks"))
+                            + _collect_task_links(step.get("issueLinks"))
+                            + _collect_task_links(step.get("defects"))
+                        )
                         task_links = _join_unique(test_result_links + step_links)
                         rows.append(
                             [
@@ -2287,6 +3049,33 @@ def build_case_step_rows(
                             task_links,
                         ]
                     )
+
+    # Final pass: collect all "id:N" markers from task_links column (last
+    # element of every row), batch-resolve them to Jira keys, and rewrite
+    # the column in place. This converts Zephyr-internal numeric ids
+    # (returned in traceLinks[].issueId) into human-readable keys like
+    # CSD-47277.
+    pending_ids: set[str] = set()
+    for row in rows:
+        if not row:
+            continue
+        cell = str(row[-1] or "")
+        if "id:" not in cell:
+            continue
+        for token in cell.split(","):
+            token = token.strip()
+            if token.startswith("id:") and token[3:].isdigit():
+                pending_ids.add(token[3:])
+    if pending_ids:
+        id_to_key = _resolve_jira_issue_keys(base_url, headers, pending_ids)
+        if id_to_key:
+            for row in rows:
+                if not row:
+                    continue
+                cell = str(row[-1] or "")
+                if "id:" not in cell:
+                    continue
+                row[-1] = _resolve_id_markers_in_links(cell, id_to_key)
     return rows
 
 
@@ -2694,6 +3483,9 @@ def _readable_template_mapping(
     folder_name: str,
     week_start: date | None,
     escape: Callable[[str], str],
+    *,
+    week_builds_html: str = "",
+    week_builds_wiki: str = "",
 ) -> dict[str, str]:
     week_label = week_start.isoformat() if week_start else "N/A"
     return {
@@ -2702,6 +3494,8 @@ def _readable_template_mapping(
         "folder_name_slug": escape(slugify(folder_name)),
         "week_start": escape(week_label),
         "week_label": escape(week_label),
+        "week_builds_html": week_builds_html,
+        "week_builds_wiki": week_builds_wiki,
     }
 
 
@@ -2712,12 +3506,20 @@ def _format_readable_html_preamble(
     folder_id_mapping: str,
     folder_name: str,
     week_start: date | None,
+    *,
+    week_builds_html: str = "",
+    week_builds_wiki: str = "",
 ) -> str:
     raw = _resolve_readable_template(template_dir, kind, "html", folder_id_resolve)
     if not raw or not raw.strip():
         return ""
     mapping = _readable_template_mapping(
-        folder_id_mapping, folder_name, week_start, html.escape
+        folder_id_mapping,
+        folder_name,
+        week_start,
+        html.escape,
+        week_builds_html=week_builds_html,
+        week_builds_wiki=week_builds_wiki,
     )
     body = _apply_readable_template_placeholders(raw.strip(), mapping)
     return f"<div class='report-preamble'>{body}</div>"
@@ -2730,12 +3532,20 @@ def _format_readable_wiki_preamble(
     folder_id_mapping: str,
     folder_name: str,
     week_start: date | None,
+    *,
+    week_builds_html: str = "",
+    week_builds_wiki: str = "",
 ) -> str:
     raw = _resolve_readable_template(template_dir, kind, "wiki", folder_id_resolve)
     if not raw or not raw.strip():
         return ""
     mapping = _readable_template_mapping(
-        folder_id_mapping, folder_name, week_start, _wiki_escape
+        folder_id_mapping,
+        folder_name,
+        week_start,
+        _wiki_escape,
+        week_builds_html=week_builds_html,
+        week_builds_wiki=week_builds_wiki,
     )
     return _apply_readable_template_placeholders(raw.strip(), mapping)
 
@@ -2786,9 +3596,163 @@ def _wiki_text_with_links(text: str) -> str:
     return "".join(rendered)
 
 
+_JIRA_TASK_KEY_RE = re.compile(r"\b[A-Z][A-Z0-9]+-\d+\b")
+
+
+def _html_tasks_render(chunk: str) -> str:
+    """Render a tasks-cell fragment, turning Jira keys into clickable links.
+
+    Behaves like _render_html_with_links for non-key text, plus wraps every
+    KEY-123 token into an <a href="/browse/KEY"> with class daily-jira-key
+    so the Confluence publisher can later swap it for the {jira} macro.
+    """
+    if not chunk:
+        return ""
+    parts = _JIRA_TASK_KEY_RE.split(chunk)
+    keys = _JIRA_TASK_KEY_RE.findall(chunk)
+    out: list[str] = []
+    for idx, part in enumerate(parts):
+        out.append(_render_html_with_links(part))
+        if idx < len(keys):
+            key = keys[idx]
+            url = _jira_issue_url(key)
+            out.append(
+                f"<a class='daily-jira-key' href='{html.escape(url, quote=True)}' "
+                f"target='_blank' rel='noopener'>{html.escape(key)}</a>"
+            )
+    return "".join(out)
+
+
+def _html_tasks_cell(text: str) -> str:
+    if not text:
+        return ""
+    chunks = re.split(r"(?i)<br\s*/?>", text)
+    return "<br/>".join(_html_tasks_render(chunk) for chunk in chunks)
+
+
+def _wiki_tasks_cell(text: str) -> str:
+    """Wiki version of tasks-cell renderer with Jira keys as native links."""
+    if not text:
+        return ""
+    use_plain = _parse_bool_env(os.getenv("ZEPHYR_WEEKLY_WIKI_PLAIN_JIRA_LINKS"))
+    with_breaks = re.sub(r"(?i)<br\s*/?>", "\n", text)
+    out_lines: list[str] = []
+    for line in with_breaks.split("\n"):
+        parts = _JIRA_TASK_KEY_RE.split(line)
+        keys = _JIRA_TASK_KEY_RE.findall(line)
+        rendered: list[str] = []
+        for idx, part in enumerate(parts):
+            if part:
+                # URLs inside text -> clickable wiki link, rest -> escaped.
+                url_parts = _URL_PATTERN.split(part)
+                for sub in url_parts:
+                    if not sub:
+                        continue
+                    if _URL_PATTERN.fullmatch(sub):
+                        rendered.append(f"[{sub}|{sub}]")
+                    else:
+                        rendered.append(_wiki_escape(sub))
+            if idx < len(keys):
+                key = keys[idx]
+                if use_plain:
+                    rendered.append(f"[{_wiki_escape(key)}|{_jira_issue_url(key)}]")
+                else:
+                    rendered.append(f"{{jira:key={_wiki_escape(key)}}}")
+        out_lines.append("".join(rendered))
+    return "\n".join(out_lines)
+
+
 def _jira_cycle_url(cycle_key: str) -> str:
     base_url = os.getenv("ZEPHYR_BASE_URL", "https://jira.navio.auto").rstrip("/")
     return f"{base_url}/secure/Tests.jspa#/testCycle/{urllib.parse.quote(cycle_key)}"
+
+
+def _jira_issue_url(issue_key: str) -> str:
+    base_url = os.getenv("ZEPHYR_BASE_URL", "https://jira.navio.auto").rstrip("/")
+    return f"{base_url}/browse/{urllib.parse.quote(issue_key)}"
+
+
+_JIRA_META_CACHE: dict[str, dict[str, str]] = {}
+
+
+def _fetch_jira_bug_metadata(
+    keys: list[str],
+    *,
+    base_url: str,
+    auth_headers: dict[str, str] | None,
+) -> dict[str, dict[str, str]]:
+    """Batch-fetch Jira issue metadata for the given keys.
+
+    Returns {key: {summary, status, priority, issuetype}}. Errors and missing
+    keys are silently skipped — the caller falls back to plain key links.
+    """
+    out: dict[str, dict[str, str]] = {}
+    if not keys or not base_url or not auth_headers:
+        return out
+
+    pending: list[str] = []
+    for key in keys:
+        clean = str(key or "").strip()
+        if not clean:
+            continue
+        if clean in _JIRA_META_CACHE:
+            out[clean] = _JIRA_META_CACHE[clean]
+            continue
+        if clean not in pending:
+            pending.append(clean)
+    if not pending:
+        return out
+
+    chunk_size = 100
+    for start in range(0, len(pending), chunk_size):
+        chunk = pending[start:start + chunk_size]
+        jql_keys = ",".join(chunk)
+        try:
+            payload = request_json(
+                base_url,
+                "/rest/api/2/search",
+                auth_headers,
+                params={
+                    "jql": f"key in ({jql_keys})",
+                    "fields": "summary,status,priority,issuetype",
+                    "maxResults": str(len(chunk)),
+                },
+            )
+        except Exception as exc:  # noqa: BLE001
+            sys.stderr.write(
+                f"[weekly] Jira metadata lookup failed for {len(chunk)} key(s): {exc}\n"
+            )
+            continue
+        issues = payload.get("issues") if isinstance(payload, dict) else None
+        if not isinstance(issues, list):
+            continue
+        for issue in issues:
+            if not isinstance(issue, dict):
+                continue
+            key = str(issue.get("key") or "").strip()
+            if not key:
+                continue
+            fields = issue.get("fields") or {}
+            if not isinstance(fields, dict):
+                fields = {}
+            status_obj = fields.get("status") or {}
+            priority_obj = fields.get("priority") or {}
+            issuetype_obj = fields.get("issuetype") or {}
+            entry = {
+                "summary": str(fields.get("summary") or "").strip(),
+                "status": str(
+                    (status_obj.get("name") if isinstance(status_obj, dict) else "") or ""
+                ).strip(),
+                "priority": str(
+                    (priority_obj.get("name") if isinstance(priority_obj, dict) else "") or ""
+                ).strip(),
+                "issuetype": str(
+                    (issuetype_obj.get("name") if isinstance(issuetype_obj, dict) else "") or ""
+                ).strip(),
+            }
+            _JIRA_META_CACHE[key] = entry
+            out[key] = entry
+    return out
 
 
 def _read_cycle_objective(cycle: dict[str, Any]) -> str:
@@ -3392,9 +4356,21 @@ def _default_weekday_labels() -> list[str]:
     return ["База", "Вт", "Ср", "Чт", "Пт"]
 
 
+def _test_day_from_folder_day(folder_day: date) -> date:
+    # Folder name encodes the day a branch was fixed; the actual test run
+    # happens on the next business day. Branches fixed on Fri/Sat/Sun are
+    # all tested on the following Monday.
+    weekday = folder_day.weekday()
+    if weekday <= 3:  # Mon..Thu -> next day
+        return folder_day + timedelta(days=1)
+    return folder_day + timedelta(days=(7 - weekday))  # Fri/Sat/Sun -> next Mon
+
+
 def _release_week_start(day: date) -> date:
-    offset = (day.weekday() - 3) % 7
-    return day - timedelta(days=offset)
+    # ISO week start (Monday). Caller is expected to pass a "test day"
+    # (see _test_day_from_folder_day) so a build fixed on Fri groups with
+    # the following Mon..Sun week instead of staying with the previous one.
+    return day - timedelta(days=day.weekday())
 
 
 def _release_week_end(start: date) -> date:
@@ -3564,9 +4540,212 @@ def _filter_tree_folders_by_report_day(
     return out
 
 
+_DEFECT_KEY_PATTERN = re.compile(r"\b[A-Z][A-Z0-9]+-\d+\b")
+_FAILED_STATUS_TOKENS = {
+    "fail",
+    "failed",
+    "не пройден",
+    "не пройдено",
+    "не пройдён",
+    "blocked",
+    "заблокирован",
+    "заблокирована",
+    "заблокировано",
+}
+_PASSED_STATUS_TOKENS = {"pass", "passed", "пройден", "пройдено", "пройдена", "ok"}
+
+
+def _is_failed_execution_status(status: str | None) -> bool:
+    text = str(status or "").strip().lower()
+    return bool(text) and text in _FAILED_STATUS_TOKENS
+
+
+def _extract_defect_keys_from_cycles(cycles: dict[str, Any]) -> list[str]:
+    keys: list[str] = []
+    if not isinstance(cycles, dict):
+        return keys
+    for cycle in cycles.values():
+        if not isinstance(cycle, dict):
+            continue
+        for case in cycle.get("cases", {}).values():
+            if not isinstance(case, dict):
+                continue
+            tasks_raw = str(case.get("tasks") or "")
+            if not tasks_raw:
+                continue
+            keys.extend(_DEFECT_KEY_PATTERN.findall(tasks_raw))
+    return keys
+
+
+def _iter_cases_in_cycles(cycles: dict[str, Any]):
+    if not isinstance(cycles, dict):
+        return
+    for cycle in cycles.values():
+        if not isinstance(cycle, dict):
+            continue
+        for case in cycle.get("cases", {}).values():
+            if isinstance(case, dict):
+                yield case
+
+
+def _empty_defect_analytics() -> dict[str, Any]:
+    return {
+        "keys_ordered": [],
+        "matrix": {},
+        "totals_by_build": {},
+        "cases_with_bug_by_build": {},
+        "cases_without_bug_by_build": {},
+        "failed_cases_with_bug_by_build": {},
+        "failed_cases_without_bug_by_build": {},
+        "bug_total_cases": {},
+        "bug_builds_count": {},
+        "hot_bugs": [],
+    }
+
+
+def _compute_weekly_defect_analytics(
+    cycles_by_day: dict[date, list[dict[str, Any]]],
+    ordered_days: list[date],
+    column_labels: list[str],
+) -> dict[str, Any]:
+    """Aggregate per-bug analytics across the week.
+
+    Returns a dict consumable by the renderers. Buckets:
+      keys_ordered, matrix, totals_by_build,
+      cases_with_bug_by_build / cases_without_bug_by_build,
+      failed_cases_with_bug_by_build / failed_cases_without_bug_by_build,
+      bug_total_cases, bug_builds_count, hot_bugs.
+    """
+    matrix: dict[str, dict[str, int]] = {}
+    cases_with_bug_by_build: dict[str, int] = {label: 0 for label in column_labels}
+    cases_without_bug_by_build: dict[str, int] = {label: 0 for label in column_labels}
+    failed_with_bug_by_build: dict[str, int] = {label: 0 for label in column_labels}
+    failed_without_bug_by_build: dict[str, int] = {label: 0 for label in column_labels}
+    bug_total_cases: dict[str, int] = {}
+    bug_appears_in_label: dict[str, set[str]] = {}
+    keys_first_seen_order: list[str] = []
+
+    label_by_day = dict(zip(ordered_days, column_labels))
+    for day, build_label in label_by_day.items():
+        for cycles_dict in cycles_by_day.get(day, []):
+            for case in _iter_cases_in_cycles(cycles_dict):
+                tasks_raw = str(case.get("tasks") or "")
+                bug_keys = _DEFECT_KEY_PATTERN.findall(tasks_raw) if tasks_raw else []
+                seen_per_case: set[str] = set()
+                is_failed = _is_failed_execution_status(case.get("executionStatus"))
+                if bug_keys:
+                    cases_with_bug_by_build[build_label] = (
+                        cases_with_bug_by_build.get(build_label, 0) + 1
+                    )
+                    if is_failed:
+                        failed_with_bug_by_build[build_label] = (
+                            failed_with_bug_by_build.get(build_label, 0) + 1
+                        )
+                else:
+                    cases_without_bug_by_build[build_label] = (
+                        cases_without_bug_by_build.get(build_label, 0) + 1
+                    )
+                    if is_failed:
+                        failed_without_bug_by_build[build_label] = (
+                            failed_without_bug_by_build.get(build_label, 0) + 1
+                        )
+                for raw_key in bug_keys:
+                    key = raw_key.strip()
+                    if not key or key in seen_per_case:
+                        continue
+                    seen_per_case.add(key)
+                    if key not in matrix:
+                        matrix[key] = {label: 0 for label in column_labels}
+                        keys_first_seen_order.append(key)
+                        bug_total_cases[key] = 0
+                        bug_appears_in_label[key] = set()
+                    matrix[key][build_label] = matrix[key].get(build_label, 0) + 1
+                    bug_total_cases[key] += 1
+                    bug_appears_in_label[key].add(build_label)
+
+    bug_builds_count = {key: len(labels) for key, labels in bug_appears_in_label.items()}
+    totals_by_build = {
+        label: sum(1 for key in matrix if matrix[key].get(label, 0) > 0)
+        for label in column_labels
+    }
+
+    label_index = {label: idx for idx, label in enumerate(column_labels)}
+    hot_bugs: list[str] = []
+    for key in keys_first_seen_order:
+        present_indexes = sorted(
+            label_index[label]
+            for label in bug_appears_in_label.get(key, set())
+            if label in label_index
+        )
+        if len(present_indexes) < 2:
+            continue
+        for a, b in zip(present_indexes, present_indexes[1:]):
+            if b - a == 1:
+                hot_bugs.append(key)
+                break
+
+    keys_ordered = sorted(
+        keys_first_seen_order,
+        key=lambda k: (
+            -bug_total_cases.get(k, 0),
+            -bug_builds_count.get(k, 0),
+            k,
+        ),
+    )
+
+    return {
+        "keys_ordered": keys_ordered,
+        "matrix": matrix,
+        "totals_by_build": totals_by_build,
+        "cases_with_bug_by_build": cases_with_bug_by_build,
+        "cases_without_bug_by_build": cases_without_bug_by_build,
+        "failed_cases_with_bug_by_build": failed_with_bug_by_build,
+        "failed_cases_without_bug_by_build": failed_without_bug_by_build,
+        "bug_total_cases": bug_total_cases,
+        "bug_builds_count": bug_builds_count,
+        "hot_bugs": hot_bugs,
+    }
+
+
+def _extract_cycle_key_objects(cycles: dict[str, Any]) -> list[dict[str, str]]:
+    """Return [{id: cycle_key, name?: cycle_name}] for every Zephyr cycle.
+
+    Mirrors what daily reports embed as <div id="zephyr-cycle-keys-json">.
+    The Confluence publisher uses these to build a per-build Zephyr Reporting
+    macro (TEST_RESULTS_SUMMARY_BY_STATUS) instead of the inline SVG pie.
+    """
+    out: list[dict[str, str]] = []
+    if not isinstance(cycles, dict):
+        return out
+    seen_keys: set[str] = set()
+    for cycle in cycles.values():
+        if not isinstance(cycle, dict):
+            continue
+        ck = str(cycle.get("cycle_key") or "").strip()
+        if not ck or ck in seen_keys:
+            continue
+        seen_keys.add(ck)
+        cn = str(cycle.get("cycle_name") or "").strip()
+        if cn:
+            out.append({"id": ck, "name": cn})
+        else:
+            out.append({"id": ck})
+    return out
+
+
 def _weekly_cycle_matrix_data(
     report_data: dict[tuple[str, str], dict[str, Any]]
-) -> tuple[date | None, list[str], list[list[str]], list[list[bool]], list[list[bool]]]:
+) -> tuple[
+    date | None,
+    list[str],
+    list[list[str]],
+    list[list[bool]],
+    list[list[bool]],
+    dict[str, dict[str, int]],
+    list[str],
+    dict[str, list[dict[str, str]]],
+    dict[str, Any],
+]:
     weekly_groups: dict[date, list[dict[str, Any]]] = defaultdict(list)
     for (folder_id, folder_name), payload in report_data.items():
         cycles = payload.get("cycles", {})
@@ -3580,18 +4759,21 @@ def _weekly_cycle_matrix_data(
         progress_rows = _build_cycle_progress_rows(cycles)
         if not progress_rows:
             continue
-        week_start = _release_week_start(report_day)
+        test_day = _test_day_from_folder_day(report_day)
+        week_start = _release_week_start(test_day)
         weekly_groups[week_start].append(
             {
                 "folder_id": str(folder_id),
                 "report_day": report_day,
+                "test_day": test_day,
                 "column_label": _parse_weekly_column_label_from_folder_name(folder_name),
                 "progress_rows": progress_rows,
+                "cycles": cycles,
             }
         )
 
     if not weekly_groups:
-        return None, [], [], [], []
+        return None, [], [], [], [], {}, [], {}, _empty_defect_analytics()
 
     def _aggregate_progress_map(
         progress_rows: list[dict[str, Any]],
@@ -3648,11 +4830,15 @@ def _weekly_cycle_matrix_data(
     )
     progress_rows_by_day: dict[date, list[dict[str, Any]]] = defaultdict(list)
     column_labels_by_day: dict[date, list[str]] = defaultdict(list)
+    cycles_by_day: dict[date, list[dict[str, Any]]] = defaultdict(list)
     for summary in week_daily_summaries:
         progress_rows_by_day[summary["report_day"]].extend(summary["progress_rows"])
         column_label = str(summary.get("column_label") or "").strip()
         if column_label:
             column_labels_by_day[summary["report_day"]].append(column_label)
+        day_cycles = summary.get("cycles")
+        if isinstance(day_cycles, dict):
+            cycles_by_day[summary["report_day"]].append(day_cycles)
     ordered_days = sorted(progress_rows_by_day.keys())
     column_labels: list[str] = []
     for day in ordered_days:
@@ -3661,6 +4847,38 @@ def _weekly_cycle_matrix_data(
             column_labels.append(Counter(day_labels).most_common(1)[0][0])
         else:
             column_labels.append(f"nightly-dev-{day.strftime('%Y.%m.%d')}")
+
+    # Per-column (per-build) case status counts, aggregated defect Jira keys
+    # and per-build Zephyr cycle key objects (for the Confluence publisher).
+    column_status_counts: dict[str, dict[str, int]] = {}
+    cycle_keys_by_label: dict[str, list[dict[str, str]]] = {}
+    defect_keys_seen: set[str] = set()
+    defect_keys_ordered: list[str] = []
+    for day_date, day_label in zip(ordered_days, column_labels):
+        merged_counts: dict[str, int] = defaultdict(int)
+        seen_cycle_keys: set[str] = set()
+        cycle_objs: list[dict[str, str]] = []
+        for cycles_dict in cycles_by_day.get(day_date, []):
+            day_counts = _daily_aggregate_case_status_counts(cycles_dict)
+            for status_key, value in day_counts.items():
+                merged_counts[status_key] += int(value)
+            for defect_key in _extract_defect_keys_from_cycles(cycles_dict):
+                if defect_key in defect_keys_seen:
+                    continue
+                defect_keys_seen.add(defect_key)
+                defect_keys_ordered.append(defect_key)
+            for entry in _extract_cycle_key_objects(cycles_dict):
+                cid = str(entry.get("id") or "").strip()
+                if not cid or cid in seen_cycle_keys:
+                    continue
+                seen_cycle_keys.add(cid)
+                cycle_objs.append(entry)
+        column_status_counts[day_label] = dict(merged_counts)
+        cycle_keys_by_label[day_label] = cycle_objs
+
+    defect_analytics = _compute_weekly_defect_analytics(
+        cycles_by_day, ordered_days, column_labels
+    )
 
     day_maps: dict[date, dict[str, dict[str, Any]]] = {}
     joined_passed_by_label: dict[str, dict[str, int]] = {}
@@ -3691,7 +4909,17 @@ def _weekly_cycle_matrix_data(
     for day_map in day_maps.values():
         all_cycle_labels.update(day_map.keys())
     if not all_cycle_labels:
-        return target_week_start, column_labels, [], [], []
+        return (
+            target_week_start,
+            column_labels,
+            [],
+            [],
+            [],
+            column_status_counts,
+            defect_keys_ordered,
+            cycle_keys_by_label,
+            defect_analytics,
+        )
 
     sort_key_by_cycle: dict[str, tuple[Any, ...]] = {}
     for cycle_label in all_cycle_labels:
@@ -3725,7 +4953,7 @@ def _weekly_cycle_matrix_data(
         cell_all_not_executed.append(ne_flags)
         cell_all_blocked.append(blocked_flags)
 
-    # Insert group subtotal row before each scenario group.
+    # Insert group subtotal row after each scenario group.
     grouped_rows: list[list[str]] = []
     grouped_ne_flags: list[list[bool]] = []
     grouped_blocked_flags: list[list[bool]] = []
@@ -3757,6 +4985,11 @@ def _weekly_cycle_matrix_data(
                 group_day_sums[day_idx] += int(current[2 + day_idx]) if 2 + day_idx < len(current) else 0
             index += 1
 
+        for copy_idx in range(group_start, index):
+            grouped_rows.append(rows[copy_idx])
+            grouped_ne_flags.append(cell_all_not_executed[copy_idx])
+            grouped_blocked_flags.append(cell_all_blocked[copy_idx])
+
         group_title = _summary_group_title_from_labels(group_labels, fallback_group=group_id)
         subtotal_row = [f"Итого: {group_title}", str(group_total_cases)]
         subtotal_row.extend(str(value) for value in group_day_sums)
@@ -3764,16 +4997,21 @@ def _weekly_cycle_matrix_data(
         grouped_ne_flags.append([False] * len(column_labels))
         grouped_blocked_flags.append([False] * len(column_labels))
 
-        for copy_idx in range(group_start, index):
-            grouped_rows.append(rows[copy_idx])
-            grouped_ne_flags.append(cell_all_not_executed[copy_idx])
-            grouped_blocked_flags.append(cell_all_blocked[copy_idx])
-
-    return target_week_start, column_labels, grouped_rows, grouped_ne_flags, grouped_blocked_flags
+    return (
+        target_week_start,
+        column_labels,
+        grouped_rows,
+        grouped_ne_flags,
+        grouped_blocked_flags,
+        column_status_counts,
+        defect_keys_ordered,
+        cycle_keys_by_label,
+        defect_analytics,
+    )
 
 
 def _weekly_cycle_matrix_rows(report_data: dict[tuple[str, str], dict[str, Any]]) -> list[list[str]]:
-    _, _, rows, _, _ = _weekly_cycle_matrix_data(report_data)
+    _, _, rows, _, _, _, _, _, _ = _weekly_cycle_matrix_data(report_data)
     return rows
 
 
@@ -3794,16 +5032,41 @@ def _split_report_data_by_week(
         progress_rows = _build_cycle_progress_rows(cycles)
         if not progress_rows:
             continue
-        week_start = _release_week_start(report_day)
+        test_day = _test_day_from_folder_day(report_day)
+        week_start = _release_week_start(test_day)
         grouped[week_start][(folder_id, folder_name)] = payload
     return grouped
 
 
 def _weekly_cycle_matrix_data_all(
     report_data: dict[tuple[str, str], dict[str, Any]]
-) -> list[tuple[date | None, list[str], list[list[str]], list[list[bool]], list[list[bool]]]]:
+) -> list[
+    tuple[
+        date | None,
+        list[str],
+        list[list[str]],
+        list[list[bool]],
+        list[list[bool]],
+        dict[str, dict[str, int]],
+        list[str],
+        dict[str, list[dict[str, str]]],
+        dict[str, Any],
+    ]
+]:
     by_week = _split_report_data_by_week(report_data)
-    matrices: list[tuple[date | None, list[str], list[list[str]], list[list[bool]], list[list[bool]]]] = []
+    matrices: list[
+        tuple[
+            date | None,
+            list[str],
+            list[list[str]],
+            list[list[bool]],
+            list[list[bool]],
+            dict[str, dict[str, int]],
+            list[str],
+            dict[str, list[dict[str, str]]],
+            dict[str, Any],
+        ]
+    ] = []
     for week_start in sorted(by_week.keys()):
         matrices.append(_weekly_cycle_matrix_data(by_week[week_start]))
     return matrices
@@ -3830,28 +5093,593 @@ def write_weekly_cycle_matrix_csv(path: str, weekday_labels: list[str], rows: li
 
 
 def _weekly_matrix_title_text(week_start: date | None, weekday_labels: list[str]) -> str:
-    week_label = week_start.isoformat() if week_start else "N/A"
-    labels = list(weekday_labels)
-    present_days: list[date] = []
-    for label in labels:
-        match = re.search(r"\b(\d{4}\.\d{2}\.\d{2})\b", str(label))
-        if not match:
-            continue
-        try:
-            present_days.append(datetime.strptime(match.group(1), "%Y.%m.%d").date())
-        except ValueError:
-            continue
-    if present_days:
-        range_start = min(present_days)
-        range_end = max(present_days)
-        week_no = int(range_start.isocalendar()[1])
-        title_start = range_start + timedelta(days=1)
-        title_end = range_end + timedelta(days=1)
+    # Title must stay stable for the whole ISO week, otherwise the
+    # Confluence publisher creates a new page every time a new folder lands
+    # mid-week (it matches existing pages by exact title). We always show
+    # Mon..Sun of the ISO week derived from `week_start`, regardless of how
+    # many builds we have data for so far.
+    if isinstance(week_start, date):
+        title_start = week_start
+        title_end = week_start + timedelta(days=6)
+        week_no = int(title_start.isocalendar()[1])
         return (
             f"Weekly W_{week_no:02d}. {title_start.strftime('%d.%m.%Y')} - "
             f"{title_end.strftime('%d.%m.%Y')}"
         )
-    return f"Weekly W_??. {week_label}"
+
+    # Fallback: no week_start available (shouldn't normally happen). Try to
+    # derive a date from the first column label so the title is at least
+    # informative.
+    for label in weekday_labels or []:
+        match = re.search(r"\b(\d{4}\.\d{2}\.\d{2})\b", str(label))
+        if not match:
+            continue
+        try:
+            folder_day = datetime.strptime(match.group(1), "%Y.%m.%d").date()
+        except ValueError:
+            continue
+        test_day = _test_day_from_folder_day(folder_day)
+        iso_monday = _release_week_start(test_day)
+        title_start = iso_monday
+        title_end = iso_monday + timedelta(days=6)
+        week_no = int(title_start.isocalendar()[1])
+        return (
+            f"Weekly W_{week_no:02d}. {title_start.strftime('%d.%m.%Y')} - "
+            f"{title_end.strftime('%d.%m.%Y')}"
+        )
+    return "Weekly W_??. N/A"
+
+
+def _weekly_builds_html_list(column_labels: list[str]) -> str:
+    items = [
+        f"  <li>{html.escape(str(label))}</li>"
+        for label in column_labels
+        if str(label).strip()
+    ]
+    if not items:
+        return ""
+    return "<ul>\n" + "\n".join(items) + "\n</ul>"
+
+
+def _weekly_builds_wiki_list(column_labels: list[str]) -> str:
+    items = [
+        f"* {_wiki_escape(str(label))}"
+        for label in column_labels
+        if str(label).strip()
+    ]
+    return "\n".join(items)
+
+
+def _weekly_best_branch_column_title(branch_name: str) -> str:
+    return f"Лучшая ветка: {str(branch_name or '').strip()}"
+
+
+def _weekly_best_branch_column_context_for_week(
+    weekly_cycle_matrices: list[
+        tuple[
+            date | None,
+            list[str],
+            list[list[str]],
+            list[list[bool]],
+            list[list[bool]],
+            dict[str, dict[str, int]],
+            list[str],
+            dict[str, list[dict[str, str]]],
+            dict[str, Any],
+        ]
+    ],
+    *,
+    best_branch_name: str,
+    best_branch_week_start: date | None,
+    report_week_start: date | None,
+) -> dict[str, Any] | None:
+    branch_name = str(best_branch_name or "").strip()
+    if (
+        not branch_name
+        or best_branch_week_start is None
+        or report_week_start is None
+        or report_week_start > best_branch_week_start
+    ):
+        return None
+
+    preferred_entry: tuple[
+        date | None,
+        list[str],
+        list[list[str]],
+        list[list[bool]],
+        list[list[bool]],
+        dict[str, dict[str, int]],
+        list[str],
+        dict[str, list[dict[str, str]]],
+        dict[str, Any],
+    ] | None = None
+    preferred_index: int | None = None
+    lower_branch = branch_name.lower()
+    for entry in weekly_cycle_matrices:
+        entry_week, labels, _rows, _ne, _blocked, _counts, _defects, _keys_map, _analytics = entry
+        for idx, label in enumerate(labels):
+            if str(label or "").strip().lower() != lower_branch:
+                continue
+            if preferred_entry is None:
+                preferred_entry = entry
+                preferred_index = idx
+            if entry_week == best_branch_week_start:
+                preferred_entry = entry
+                preferred_index = idx
+                break
+        if preferred_entry is not None and entry_week == best_branch_week_start:
+            break
+    if preferred_entry is None or preferred_index is None:
+        return None
+
+    _, _labels, best_rows, _ne, _blocked, best_counts_by_label, _defects, best_cycle_keys, _analytics = (
+        preferred_entry
+    )
+    scenario_passed_by_row: dict[str, int] = {}
+    for row in best_rows:
+        if not row:
+            continue
+        row_key = str(row[0] or "").strip()
+        if not row_key:
+            continue
+        value_raw = row[2 + preferred_index] if 2 + preferred_index < len(row) else "0"
+        try:
+            scenario_passed_by_row[row_key] = int(value_raw)
+        except (TypeError, ValueError):
+            scenario_passed_by_row[row_key] = 0
+
+    counts = best_counts_by_label.get(branch_name)
+    if counts is None:
+        for key, value in best_counts_by_label.items():
+            if str(key or "").strip().lower() == lower_branch:
+                counts = value
+                break
+    return {
+        "title": _weekly_best_branch_column_title(branch_name),
+        "name": branch_name,
+        "overall_counts": counts or {},
+        "scenario_passed_by_row": scenario_passed_by_row,
+        "cycle_keys": best_cycle_keys.get(branch_name) or [],
+    }
+
+
+def _weekly_defects_html_block(defect_keys: list[str]) -> str:
+    if not defect_keys:
+        return "<p><em>В процессе написания</em></p>"
+    items = [
+        f"  <li>{_weekly_jira_key_span_html(key)}</li>" for key in defect_keys
+    ]
+    return "<ul class='weekly-defects-list'>\n" + "\n".join(items) + "\n</ul>"
+
+
+def _weekly_defects_wiki_block(defect_keys: list[str]) -> str:
+    if not defect_keys:
+        return "_В процессе написания_"
+    return "\n".join(f"* {_weekly_jira_key_wiki(key)}" for key in defect_keys)
+
+
+_DEFECT_TOP_LIMIT = 10
+
+
+def _norm_jira_token(text: str | None) -> str:
+    return str(text or "").strip().lower()
+
+
+def _weekly_jira_key_span_html(issue_key: str) -> str:
+    """Issue key cell: monospace link + data attribute for Confluence Jira macro."""
+    key = str(issue_key or "").strip()
+    if not key:
+        return "—"
+    url = _jira_issue_url(key)
+    return (
+        f'<span class="weekly-jira-key" data-jira-key="{html.escape(key)}">'
+        f'<a class="weekly-jira-key-link" href="{html.escape(url)}" '
+        f'target="_blank" rel="noopener">{html.escape(key)}</a></span>'
+    )
+
+
+def _jira_status_lozenge_html(status: str | None) -> str:
+    t = _norm_jira_token(status)
+    bg, fg, bd = "#dfe1e6", "#42526e", "#dfe1e6"
+    if any(x in t for x in ("done", "closed", "resolved", "готов", "закрыт", "выполнен", "решён", "решен")):
+        bg, fg, bd = "#e3fcef", "#006644", "#b3d4c7"
+    elif any(x in t for x in ("progress", "development", "в работе", "review")):
+        bg, fg, bd = "#deebff", "#0747a6", "#b3d4ff"
+    elif any(x in t for x in ("block", "blocked", "блок")):
+        bg, fg, bd = "#ffebe6", "#bf2600", "#ffccc7"
+    elif any(x in t for x in ("hold", "wait", "to do", "backlog", "отлож", "ожид", "новый", "open")):
+        bg, fg, bd = "#f4f5f7", "#42526e", "#dfe1e6"
+    esc = html.escape(status or "—")
+    return (
+        f'<span class="jira-lozenge jira-lozenge-status" style="display:inline-block;max-width:100%;'
+        f"padding:0 6px;border-radius:3px;font-size:11px;font-weight:600;line-height:1.82;"
+        f"text-transform:uppercase;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;"
+        f'background-color:{bg};color:{fg};border:1px solid {bd};" title="{esc}">{esc}</span>'
+    )
+
+
+def _jira_priority_lozenge_html(priority: str | None) -> str:
+    t = _norm_jira_token(priority)
+    bg, fg = "#dfe1e6", "#42526e"
+    if any(x in t for x in ("highest", "blocker", "critical", "наивыс", "блокирующ")):
+        bg, fg = "#de350b", "#ffffff"
+    elif "high" in t or "высок" in t:
+        bg, fg = "#ff8b00", "#ffffff"
+    elif "medium" in t or "средн" in t or "normal" in t:
+        bg, fg = "#ffab00", "#172b4d"
+    elif "low" in t or "низк" in t or "lowest" in t:
+        bg, fg = "#0065ff", "#ffffff"
+    esc = html.escape(priority or "—")
+    return (
+        f'<span class="jira-lozenge jira-lozenge-priority" style="display:inline-block;max-width:100%;'
+        f"padding:0 6px;border-radius:3px;font-size:11px;font-weight:600;line-height:1.82;"
+        f"white-space:nowrap;overflow:hidden;text-overflow:ellipsis;"
+        f'background-color:{bg};color:{fg};" title="{esc}">{esc}</span>'
+    )
+
+
+def _jira_issuetype_chip_html(issuetype: str | None) -> str:
+    t = _norm_jira_token(issuetype)
+    bg, fg, bd = "#eae6ff", "#403294", "#c0b6f2"
+    if "bug" in t or "дефект" in t or "ошиб" in t:
+        bg, fg, bd = "#ffebe6", "#bf2600", "#ffccc7"
+    elif "story" in t or "истор" in t:
+        bg, fg, bd = "#e3fcef", "#006644", "#abf5d1"
+    elif "task" in t or "задач" in t or "sub" in t:
+        bg, fg, bd = "#deebff", "#0747a6", "#b3d4ff"
+    elif "epic" in t or "эпик" in t:
+        bg, fg, bd = "#e6fcff", "#0747a6", "#b3f5ff"
+    esc = html.escape(issuetype or "—")
+    return (
+        f'<span class="jira-lozenge jira-lozenge-issuetype" style="display:inline-block;max-width:100%;'
+        f"padding:0 6px;border-radius:3px;font-size:12px;font-weight:500;line-height:1.6;"
+        f"white-space:nowrap;overflow:hidden;text-overflow:ellipsis;"
+        f'background-color:{bg};color:{fg};border:1px solid {bd};" title="{esc}">{esc}</span>'
+    )
+
+
+def _jira_summary_cell_html(summary: str | None) -> str:
+    esc = html.escape(summary or "")
+    if not esc:
+        return '<span class="weekly-jira-summary-empty">—</span>'
+    return f'<span class="weekly-jira-summary">{esc}</span>'
+
+
+_WEEKLY_JIRA_KEY_SPAN_RE = re.compile(
+    r'<span\s+class="weekly-jira-key"\s+data-jira-key="([A-Z][A-Z0-9]+-\d+)"[^>]*>.*?</span>',
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _jira_issue_confluence_storage_macro(issue_key: str) -> str:
+    """Confluence storage: native Jira Issues macro (renders like Jira, not plain text)."""
+    key = html.escape(issue_key.strip())
+    server_id = (os.getenv("ZEPHYR_CONFLUENCE_JIRA_SERVER_ID") or "").strip()
+    server_param = ""
+    if server_id:
+        server_param = (
+            f'<ac:parameter ac:name="serverId">{html.escape(server_id)}</ac:parameter>'
+        )
+    return (
+        '<ac:structured-macro ac:name="jira" ac:schema-version="1">'
+        f'<ac:parameter ac:name="key">{key}</ac:parameter>{server_param}'
+        "</ac:structured-macro>"
+    )
+
+
+def _replace_weekly_jira_key_spans_with_confluence_macro(body_html: str) -> str:
+    if (
+        not body_html
+        or "weekly-jira-key" not in body_html
+        or not _parse_bool_env(os.getenv("ZEPHYR_CONFLUENCE_WEEKLY_JIRA_MACRO", "true"))
+    ):
+        return body_html
+
+    def _repl(match: re.Match[str]) -> str:
+        return _jira_issue_confluence_storage_macro(match.group(1))
+
+    return _WEEKLY_JIRA_KEY_SPAN_RE.sub(_repl, body_html)
+
+
+def _wrap_weekly_scenario_block_with_excerpt_macro(body_html: str) -> str:
+    """Wrap weekly block from top Weekly heading to scenario table."""
+    if (
+        not body_html
+        or "Score по сценариям" not in body_html
+        or "<table" not in body_html
+        or not _parse_bool_env(os.getenv("ZEPHYR_CONFLUENCE_WEEKLY_EXCERPT", "true"))
+    ):
+        return body_html
+    if (
+        "ac:name=\"excerpt\"" in body_html
+        or "ac:name='excerpt'" in body_html
+    ):
+        return body_html
+    pattern = re.compile(
+        r"(?P<block><h1\b[^>]*>\s*Weekly\b.*?</h1>.*?"
+        r"<h3\b[^>]*>\s*<strong>\s*Score по сценариям\s*</strong>\s*</h3>\s*"
+        r"<table\b[^>]*>.*?</table>)",
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+
+    def _repl(match: re.Match[str]) -> str:
+        block_html = match.group("block")
+        wrapped = (
+            '<ac:structured-macro ac:name="excerpt" ac:schema-version="1">'
+            f"<ac:rich-text-body>{block_html}</ac:rich-text-body>"
+            "</ac:structured-macro>"
+        )
+        return wrapped
+
+    return pattern.sub(_repl, body_html, count=1)
+
+
+def _replace_legacy_weekly_table_macros_with_excerpt(body_html: str) -> str:
+    if not body_html:
+        return body_html
+    body_html = body_html.replace('ac:name="table-filter"', 'ac:name="excerpt"')
+    body_html = body_html.replace("ac:name='table-filter'", "ac:name='excerpt'")
+    body_html = body_html.replace('ac:name="table-excerpt"', 'ac:name="excerpt"')
+    body_html = body_html.replace("ac:name='table-excerpt'", "ac:name='excerpt'")
+    return body_html
+
+
+def _weekly_jira_key_wiki(issue_key: str) -> str:
+    """Confluence wiki: embedded Jira issue (falls back to link if macro unsupported)."""
+    key = str(issue_key or "").strip()
+    if not key:
+        return " "
+    if _parse_bool_env(os.getenv("ZEPHYR_WEEKLY_WIKI_PLAIN_JIRA_LINKS")):
+        return f"[{_wiki_escape(key)}|{_jira_issue_url(key)}]"
+    return f"{{jira:key={_wiki_escape(key)}}}"
+
+
+def _filter_keys_by_issuetype(
+    keys: list[str],
+    defect_meta: dict[str, dict[str, str]] | None,
+) -> list[str]:
+    """Optionally restrict to issuetype = ZEPHYR_DEFECT_TYPE_FILTER (default Bug).
+
+    If Jira metadata is missing for a key, the key is kept (graceful).
+    """
+    raw_filter = os.getenv("ZEPHYR_DEFECT_TYPE_FILTER", "Bug")
+    allowed = {
+        token.strip().lower()
+        for token in str(raw_filter or "").split(",")
+        if token.strip()
+    }
+    if not allowed:
+        return keys
+    meta = defect_meta or {}
+    out: list[str] = []
+    for key in keys:
+        entry = meta.get(key)
+        if not entry:
+            out.append(key)
+            continue
+        issuetype = (entry.get("issuetype") or "").strip().lower()
+        if not issuetype or issuetype in allowed:
+            out.append(key)
+    return out
+
+
+def _weekly_defect_analytics_html(
+    defect_analytics: dict[str, Any] | None,
+    defect_meta: dict[str, dict[str, str]] | None,
+    column_labels: list[str],
+) -> str:
+    analytics = defect_analytics or {}
+    keys_ordered = list(analytics.get("keys_ordered") or [])
+    keys_ordered = _filter_keys_by_issuetype(keys_ordered, defect_meta)
+    if not keys_ordered:
+        return "<p><em>В процессе написания</em></p>"
+
+    matrix = analytics.get("matrix") or {}
+    bug_total_cases = analytics.get("bug_total_cases") or {}
+    bug_builds_count = analytics.get("bug_builds_count") or {}
+    totals_by_build = analytics.get("totals_by_build") or {}
+    cases_with = analytics.get("cases_with_bug_by_build") or {}
+    cases_without = analytics.get("cases_without_bug_by_build") or {}
+    failed_with = analytics.get("failed_cases_with_bug_by_build") or {}
+    failed_without = analytics.get("failed_cases_without_bug_by_build") or {}
+    hot_bugs = [k for k in (analytics.get("hot_bugs") or []) if k in keys_ordered]
+    meta = defect_meta or {}
+
+    parts: list[str] = []
+    parts.append('<div class="weekly-defects-jira">')
+
+    # 1. Сводка
+    parts.append("<h4>Сводка</h4>")
+    parts.append("<table class='weekly-defects-table weekly-defects-summary'>")
+    header_cells = ["<th>Метрика</th>"] + [
+        f"<th>{html.escape(label)}</th>" for label in column_labels
+    ]
+    parts.append("<thead><tr>" + "".join(header_cells) + "</tr></thead>")
+    parts.append("<tbody>")
+
+    def _row(label: str, getter) -> str:
+        cells = [f"<td>{html.escape(label)}</td>"]
+        for col in column_labels:
+            cells.append(f"<td>{int(getter(col) or 0)}</td>")
+        return "<tr>" + "".join(cells) + "</tr>"
+
+    parts.append(_row("Уникальных багов", lambda c: totals_by_build.get(c, 0)))
+    parts.append(_row("Кейсов с багом", lambda c: cases_with.get(c, 0)))
+    parts.append(_row("Кейсов без бага", lambda c: cases_without.get(c, 0)))
+    parts.append(_row("Fail-кейсов с багом", lambda c: failed_with.get(c, 0)))
+    parts.append(_row("Fail-кейсов без бага", lambda c: failed_without.get(c, 0)))
+    parts.append("</tbody></table>")
+
+    # 2. Топ-N
+    parts.append(f"<h4>Топ багов (до {_DEFECT_TOP_LIMIT})</h4>")
+    top_keys = keys_ordered[:_DEFECT_TOP_LIMIT]
+    parts.append("<table class='weekly-defects-table weekly-defects-top'>")
+    parts.append(
+        "<thead><tr>"
+        "<th>Ключ</th><th>Summary</th><th>Priority</th><th>Status</th>"
+        "<th>Type</th><th>Кейсов</th><th>Билдов</th>"
+        "</tr></thead><tbody>"
+    )
+    for key in top_keys:
+        entry = meta.get(key, {}) or {}
+        parts.append(
+            "<tr>"
+            f"<td class='weekly-jira-key-cell'>{_weekly_jira_key_span_html(key)}</td>"
+            f"<td>{_jira_summary_cell_html(entry.get('summary', ''))}</td>"
+            f"<td>{_jira_priority_lozenge_html(entry.get('priority', ''))}</td>"
+            f"<td>{_jira_status_lozenge_html(entry.get('status', ''))}</td>"
+            f"<td>{_jira_issuetype_chip_html(entry.get('issuetype', ''))}</td>"
+            f"<td style='text-align:center;'>{int(bug_total_cases.get(key, 0))}</td>"
+            f"<td style='text-align:center;'>{int(bug_builds_count.get(key, 0))}</td>"
+            "</tr>"
+        )
+    parts.append("</tbody></table>")
+
+    # 3. Матрица «баг x билд»
+    parts.append("<h4>Матрица «баг × билд»</h4>")
+    parts.append("<table class='weekly-defects-table weekly-defects-matrix'>")
+    # <colgroup>: «Ключ» ~10%, «Priority» ~10%, build-колонки делят ~30%
+    # поровну, остаток (~50%) уходит на «Summary». Ширины зеркалят матрицу
+    # по габаритам с таблицей «Score по сценариям» выше.
+    n_builds_matrix = len(column_labels)
+    if n_builds_matrix > 0:
+        key_pct = 10.0
+        priority_pct = 10.0
+        builds_total_pct = 30.0
+        build_pct = builds_total_pct / n_builds_matrix
+        summary_pct = 100.0 - key_pct - priority_pct - build_pct * n_builds_matrix
+        col_tags = [
+            f"<col style='width:{key_pct:.2f}%'>",
+            f"<col style='width:{summary_pct:.2f}%'>",
+            f"<col style='width:{priority_pct:.2f}%'>",
+        ]
+        col_tags.extend(
+            f"<col style='width:{build_pct:.2f}%'>" for _ in range(n_builds_matrix)
+        )
+        parts.append("<colgroup>" + "".join(col_tags) + "</colgroup>")
+    matrix_header = (
+        "<thead><tr><th>Ключ</th><th>Summary</th><th>Priority</th>"
+        + "".join(f"<th>{html.escape(label)}</th>" for label in column_labels)
+        + "</tr></thead><tbody>"
+    )
+    parts.append(matrix_header)
+    for key in keys_ordered:
+        entry = meta.get(key, {}) or {}
+        cells = [
+            f"<td class='weekly-jira-key-cell'>{_weekly_jira_key_span_html(key)}</td>",
+            f"<td>{_jira_summary_cell_html(entry.get('summary', ''))}</td>",
+            f"<td>{_jira_priority_lozenge_html(entry.get('priority', ''))}</td>",
+        ]
+        row_map = matrix.get(key, {}) or {}
+        for col in column_labels:
+            value = int(row_map.get(col, 0))
+            cells.append(
+                f"<td class='matrix-num'>{value if value > 0 else '—'}</td>"
+            )
+        parts.append("<tr>" + "".join(cells) + "</tr>")
+    parts.append("</tbody></table>")
+
+    # 4. Hot bugs
+    if hot_bugs:
+        links = ", ".join(_weekly_jira_key_span_html(key) for key in hot_bugs)
+        parts.append(
+            "<p class='weekly-defects-hot'>"
+            "<strong>Горячие баги (в подряд идущих билдах):</strong> "
+            f"{links}"
+            "</p>"
+        )
+
+    parts.append("</div>")
+    return "\n".join(parts)
+
+
+def _weekly_defect_analytics_wiki(
+    defect_analytics: dict[str, Any] | None,
+    defect_meta: dict[str, dict[str, str]] | None,
+    column_labels: list[str],
+) -> str:
+    analytics = defect_analytics or {}
+    keys_ordered = list(analytics.get("keys_ordered") or [])
+    keys_ordered = _filter_keys_by_issuetype(keys_ordered, defect_meta)
+    if not keys_ordered:
+        return "_В процессе написания_"
+
+    matrix = analytics.get("matrix") or {}
+    bug_total_cases = analytics.get("bug_total_cases") or {}
+    bug_builds_count = analytics.get("bug_builds_count") or {}
+    totals_by_build = analytics.get("totals_by_build") or {}
+    cases_with = analytics.get("cases_with_bug_by_build") or {}
+    cases_without = analytics.get("cases_without_bug_by_build") or {}
+    failed_with = analytics.get("failed_cases_with_bug_by_build") or {}
+    failed_without = analytics.get("failed_cases_without_bug_by_build") or {}
+    hot_bugs = [k for k in (analytics.get("hot_bugs") or []) if k in keys_ordered]
+    meta = defect_meta or {}
+
+    parts: list[str] = []
+
+    # 1. Сводка
+    parts.append("h4. Сводка")
+    header_cells = ["Метрика"] + list(column_labels)
+    parts.append("|| " + " || ".join(_wiki_escape(c) for c in header_cells) + " ||")
+
+    def _row(label: str, source: dict[str, int]) -> str:
+        cells = [label] + [str(int(source.get(c, 0))) for c in column_labels]
+        return "| " + " | ".join(_wiki_escape(c) for c in cells) + " |"
+
+    parts.append(_row("Уникальных багов", totals_by_build))
+    parts.append(_row("Кейсов с багом", cases_with))
+    parts.append(_row("Кейсов без бага", cases_without))
+    parts.append(_row("Fail-кейсов с багом", failed_with))
+    parts.append(_row("Fail-кейсов без бага", failed_without))
+    parts.append("")
+
+    # 2. Топ
+    parts.append(f"h4. Топ багов (до {_DEFECT_TOP_LIMIT})")
+    parts.append(
+        "|| Ключ || Summary || Priority || Status || Type || Кейсов || Билдов ||"
+    )
+    for key in keys_ordered[:_DEFECT_TOP_LIMIT]:
+        entry = meta.get(key, {}) or {}
+        cells = [
+            _weekly_jira_key_wiki(key),
+            _wiki_escape(entry.get("summary", "")) or " ",
+            _wiki_escape(entry.get("priority", "")) or " ",
+            _wiki_escape(entry.get("status", "")) or " ",
+            _wiki_escape(entry.get("issuetype", "")) or " ",
+            str(int(bug_total_cases.get(key, 0))),
+            str(int(bug_builds_count.get(key, 0))),
+        ]
+        parts.append("| " + " | ".join(cells) + " |")
+    parts.append("")
+
+    # 3. Матрица
+    parts.append("h4. Матрица «баг × билд»")
+    matrix_header = ["Ключ", "Summary", "Priority"] + list(column_labels)
+    parts.append("|| " + " || ".join(_wiki_escape(c) for c in matrix_header) + " ||")
+    for key in keys_ordered:
+        entry = meta.get(key, {}) or {}
+        row_map = matrix.get(key, {}) or {}
+        cells = [
+            _weekly_jira_key_wiki(key),
+            _wiki_escape(entry.get("summary", "")) or " ",
+            _wiki_escape(entry.get("priority", "")) or " ",
+        ]
+        for col in column_labels:
+            value = int(row_map.get(col, 0))
+            cells.append(f"*{value}*" if value > 0 else "—")
+        parts.append("| " + " | ".join(cells) + " |")
+
+    # 4. Hot bugs
+    if hot_bugs:
+        parts.append("")
+        links = ", ".join(_weekly_jira_key_wiki(key) for key in hot_bugs)
+        parts.append(
+            "{warning:title=Горячие баги}\n"
+            f"В подряд идущих билдах: {links}\n"
+            "{warning}"
+        )
+
+    return "\n".join(parts)
 
 
 def render_weekly_html_report(
@@ -3861,15 +5689,40 @@ def render_weekly_html_report(
     cell_all_not_executed: list[list[bool]] | None = None,
     cell_all_blocked: list[list[bool]] | None = None,
     *,
+    column_status_counts: dict[str, dict[str, int]] | None = None,
+    defect_keys: list[str] | None = None,
+    cycle_keys_by_label: dict[str, list[dict[str, Any]]] | None = None,
+    defect_analytics: dict[str, Any] | None = None,
+    defect_meta: dict[str, dict[str, str]] | None = None,
     template_dir: str | None = None,
     folder_id_resolve: str | None = None,
     folder_id_mapping: str = "",
     folder_name_mapping: str = "",
+    best_branch_column: dict[str, Any] | None = None,
 ) -> str:
     labels = list(weekday_labels)
+    best_column = best_branch_column or {}
+    best_title = str(best_column.get("title") or "").strip()
+    has_best_column = bool(best_title)
+    data_labels = ([best_title] if has_best_column else []) + labels
+    best_scenario_map = (
+        best_column.get("scenario_passed_by_row")
+        if isinstance(best_column.get("scenario_passed_by_row"), dict)
+        else {}
+    )
+    best_overall_counts = (
+        best_column.get("overall_counts")
+        if isinstance(best_column.get("overall_counts"), dict)
+        else {}
+    )
+    best_cycle_keys = best_column.get("cycle_keys")
+    if not isinstance(best_cycle_keys, list):
+        best_cycle_keys = []
     title_text = _weekly_matrix_title_text(week_start, weekday_labels)
     header_cells = ["<th>Тестовый цикл</th>", "<th>Всего кейсов</th>"]
-    header_cells.extend(f"<th>{html.escape(label)}</th>" for label in labels)
+    header_cells.extend(f"<th>{html.escape(label)}</th>" for label in data_labels)
+    builds_html = _weekly_builds_html_list(labels)
+    builds_wiki = _weekly_builds_wiki_list(labels)
     preamble = _format_readable_html_preamble(
         template_dir,
         "weekly",
@@ -3877,6 +5730,8 @@ def render_weekly_html_report(
         folder_id_mapping,
         folder_name_mapping,
         week_start,
+        week_builds_html=builds_html,
+        week_builds_wiki=builds_wiki,
     )
     sections = [
         "<!doctype html>",
@@ -3885,7 +5740,11 @@ def render_weekly_html_report(
         (
             "<style>"
             "body{font-family:Arial,sans-serif;margin:24px;}"
-            "h1{margin-bottom:8px;}table{border-collapse:collapse;width:100%;margin-bottom:16px;table-layout:fixed;}"
+            "h1{margin-bottom:8px;}"
+            "h2{margin-top:24px;margin-bottom:8px;font-weight:700;}"
+            "h3{margin-top:20px;margin-bottom:8px;font-weight:700;}"
+            "h4{margin-top:14px;margin-bottom:6px;font-weight:600;}"
+            "table{border-collapse:collapse;width:100%;margin-bottom:16px;table-layout:fixed;}"
             "th,td{border:1px solid #d6d6d6;padding:6px 8px;text-align:left;vertical-align:top;overflow-wrap:anywhere;word-wrap:break-word;}"
             "th{background:#f0f2f5;font-weight:600;}.passed-count-cell{font-weight:400;text-align:center;}"
             ".total-cases-cell{text-align:center;}"
@@ -3893,6 +5752,29 @@ def render_weekly_html_report(
             ".group-total-row td:not(:first-child){text-align:center;}"
             ".scenario-sep td{border:none;height:8px;padding:0;background:transparent;}"
             ".report-preamble{margin:12px 0 20px;}"
+            ".daily-pie-wrap{display:flex;flex-wrap:wrap;align-items:flex-start;gap:16px;margin:12px 0;}"
+            ".pie-legend{display:flex;flex-wrap:wrap;gap:12px;align-items:center;font-size:13px;max-width:520px;}"
+            ".pie-swatch{display:inline-block;width:12px;height:12px;border-radius:2px;margin-right:6px;vertical-align:middle;}"
+            ".pie-empty{color:#666;margin:8px 0;}"
+            ".weekly-overall-grid{display:flex;flex-wrap:wrap;gap:24px;align-items:flex-start;margin:12px 0 16px;}"
+            ".weekly-overall-cell{flex:1 1 240px;min-width:240px;max-width:360px;}"
+            ".weekly-overall-cell h4{margin:0 0 6px;}"
+            ".weekly-defects-list{margin:8px 0 16px;padding-left:24px;}"
+            ".weekly-defects-jira{margin:12px 0 20px;}"
+            ".weekly-defects-table{font-size:14px;}"
+            ".weekly-defects-table th{background:#f4f5f7;color:#42526e;font-weight:600;}"
+            ".weekly-defects-matrix{table-layout:fixed;width:100%;}"
+            ".weekly-defects-matrix td,.weekly-defects-matrix th{padding:4px 6px;}"
+            ".weekly-defects-matrix .matrix-num{text-align:center;font-weight:700;}"
+            ".weekly-jira-key-cell{white-space:nowrap;vertical-align:middle;width:1%;}"
+            ".weekly-jira-key-link{font-family:ui-monospace,Consolas,monospace;font-size:13px;"
+            "font-weight:600;color:#0052cc;text-decoration:none;background:#e9f2ff;"
+            "padding:2px 6px;border-radius:3px;border:1px solid #b3d4ff;}"
+            ".weekly-jira-key-link:hover{text-decoration:underline;}"
+            ".weekly-jira-summary{color:#172b4d;font-size:13px;line-height:1.45;}"
+            ".weekly-jira-summary-empty{color:#6b778c;}"
+            ".weekly-defects-hot .weekly-jira-key-link{margin-right:4px;}"
+            ".jira-lozenge{vertical-align:middle;}"
             "</style>"
         ),
         "</head><body>",
@@ -3900,9 +5782,77 @@ def render_weekly_html_report(
     ]
     if preamble:
         sections.append(preamble)
+    sections.append("<h2 id='scenarios'><strong>3. Результаты тестирования</strong></h2>")
+
+    sections.append("<h3 id='overall-score'><strong>Общий score</strong></h3>")
+    counts_by_label = column_status_counts or {}
+    cycle_keys_map = cycle_keys_by_label or {}
+    if data_labels:
+        sections.append("<div class='weekly-overall-grid'>")
+        if has_best_column:
+            cycle_keys_attr = ""
+            if best_cycle_keys:
+                cycle_keys_attr = (
+                    " data-zephyr-cycle-keys=\""
+                    + html.escape(
+                        json.dumps(best_cycle_keys, ensure_ascii=True),
+                        quote=True,
+                    )
+                    + "\""
+                )
+            sections.append(
+                f"<div class='weekly-overall-cell'{cycle_keys_attr}>"
+                f"<h4>{html.escape(best_title)}</h4>"
+                f"{_daily_status_pie_svg(best_overall_counts)}"
+                "</div>"
+            )
+        for label in labels:
+            counts = counts_by_label.get(label, {}) or {}
+            cycle_keys = cycle_keys_map.get(label) or []
+            cycle_keys_attr = ""
+            if cycle_keys:
+                cycle_keys_attr = (
+                    " data-zephyr-cycle-keys=\""
+                    + html.escape(
+                        json.dumps(cycle_keys, ensure_ascii=True),
+                        quote=True,
+                    )
+                    + "\""
+                )
+            sections.append(
+                f"<div class='weekly-overall-cell'{cycle_keys_attr}>"
+                f"<h4>{html.escape(str(label))}</h4>"
+                f"{_daily_status_pie_svg(counts)}"
+                "</div>"
+            )
+        sections.append("</div>")
+    else:
+        sections.append("<p class='pie-empty'>Нет данных по статусам</p>")
+
+    sections.append("<h3 id='scenario-score'><strong>Score по сценариям</strong></h3>")
+    # Compact build columns by ~30%: redistribute the saved width to
+    # "Тестовый цикл" (long titles) and "Всего кейсов".
+    n_builds = len(data_labels)
+    if n_builds > 0:
+        equal_pct = 100.0 / (n_builds + 2)
+        build_pct = equal_pct * 0.7
+        remain_pct = 100.0 - build_pct * n_builds
+        cycle_pct = remain_pct * 0.78
+        total_pct = remain_pct - cycle_pct
+        col_tags = [
+            f"<col style='width:{cycle_pct:.2f}%'>",
+            f"<col style='width:{total_pct:.2f}%'>",
+        ]
+        col_tags.extend(
+            f"<col style='width:{build_pct:.2f}%'>" for _ in range(n_builds)
+        )
+        colgroup_html = "<colgroup>" + "".join(col_tags) + "</colgroup>"
+    else:
+        colgroup_html = ""
     sections.extend(
         [
             "<table>",
+            colgroup_html,
             "<thead><tr>" + "".join(header_cells) + "</tr></thead><tbody>",
         ]
     )
@@ -3916,12 +5866,18 @@ def render_weekly_html_report(
                     f"{html.escape(row[1])}</td>"
                 ),
             ]
+            data_values: list[str] = []
+            if has_best_column:
+                data_values.append(str(best_scenario_map.get(str(row[0] or "").strip(), 0)))
+            data_values.extend(
+                str(row[2 + idx] if 2 + idx < len(row) else "0") for idx in range(len(labels))
+            )
             total_cells.extend(
                 (
                     "<td style='font-weight:700;background:#ffffff;color:#1f2328;text-align:center;'>"
-                    f"{html.escape(row[2 + idx] if 2 + idx < len(row) else '0')}</td>"
+                    f"{html.escape(value)}</td>"
                 )
-                for idx in range(len(labels))
+                for value in data_values
             )
             sections.append(
                 (
@@ -3942,10 +5898,18 @@ def render_weekly_html_report(
             if cell_all_blocked and row_idx < len(cell_all_blocked)
             else []
         )
-        for idx in range(len(labels)):
-            passed_value = int(row[2 + idx]) if 2 + idx < len(row) else 0
-            all_ne = bool(ne_row[idx]) if idx < len(ne_row) else False
-            all_blocked = bool(blocked_row[idx]) if idx < len(blocked_row) else False
+        for idx in range(len(data_labels)):
+            if has_best_column and idx == 0:
+                passed_value = int(best_scenario_map.get(str(row[0] or "").strip(), 0))
+                all_ne = False
+                all_blocked = False
+            else:
+                regular_idx = idx - (1 if has_best_column else 0)
+                passed_value = int(row[2 + regular_idx]) if 2 + regular_idx < len(row) else 0
+                all_ne = bool(ne_row[regular_idx]) if regular_idx < len(ne_row) else False
+                all_blocked = (
+                    bool(blocked_row[regular_idx]) if regular_idx < len(blocked_row) else False
+                )
             passed_cells.append(
                 "<td class='passed-count-cell' "
                 f"style='background:{_passed_count_color(passed_value, all_not_executed=all_ne, all_blocked=all_blocked)};"
@@ -3962,7 +5926,49 @@ def render_weekly_html_report(
                 + "</tr>"
             )
         )
-    sections.extend(["</tbody></table>", "</body></html>"])
+    # Grand total across detail rows (skip "Итого: <group>" subtotals to
+    # avoid double-counting).
+    if rows:
+        detail_rows = [r for r in rows if not str(r[0]).startswith("Итого:")]
+        total_cases_grand = sum(int(r[1]) for r in detail_rows if len(r) > 1)
+        passed_grand: list[int] = []
+        if has_best_column:
+            passed_grand.append(
+                sum(int(best_scenario_map.get(str(r[0] or "").strip(), 0)) for r in detail_rows)
+            )
+        passed_grand.extend(
+            sum(int(r[2 + idx]) for r in detail_rows if 2 + idx < len(r))
+            for idx in range(len(labels))
+        )
+        grand_cells = [
+            "<td style='font-weight:700;background:#eef1f5;color:#1f2328;'>Итого</td>",
+            (
+                "<td class='total-cases-cell' "
+                "style='font-weight:700;background:#eef1f5;color:#1f2328;text-align:center;'>"
+                f"{total_cases_grand}</td>"
+            ),
+        ]
+        grand_cells.extend(
+            (
+                "<td style='font-weight:700;background:#eef1f5;color:#1f2328;text-align:center;'>"
+                f"{value}</td>"
+            )
+            for value in passed_grand
+        )
+        sections.append(
+            "<tr class='grand-total-row'>" + "".join(grand_cells) + "</tr>"
+        )
+    sections.append("</tbody></table>")
+
+    sections.append("<h3 id='defects'><strong>Заведённые дефекты</strong></h3>")
+    if defect_analytics and (defect_analytics.get("keys_ordered") or []):
+        sections.append(
+            _weekly_defect_analytics_html(defect_analytics, defect_meta, labels)
+        )
+    else:
+        sections.append(_weekly_defects_html_block(defect_keys or []))
+
+    sections.append("</body></html>")
     return "\n".join(sections)
 
 
@@ -3971,13 +5977,34 @@ def render_weekly_wiki_report(
     weekday_labels: list[str],
     rows: list[list[str]],
     *,
+    column_status_counts: dict[str, dict[str, int]] | None = None,
+    defect_keys: list[str] | None = None,
+    defect_analytics: dict[str, Any] | None = None,
+    defect_meta: dict[str, dict[str, str]] | None = None,
     template_dir: str | None = None,
     folder_id_resolve: str | None = None,
     folder_id_mapping: str = "",
     folder_name_mapping: str = "",
+    best_branch_column: dict[str, Any] | None = None,
 ) -> str:
     title_text = _weekly_matrix_title_text(week_start, weekday_labels)
     labels = list(weekday_labels)
+    best_column = best_branch_column or {}
+    best_title = str(best_column.get("title") or "").strip()
+    has_best_column = bool(best_title)
+    data_labels = ([best_title] if has_best_column else []) + labels
+    best_scenario_map = (
+        best_column.get("scenario_passed_by_row")
+        if isinstance(best_column.get("scenario_passed_by_row"), dict)
+        else {}
+    )
+    best_overall_counts = (
+        best_column.get("overall_counts")
+        if isinstance(best_column.get("overall_counts"), dict)
+        else {}
+    )
+    builds_html = _weekly_builds_html_list(labels)
+    builds_wiki = _weekly_builds_wiki_list(labels)
     lines = [f"h1. {_wiki_escape(title_text)}", ""]
     wiki_pre = _format_readable_wiki_preamble(
         template_dir,
@@ -3986,21 +6013,64 @@ def render_weekly_wiki_report(
         folder_id_mapping,
         folder_name_mapping,
         week_start,
+        week_builds_html=builds_html,
+        week_builds_wiki=builds_wiki,
     )
     if wiki_pre:
         lines.extend(wiki_pre.splitlines())
         lines.append("")
+
+    lines.append("{anchor:scenarios}")
+    lines.append("h2. *3. Результаты тестирования*")
+    lines.append("")
+
+    lines.append("{anchor:overall_score}")
+    lines.append("h3. *Общий score*")
+    lines.append("")
+    counts_by_label = column_status_counts or {}
+    if data_labels:
+        # One {chart} macro per build, stacked vertically — same approach as
+        # the daily wiki report. Side-by-side layout requires PNG attachments
+        # and is handled by the Confluence publisher (HTML -> storage).
+        if has_best_column:
+            lines.append(f"h4. {_wiki_escape(best_title)}")
+            best_chart = _daily_status_chart_wiki_block(best_overall_counts)
+            if best_chart:
+                lines.extend(best_chart.splitlines())
+            else:
+                lines.append("_Нет данных по статусам_")
+            lines.append("")
+        for label in labels:
+            counts = counts_by_label.get(label, {}) or {}
+            lines.append(f"h4. {_wiki_escape(str(label))}")
+            chart_block = _daily_status_chart_wiki_block(counts)
+            if chart_block:
+                lines.extend(chart_block.splitlines())
+            else:
+                lines.append("_Нет данных по статусам_")
+            lines.append("")
+    else:
+        lines.append("_Нет данных по статусам_")
+        lines.append("")
+
+    lines.append("{anchor:scenario_score}")
+    lines.append("h3. *Score по сценариям*")
+    lines.append("")
     header_cells = ["Тестовый цикл", "Всего кейсов"]
-    header_cells.extend(f"{_wiki_escape(label)}" for label in labels)
+    header_cells.extend(f"{_wiki_escape(label)}" for label in data_labels)
     lines.append("|| " + " || ".join(header_cells) + " ||")
     for row in rows:
         if str(row[0]).startswith("Итого:"):
             row_values = [f"*{row[0]}*", f"*{row[1]}*"]
+            if has_best_column:
+                row_values.append(f"*{best_scenario_map.get(str(row[0] or '').strip(), 0)}*")
             for idx in range(len(labels)):
                 row_values.append(f"*{row[2 + idx] if 2 + idx < len(row) else '0'}*")
             lines.append("| " + " | ".join(_wiki_escape(str(value)) for value in row_values) + " |")
             continue
         row_values = [row[0], row[1]]
+        if has_best_column:
+            row_values.append(str(best_scenario_map.get(str(row[0] or "").strip(), 0)))
         for idx in range(len(labels)):
             row_values.append(row[2 + idx] if 2 + idx < len(row) else "0")
         lines.append(
@@ -4008,6 +6078,37 @@ def render_weekly_wiki_report(
             + " | ".join(_wiki_escape(str(value)) for value in row_values)
             + " |"
         )
+    if rows:
+        detail_rows = [r for r in rows if not str(r[0]).startswith("Итого:")]
+        total_cases_grand = sum(int(r[1]) for r in detail_rows if len(r) > 1)
+        passed_grand: list[int] = []
+        if has_best_column:
+            passed_grand.append(
+                sum(int(best_scenario_map.get(str(r[0] or "").strip(), 0)) for r in detail_rows)
+            )
+        passed_grand.extend(
+            sum(int(r[2 + idx]) for r in detail_rows if 2 + idx < len(r))
+            for idx in range(len(labels))
+        )
+        grand_values = [f"*Итого*", f"*{total_cases_grand}*"]
+        for value in passed_grand:
+            grand_values.append(f"*{value}*")
+        lines.append(
+            "| " + " | ".join(_wiki_escape(str(v)) for v in grand_values) + " |"
+        )
+    lines.append("")
+
+    lines.append("{anchor:defects}")
+    lines.append("h3. *Заведённые дефекты*")
+    lines.append("")
+    if defect_analytics and (defect_analytics.get("keys_ordered") or []):
+        defects_block = _weekly_defect_analytics_wiki(
+            defect_analytics, defect_meta, labels
+        )
+    else:
+        defects_block = _weekly_defects_wiki_block(defect_keys or [])
+    if defects_block:
+        lines.extend(defects_block.splitlines())
     lines.append("")
     return "\n".join(lines)
 
@@ -4021,11 +6122,17 @@ def write_weekly_readable_reports(
     cell_all_not_executed: list[list[bool]] | None = None,
     cell_all_blocked: list[list[bool]] | None = None,
     *,
+    column_status_counts: dict[str, dict[str, int]] | None = None,
+    defect_keys: list[str] | None = None,
+    cycle_keys_by_label: dict[str, list[dict[str, Any]]] | None = None,
+    defect_analytics: dict[str, Any] | None = None,
+    defect_meta: dict[str, dict[str, str]] | None = None,
     template_dir: str | None = None,
     folder_id_resolve: str | None = None,
     folder_id_mapping: str = "",
     folder_name_mapping: str = "",
     filename_suffix: str = "",
+    best_branch_column: dict[str, Any] | None = None,
 ) -> list[str]:
     os.makedirs(output_dir, exist_ok=True)
     week_label = week_start.isoformat() if week_start else "unknown_week"
@@ -4039,10 +6146,16 @@ def write_weekly_readable_reports(
             rows,
             cell_all_not_executed=cell_all_not_executed,
             cell_all_blocked=cell_all_blocked,
+            column_status_counts=column_status_counts,
+            defect_keys=defect_keys,
+            cycle_keys_by_label=cycle_keys_by_label,
+            defect_analytics=defect_analytics,
+            defect_meta=defect_meta,
             template_dir=template_dir,
             folder_id_resolve=folder_id_resolve,
             folder_id_mapping=folder_id_mapping,
             folder_name_mapping=folder_name_mapping,
+            best_branch_column=best_branch_column,
         )
         if _write_text_if_changed(html_path, html_body):
             updated_paths.append(html_path)
@@ -4052,10 +6165,15 @@ def write_weekly_readable_reports(
             week_start,
             weekday_labels,
             rows,
+            column_status_counts=column_status_counts,
+            defect_keys=defect_keys,
+            defect_analytics=defect_analytics,
+            defect_meta=defect_meta,
             template_dir=template_dir,
             folder_id_resolve=folder_id_resolve,
             folder_id_mapping=folder_id_mapping,
             folder_name_mapping=folder_name_mapping,
+            best_branch_column=best_branch_column,
         )
         if _write_text_if_changed(wiki_path, wiki_body):
             updated_paths.append(wiki_path)
@@ -4817,6 +6935,10 @@ def render_daily_html_report(
             ".scenario-result-cell{vertical-align:middle;text-align:center;}"
             ".scenario-result-cell .daily-pie-wrap{justify-content:center;margin:0 auto;}"
             ".scenario-result-cell .pie-legend{font-size:11px;gap:6px;max-width:280px;}"
+            ".daily-jira-key{display:inline-block;font-family:ui-monospace,Consolas,monospace;"
+            "font-size:12px;font-weight:600;color:#0052cc;text-decoration:none;background:#e9f2ff;"
+            "padding:1px 6px;margin:1px 2px 1px 0;border-radius:3px;border:1px solid #b3d4ff;}"
+            ".daily-jira-key:hover{text-decoration:underline;}"
             "</style>"
         ),
         "</head><body>",
@@ -4914,7 +7036,7 @@ def render_daily_html_report(
                     f"<td>{_status_badge_html(result_value)}</td>"
                     f"<td>{html.escape(display_date)}</td>"
                     f"<td>{_html_comment_cell(case.get('comment', ''))}</td>"
-                    f"<td>{_html_comment_cell(case.get('tasks', ''))}</td>"
+                    f"<td>{_html_tasks_cell(case.get('tasks', ''))}</td>"
                     f"{result_col}"
                     "</tr>"
                 )
@@ -5052,7 +7174,7 @@ def render_daily_wiki_report(
             res = case.get("result", case.get("test_case_status", ""))
             exd = _render_report_date(case)
             cmt = _wiki_text_with_links(case.get("comment", ""))
-            tasks = _wiki_text_with_links(case.get("tasks", ""))
+            tasks = _wiki_tasks_cell(case.get("tasks", ""))
             criterion_cell_wiki = ""
             if criterion_spans[idx] > 0:
                 criterion_cell_wiki = _wiki_escape(case.get("_criterion_display", ""))
@@ -5186,7 +7308,7 @@ def _expected_weekly_readable_html_paths(
     per_folder: bool,
 ) -> list[str]:
     paths: list[str] = []
-    for week_start, _wl, _rows, _ne, _blk in _weekly_cycle_matrix_data_all(report_data):
+    for week_start, *_rest in _weekly_cycle_matrix_data_all(report_data):
         week_label = week_start.isoformat() if week_start else "unknown_week"
         base_name = f"weekly_cycle_matrix_{week_label}"
         paths.append(os.path.join(output_dir, f"{base_name}.html"))
@@ -5195,7 +7317,7 @@ def _expected_weekly_readable_html_paths(
             folder_id_pf, _folder_name_pf = folder_key
             suffix = f"_folder_{folder_id_pf}"
             single_folder_data = {folder_key: payload}
-            for week_start, _wl, _rows, _ne, _blk in _weekly_cycle_matrix_data_all(
+            for week_start, *_rest in _weekly_cycle_matrix_data_all(
                 single_folder_data
             ):
                 week_label = week_start.isoformat() if week_start else "unknown_week"
@@ -5648,7 +7770,17 @@ def main() -> int:
             weekly_cycle_cell_all_ne: list[list[bool]] = []
             weekly_cycle_cell_all_blocked: list[list[bool]] = []
             weekly_cycle_matrices: list[
-                tuple[date | None, list[str], list[list[str]], list[list[bool]], list[list[bool]]]
+                tuple[
+                    date | None,
+                    list[str],
+                    list[list[str]],
+                    list[list[bool]],
+                    list[list[bool]],
+                    dict[str, dict[str, int]],
+                    list[str],
+                    dict[str, list[dict[str, str]]],
+                    dict[str, Any],
+                ]
             ] = []
             if args.weekly_cycle_matrix_output:
                 weekly_cycle_matrices = _weekly_cycle_matrix_data_all(report_data_for_matrix)
@@ -5659,6 +7791,10 @@ def main() -> int:
                         weekly_cycle_rows,
                         weekly_cycle_cell_all_ne,
                         weekly_cycle_cell_all_blocked,
+                        _weekly_cycle_status_counts,
+                        _weekly_cycle_defect_keys,
+                        _weekly_cycle_keys_by_label,
+                        _weekly_cycle_defect_analytics,
                     ) = weekly_cycle_matrices[-1]
                     # Keep the legacy output path as the latest week for compatibility.
                     latest_updated = write_weekly_cycle_matrix_csv(
@@ -5667,7 +7803,7 @@ def main() -> int:
                         weekly_cycle_rows,
                     )
                     weekly_matrix_csv_updates.append((args.weekly_cycle_matrix_output, latest_updated))
-                for week_start, weekday_labels, rows, _cell_flags, _blocked_flags in weekly_cycle_matrices:
+                for week_start, weekday_labels, rows, _cell_flags, _blocked_flags, _wcsc, _wdk, _wck, _wda in weekly_cycle_matrices:
                     week_path = _weekly_output_path_for_week(args.weekly_cycle_matrix_output, week_start)
                     week_updated = write_weekly_cycle_matrix_csv(week_path, weekday_labels, rows)
                     weekly_matrix_csv_updates.append((week_path, week_updated))
@@ -5682,9 +7818,50 @@ def main() -> int:
                         weekly_cycle_rows,
                         weekly_cycle_cell_all_ne,
                         weekly_cycle_cell_all_blocked,
+                        _weekly_cycle_status_counts,
+                        _weekly_cycle_defect_keys,
+                        _weekly_cycle_keys_by_label,
+                        _weekly_cycle_defect_analytics,
                     ) = weekly_cycle_matrices[-1]
                 selected_weekly_formats = set(args.weekly_readable_format or ["html", "wiki"])
-                for week_start, weekday_labels, rows, cell_all_ne, cell_all_blocked in weekly_cycle_matrices:
+                best_branch_context = fetch_autofleet_abtest_best_branch_context(
+                    base_url=os.getenv("ZEPHYR_BASE_URL", "").rstrip("/") or args.base_url.rstrip("/"),
+                    auth_headers=headers,
+                )
+                best_branch_name = str(best_branch_context.get("name") or "").strip()
+                best_branch_week_start = best_branch_context.get("week_start")
+                # Collect all unique defect keys across all weeks and per-folder
+                # variants, then fetch metadata from Jira once.
+                all_defect_keys: list[str] = []
+                seen_defect_keys: set[str] = set()
+                for matrix_entry in weekly_cycle_matrices:
+                    analytics = matrix_entry[8] or {}
+                    for key in analytics.get("keys_ordered", []) or []:
+                        if key not in seen_defect_keys:
+                            seen_defect_keys.add(key)
+                            all_defect_keys.append(key)
+                defect_meta = _fetch_jira_bug_metadata(
+                    all_defect_keys,
+                    base_url=os.getenv("ZEPHYR_BASE_URL", "").rstrip("/"),
+                    auth_headers=headers,
+                )
+                for (
+                    week_start,
+                    weekday_labels,
+                    rows,
+                    cell_all_ne,
+                    cell_all_blocked,
+                    column_status_counts,
+                    defect_keys,
+                    cycle_keys_by_label,
+                    defect_analytics,
+                ) in weekly_cycle_matrices:
+                    best_branch_column = _weekly_best_branch_column_context_for_week(
+                        weekly_cycle_matrices,
+                        best_branch_name=best_branch_name,
+                        best_branch_week_start=best_branch_week_start,
+                        report_week_start=week_start,
+                    )
                     weekly_readable_paths.extend(
                         write_weekly_readable_reports(
                             output_dir=args.weekly_readable_dir,
@@ -5694,7 +7871,13 @@ def main() -> int:
                             formats=selected_weekly_formats,
                             cell_all_not_executed=cell_all_ne,
                             cell_all_blocked=cell_all_blocked,
+                            column_status_counts=column_status_counts,
+                            defect_keys=defect_keys,
+                            cycle_keys_by_label=cycle_keys_by_label,
+                            defect_analytics=defect_analytics,
+                            defect_meta=defect_meta,
                             template_dir=readable_template_dir,
+                            best_branch_column=best_branch_column,
                         )
                     )
                 if args.weekly_readable_per_folder:
@@ -5709,7 +7892,17 @@ def main() -> int:
                             rows_pf,
                             cell_all_ne_pf,
                             cell_all_blocked_pf,
+                            column_status_counts_pf,
+                            defect_keys_pf,
+                            cycle_keys_by_label_pf,
+                            defect_analytics_pf,
                         ) in per_folder_matrices:
+                            best_branch_column_pf = _weekly_best_branch_column_context_for_week(
+                                weekly_cycle_matrices,
+                                best_branch_name=best_branch_name,
+                                best_branch_week_start=best_branch_week_start,
+                                report_week_start=week_start_pf,
+                            )
                             weekly_readable_paths.extend(
                                 write_weekly_readable_reports(
                                     output_dir=args.weekly_readable_dir,
@@ -5719,11 +7912,17 @@ def main() -> int:
                                     formats=selected_weekly_formats,
                                     cell_all_not_executed=cell_all_ne_pf,
                                     cell_all_blocked=cell_all_blocked_pf,
+                                    column_status_counts=column_status_counts_pf,
+                                    defect_keys=defect_keys_pf,
+                                    cycle_keys_by_label=cycle_keys_by_label_pf,
+                                    defect_analytics=defect_analytics_pf,
+                                    defect_meta=defect_meta,
                                     template_dir=readable_template_dir,
                                     folder_id_resolve=str(folder_id_pf),
                                     folder_id_mapping=str(folder_id_pf),
                                     folder_name_mapping=str(folder_name_pf),
                                     filename_suffix=suffix,
+                                    best_branch_column=best_branch_column_pf,
                                 )
                             )
                 if "html" in selected_weekly_formats:

@@ -64,6 +64,18 @@ Outputs:
   - output files:
     - `<folder_name>_<folder_id>.html` (copy/paste into Confluence editor)
     - `<folder_name>_<folder_id>.confluence.txt` (wiki-markup format)
+- readable weekly reports:
+  - `ZEPHYR_EXPORT_WEEKLY_READABLE=true`
+  - `ZEPHYR_WEEKLY_READABLE_DIR=reports/weekly_readable`
+  - `ZEPHYR_WEEKLY_READABLE_FORMATS=html,wiki`
+  - when Autofleet AB-test branch is resolved from Jira (`labels = autofleet_abtest`, build from `description` point `A`), weekly render adds a first column/card `Лучшая ветка: <branch>` in both `Общий score` and `Score по сценариям`
+  - insertion rule is strict: only for weeks with `week_start < best_branch_week_start` (week of that branch and later weeks are not modified)
+- Jira Autofleet AB-test extraction helpers (for downstream automation):
+  - `ZEPHYR_AUTOFLEET_ABTEST_ENABLED=true`
+  - `ZEPHYR_AUTOFLEET_ABTEST_JQL='labels = autofleet_abtest'`
+  - `ZEPHYR_AUTOFLEET_ABTEST_MAX_RESULTS=100`
+  - helper logic parses date from issue `summary`, compares it with Jira `created`, picks latest issue by max(date), then extracts build name from point `A` in `description` (`A)`, `A.`, `A:`, `А)` variants).
+  - by current behavior this value is not rendered into weekly HTML/wiki yet (explicitly disabled for now).
 - optional first step: create target Zephyr folder before report generation:
   - `ZEPHYR_CREATE_FOLDER_FIRST=true`
   - set one of:
