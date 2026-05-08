@@ -5154,8 +5154,114 @@ def _weekly_best_branch_column_title(branch_name: str) -> str:
     return f"Лучшая ветка: {str(branch_name or '').strip()}"
 
 
+def _jira_issue_effective_datetime(issue: dict[str, Any]) -> datetime | None:
+    fields = issue.get("fields") or {}
+    if not isinstance(fields, dict):
+        return None
+    created_dt = _coerce_utc_naive(_to_datetime(fields.get("created")))
+    summary_dt = _coerce_utc_naive(parse_date_from_summary(fields.get("summary")))
+    min_dt = datetime.min
+    effective_dt = max(created_dt or min_dt, summary_dt or min_dt)
+    if effective_dt == min_dt:
+        return None
+    return effective_dt
+
+
+_SUMMARY_BRANCH_RE = re.compile(
+    r"\b(?:nightly-dev-\d{4}[._-]\d{2}[._-]\d{2}|f/[A-Za-z0-9._/-]+)\b",
+    flags=re.IGNORECASE,
+)
+
+
+def _extract_branch_from_summary(summary: str | None) -> str:
+    text = str(summary or "").strip()
+    if not text:
+        return ""
+    match = _SUMMARY_BRANCH_RE.search(text)
+    if not match:
+        return ""
+    return match.group(0).strip()
+
+
+def _build_best_branch_schedule_from_jira(
+    issues: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Build branch change schedule activated from the next week.
+
+    Rule: when branch in Jira summary changes, this branch is used starting
+    from the following week.
+    """
+    prepared: list[tuple[datetime, datetime, dict[str, Any], str]] = []
+    min_dt = datetime.min
+    for issue in issues:
+        if not isinstance(issue, dict):
+            continue
+        fields = issue.get("fields") or {}
+        if not isinstance(fields, dict):
+            fields = {}
+        branch = _extract_branch_from_summary(fields.get("summary"))
+        if not branch:
+            branch = extract_build_from_description_point_a(fields.get("description"))
+        if not branch:
+            continue
+        effective_dt = _jira_issue_effective_datetime(issue)
+        if effective_dt is None:
+            continue
+        created_dt = _coerce_utc_naive(_to_datetime(fields.get("created"))) or min_dt
+        prepared.append((effective_dt, created_dt, issue, branch))
+    prepared.sort(key=lambda item: (item[0], item[1], str(item[2].get("key") or "")))
+
+    schedule: list[dict[str, Any]] = []
+    current_branch = ""
+    for effective_dt, _created_dt, issue, branch in prepared:
+        if branch == current_branch:
+            continue
+        current_branch = branch
+        effective_week = _release_week_start(effective_dt.date())
+        activate_week = effective_week + timedelta(days=7)
+        schedule.append(
+            {
+                "branch": branch,
+                "issue_key": str(issue.get("key") or "").strip(),
+                "effective_date": effective_dt.date(),
+                "activate_week_start": activate_week,
+            }
+        )
+    return schedule
+
+
+def _resolve_branch_for_report_week(
+    schedule: list[dict[str, Any]],
+    report_week_start: date | None,
+) -> dict[str, Any] | None:
+    if report_week_start is None:
+        return None
+    chosen: dict[str, Any] | None = None
+    for item in schedule:
+        activate_week = item.get("activate_week_start")
+        if not isinstance(activate_week, date):
+            continue
+        if activate_week <= report_week_start:
+            chosen = item
+        else:
+            break
+    return chosen
+
+
 def _weekly_best_branch_column_context_for_week(
-    weekly_cycle_matrices: list[
+    matrix_entry: tuple[
+        date | None,
+        list[str],
+        list[list[str]],
+        list[list[bool]],
+        list[list[bool]],
+        dict[str, dict[str, int]],
+        list[str],
+        dict[str, list[dict[str, str]]],
+        dict[str, Any],
+    ],
+    *,
+    all_weekly_matrices: list[
         tuple[
             date | None,
             list[str],
@@ -5168,21 +5274,29 @@ def _weekly_best_branch_column_context_for_week(
             dict[str, Any],
         ]
     ],
-    *,
     best_branch_name: str,
-    best_branch_week_start: date | None,
     report_week_start: date | None,
 ) -> dict[str, Any] | None:
-    branch_name = str(best_branch_name or "").strip()
-    if (
-        not branch_name
-        or best_branch_week_start is None
-        or report_week_start is None
-        or report_week_start > best_branch_week_start
-    ):
+    if report_week_start is None:
         return None
 
-    preferred_entry: tuple[
+    branch_name = str(best_branch_name or "").strip()
+    if not branch_name:
+        return None
+
+    (
+        _report_week,
+        _report_labels,
+        _report_rows,
+        _report_ne,
+        _report_blocked,
+        _report_counts,
+        _report_defects,
+        _report_cycle_keys,
+        _report_analytics,
+    ) = matrix_entry
+    lower_branch = branch_name.lower()
+    preferred_source: tuple[
         date | None,
         list[str],
         list[list[str]],
@@ -5194,52 +5308,91 @@ def _weekly_best_branch_column_context_for_week(
         dict[str, Any],
     ] | None = None
     preferred_index: int | None = None
-    lower_branch = branch_name.lower()
-    for entry in weekly_cycle_matrices:
-        entry_week, labels, _rows, _ne, _blocked, _counts, _defects, _keys_map, _analytics = entry
+    preferred_week: date | None = None
+    for entry in all_weekly_matrices:
+        (
+            entry_week,
+            labels,
+            _rows,
+            _ne,
+            _blocked,
+            _counts,
+            _defects,
+            _cycle_keys,
+            _analytics,
+        ) = entry
+        if isinstance(entry_week, date) and isinstance(report_week_start, date):
+            if entry_week > report_week_start:
+                continue
         for idx, label in enumerate(labels):
             if str(label or "").strip().lower() != lower_branch:
                 continue
-            if preferred_entry is None:
-                preferred_entry = entry
+            if (
+                preferred_source is None
+                or (
+                    isinstance(entry_week, date)
+                    and (preferred_week is None or entry_week > preferred_week)
+                )
+            ):
+                preferred_source = entry
                 preferred_index = idx
-            if entry_week == best_branch_week_start:
-                preferred_entry = entry
-                preferred_index = idx
-                break
-        if preferred_entry is not None and entry_week == best_branch_week_start:
+                preferred_week = entry_week if isinstance(entry_week, date) else preferred_week
             break
-    if preferred_entry is None or preferred_index is None:
-        return None
 
-    _, _labels, best_rows, _ne, _blocked, best_counts_by_label, _defects, best_cycle_keys, _analytics = (
-        preferred_entry
-    )
     scenario_passed_by_row: dict[str, int] = {}
-    for row in best_rows:
-        if not row:
-            continue
-        row_key = str(row[0] or "").strip()
-        if not row_key:
-            continue
-        value_raw = row[2 + preferred_index] if 2 + preferred_index < len(row) else "0"
-        try:
-            scenario_passed_by_row[row_key] = int(value_raw)
-        except (TypeError, ValueError):
-            scenario_passed_by_row[row_key] = 0
+    if preferred_source is not None and preferred_index is not None:
+        (
+            _src_week,
+            _src_labels,
+            source_rows,
+            _src_ne,
+            _src_blocked,
+            source_counts_by_label,
+            _src_defects,
+            source_cycle_keys_by_label,
+            _src_analytics,
+        ) = preferred_source
+        for row in source_rows:
+            if not row:
+                continue
+            row_key = str(row[0] or "").strip()
+            if not row_key:
+                continue
+            value_raw = row[2 + preferred_index] if 2 + preferred_index < len(row) else "0"
+            try:
+                scenario_passed_by_row[row_key] = int(value_raw)
+            except (TypeError, ValueError):
+                scenario_passed_by_row[row_key] = 0
+    else:
+        # Keep the explicit best-branch column visible for the week even when
+        # this exact build label is absent in matrix columns.
+        for row in _report_rows:
+            if not row:
+                continue
+            row_key = str(row[0] or "").strip()
+            if row_key:
+                scenario_passed_by_row[row_key] = 0
 
-    counts = best_counts_by_label.get(branch_name)
+    counts = None
+    if preferred_source is not None and preferred_index is not None:
+        counts = source_counts_by_label.get(branch_name)
+        if counts is None:
+            for key, value in source_counts_by_label.items():
+                if str(key or "").strip().lower() == lower_branch:
+                    counts = value
+                    break
     if counts is None:
-        for key, value in best_counts_by_label.items():
-            if str(key or "").strip().lower() == lower_branch:
-                counts = value
-                break
+        counts = {}
     return {
         "title": _weekly_best_branch_column_title(branch_name),
         "name": branch_name,
-        "overall_counts": counts or {},
+        "overall_counts": counts,
         "scenario_passed_by_row": scenario_passed_by_row,
-        "cycle_keys": best_cycle_keys.get(branch_name) or [],
+        "cycle_keys": (
+            source_cycle_keys_by_label.get(branch_name) or []
+            if preferred_source is not None and preferred_index is not None
+            else []
+        ),
     }
 
 
@@ -6967,14 +7120,13 @@ def render_daily_html_report(
             "<col style='width:22%'>"
             "<col style='width:9%'>"
             "<col style='width:8%'>"
-            "<col style='width:8%'>"
-            "<col style='width:8%'>"
-            "<col style='width:10%'>"
             "<col style='width:14%'>"
+            "<col style='width:10%'>"
+            "<col style='width:12%'>"
             "</colgroup>"
             "<thead><tr>"
             "<th>Название</th><th>Критерий валидации</th><th>Тестовый прогон</th>"
-            "<th>Статус</th><th>Дата</th><th>Комментарий</th><th>Задачи</th><th>Результат</th>"
+            "<th>Статус</th><th>Результат</th><th>Комментарий</th><th>Задачи</th>"
             "</tr></thead><tbody>"
         )
         sorted_cases, criterion_spans = _prepare_cycle_cases_with_groups(cycle)
@@ -7006,7 +7158,6 @@ def render_daily_html_report(
         else:
             for idx, case in enumerate(sorted_cases):
                 result_value = case.get("result", case.get("test_case_status", ""))
-                display_date = _render_report_date(case)
                 criterion_cell = ""
                 if criterion_spans[idx] > 0:
                     criterion_text = case.get("_criterion_display", "")
@@ -7034,10 +7185,9 @@ def render_daily_html_report(
                     f"{criterion_cell}"
                     f"<td>{cycle_cell_html}</td>"
                     f"<td>{_status_badge_html(result_value)}</td>"
-                    f"<td>{html.escape(display_date)}</td>"
+                    f"{result_col}"
                     f"<td>{_html_comment_cell(case.get('comment', ''))}</td>"
                     f"<td>{_html_tasks_cell(case.get('tasks', ''))}</td>"
-                    f"{result_col}"
                     "</tr>"
                 )
         sections.append("</tbody></table>")
@@ -7167,12 +7317,11 @@ def render_daily_wiki_report(
             cycle_url = _jira_cycle_url(cycle_key_value)
             cycle_cell_wiki = f"[{cycle_key_value}|{cycle_url}]"
         lines.append(
-            "|| Название || Критерий валидации || Тестовый прогон || Статус || Дата || Комментарий || Задачи ||"
+            "|| Название || Критерий валидации || Тестовый прогон || Статус || Результат || Комментарий || Задачи ||"
         )
         sorted_cases, criterion_spans = _prepare_cycle_cases_with_groups(cycle)
         for idx, case in enumerate(sorted_cases):
             res = case.get("result", case.get("test_case_status", ""))
-            exd = _render_report_date(case)
             cmt = _wiki_text_with_links(case.get("comment", ""))
             tasks = _wiki_tasks_cell(case.get("tasks", ""))
             criterion_cell_wiki = ""
@@ -7186,7 +7335,7 @@ def render_daily_wiki_report(
                         criterion_cell_wiki,
                         cycle_cell_wiki,
                         _wiki_status_markup(res),
-                        _wiki_escape(exd),
+                        "",
                         cmt,
                         tasks,
                     ]
@@ -7824,12 +7973,13 @@ def main() -> int:
                         _weekly_cycle_defect_analytics,
                     ) = weekly_cycle_matrices[-1]
                 selected_weekly_formats = set(args.weekly_readable_format or ["html", "wiki"])
-                best_branch_context = fetch_autofleet_abtest_best_branch_context(
+                weekly_abtest_issues = fetch_autofleet_abtest_candidates(
                     base_url=os.getenv("ZEPHYR_BASE_URL", "").rstrip("/") or args.base_url.rstrip("/"),
                     auth_headers=headers,
                 )
-                best_branch_name = str(best_branch_context.get("name") or "").strip()
-                best_branch_week_start = best_branch_context.get("week_start")
+                weekly_branch_schedule = _build_best_branch_schedule_from_jira(
+                    weekly_abtest_issues
+                )
                 # Collect all unique defect keys across all weeks and per-folder
                 # variants, then fetch metadata from Jira once.
                 all_defect_keys: list[str] = []
@@ -7856,10 +8006,23 @@ def main() -> int:
                     cycle_keys_by_label,
                     defect_analytics,
                 ) in weekly_cycle_matrices:
+                    weekly_branch_item = _resolve_branch_for_report_week(
+                        weekly_branch_schedule, week_start
+                    )
                     best_branch_column = _weekly_best_branch_column_context_for_week(
-                        weekly_cycle_matrices,
-                        best_branch_name=best_branch_name,
-                        best_branch_week_start=best_branch_week_start,
+                        (
+                            week_start,
+                            weekday_labels,
+                            rows,
+                            cell_all_ne,
+                            cell_all_blocked,
+                            column_status_counts,
+                            defect_keys,
+                            cycle_keys_by_label,
+                            defect_analytics,
+                        ),
+                        all_weekly_matrices=weekly_cycle_matrices,
+                        best_branch_name=str((weekly_branch_item or {}).get("branch") or ""),
                         report_week_start=week_start,
                     )
                     weekly_readable_paths.extend(
@@ -7897,10 +8060,23 @@ def main() -> int:
                             cycle_keys_by_label_pf,
                             defect_analytics_pf,
                         ) in per_folder_matrices:
+                            weekly_branch_item_pf = _resolve_branch_for_report_week(
+                                weekly_branch_schedule, week_start_pf
+                            )
                             best_branch_column_pf = _weekly_best_branch_column_context_for_week(
-                                weekly_cycle_matrices,
-                                best_branch_name=best_branch_name,
-                                best_branch_week_start=best_branch_week_start,
+                                (
+                                    week_start_pf,
+                                    weekday_labels_pf,
+                                    rows_pf,
+                                    cell_all_ne_pf,
+                                    cell_all_blocked_pf,
+                                    column_status_counts_pf,
+                                    defect_keys_pf,
+                                    cycle_keys_by_label_pf,
+                                    defect_analytics_pf,
+                                ),
+                                all_weekly_matrices=weekly_cycle_matrices,
+                                best_branch_name=str((weekly_branch_item_pf or {}).get("branch") or ""),
                                 report_week_start=week_start_pf,
                             )
                             weekly_readable_paths.extend(
