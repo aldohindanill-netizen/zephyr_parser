@@ -6,6 +6,22 @@ param(
 $ErrorActionPreference = "Stop"
 
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$envPath = Join-Path $ScriptDir ".env"
+if (Test-Path -LiteralPath $envPath) {
+    Get-Content -LiteralPath $envPath | ForEach-Object {
+        $line = $_.Trim()
+        if (-not $line -or $line.StartsWith('#') -or -not $line.Contains('=')) { return }
+        $parts = $line -split '=', 2
+        $name = $parts[0].Trim()
+        $value = $parts[1].Trim()
+        if (($value.StartsWith("'") -and $value.EndsWith("'")) -or
+            ($value.StartsWith('"') -and $value.EndsWith('"'))) {
+            $value = $value.Substring(1, $value.Length - 2)
+        }
+        [Environment]::SetEnvironmentVariable($name, $value, 'Process')
+    }
+}
+
 $PythonBin = if ($env:PYTHON_BIN) { $env:PYTHON_BIN } else { "py" }
 $PythonBinArgs = @()
 if (-not $env:PYTHON_BIN) {
@@ -20,7 +36,7 @@ $TokenHeader = if ($env:ZEPHYR_TOKEN_HEADER) { $env:ZEPHYR_TOKEN_HEADER } else {
 $TokenPrefix = if ($env:ZEPHYR_TOKEN_PREFIX) { $env:ZEPHYR_TOKEN_PREFIX } else { "Bearer" }
 
 if (-not $env:ZEPHYR_API_TOKEN) {
-    throw "Set ZEPHYR_API_TOKEN environment variable before running."
+    throw "Set ZEPHYR_API_TOKEN in .env or environment before running."
 }
 
 $ArgsList = @(
@@ -33,13 +49,6 @@ $ArgsList = @(
     "--page-size", $PageSize
     "--output", $Output
 )
-
-if ($env:ZEPHYR_FROM_DATE) {
-    $ArgsList += @("--from-date", $env:ZEPHYR_FROM_DATE)
-}
-if ($env:ZEPHYR_TO_DATE) {
-    $ArgsList += @("--to-date", $env:ZEPHYR_TO_DATE)
-}
 
 if ($env:ZEPHYR_EXTRA_PARAMS) {
     $env:ZEPHYR_EXTRA_PARAMS.Split(",") | ForEach-Object {

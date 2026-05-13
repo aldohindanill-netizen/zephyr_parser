@@ -48,8 +48,6 @@ STATUS_FIELD="${ZEPHYR_STATUS_FIELD:-status.name}"
 FIELDS="${ZEPHYR_FIELDS:-id,key,name,folderId,iterationId,projectVersionId,environmentId,userKeys,environmentIds,plannedStartDate,plannedEndDate,executionTime,estimatedTime,testResultStatuses,testCaseCount,issueCount,status(id,name,i18nKey,color),customFieldValues,createdOn,createdBy,updatedOn,updatedBy,owner}"
 QUERY_TEMPLATE="${ZEPHYR_QUERY_TEMPLATE:-testRun.projectId IN (${PROJECT_ID}) AND testRun.folderTreeId IN ({folder_id}) ORDER BY testRun.name ASC}"
 PROJECT_QUERY="${ZEPHYR_PROJECT_QUERY:-testRun.projectId IN (${PROJECT_ID}) ORDER BY testRun.name ASC}"
-FROM_DATE="${ZEPHYR_FROM_DATE:-}"
-TO_DATE="${ZEPHYR_TO_DATE:-}"
 DEBUG_FOLDER_FIELDS="${ZEPHYR_DEBUG_FOLDER_FIELDS:-false}"
 DISCOVERY_MODE="${ZEPHYR_DISCOVERY_MODE:-tree}"
 TREE_LEAF_ONLY="${ZEPHYR_TREE_LEAF_ONLY:-true}"
@@ -102,8 +100,6 @@ STATUS_FIELD="$(strip_cr "$STATUS_FIELD")"
 FIELDS="$(strip_cr "$FIELDS")"
 QUERY_TEMPLATE="$(strip_cr "$QUERY_TEMPLATE")"
 PROJECT_QUERY="$(strip_cr "$PROJECT_QUERY")"
-FROM_DATE="$(strip_cr "$FROM_DATE")"
-TO_DATE="$(strip_cr "$TO_DATE")"
 DEBUG_FOLDER_FIELDS="$(strip_cr "$DEBUG_FOLDER_FIELDS")"
 DISCOVERY_MODE="$(strip_cr "$DISCOVERY_MODE")"
 TREE_LEAF_ONLY="$(strip_cr "$TREE_LEAF_ONLY")"
@@ -284,13 +280,8 @@ if [[ -n "$FOLDER_PATH_REGEX" ]]; then
   cmd+=(--folder-path-regex "$FOLDER_PATH_REGEX")
 fi
 
-if [[ -n "$FROM_DATE" ]]; then
-  cmd+=(--from-date "$FROM_DATE")
-fi
-
-if [[ -n "$TO_DATE" ]]; then
-  cmd+=(--to-date "$TO_DATE")
-fi
+# Date window: zephyr_weekly_report.py reads ZEPHYR_REGENERATE_LAST_N_DAYS,
+# ZEPHYR_FROM_DATE, ZEPHYR_TO_DATE from the environment (no CLI flags needed).
 
 if [[ "$DEBUG_FOLDER_FIELDS" == "true" ]]; then
   cmd+=(--debug-folder-fields)

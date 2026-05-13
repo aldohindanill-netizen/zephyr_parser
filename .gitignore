@@ -5,6 +5,9 @@ infra/.env.nocodb-n8n
 infra/.zephyr_writeback_15m.runtime.json
 infra/.zephyr_ingest_15m.runtime.json
 weekly_zephyr_report.csv
+# run logs (stdout/stderr tee)
+logs/
+
 # generated report artifacts
 reports/by_folder/
 reports/daily_readable/

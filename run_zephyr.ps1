@@ -35,9 +35,6 @@ Get-Content -LiteralPath $envPath | ForEach-Object {
 $env:ZEPHYR_CONFLUENCE_AUTH_SCHEME = "bearer"
 
 $extraArgs = @($args)
-$hasRegenerateLast7Days = $extraArgs -contains "--regenerate-last-7-days"
-$hasFromDateOverride = $extraArgs -contains "--from-date"
-$hasToDateOverride = $extraArgs -contains "--to-date"
 
 $reportScript = Join-Path $RepoRoot "zephyr_weekly_report.py"
 $readableTemplateDir = Join-Path $RepoRoot "report_templates\readable"
@@ -91,15 +88,6 @@ if ($env:ZEPHYR_EXPORT_WEEKLY_READABLE -eq 'true') {
     if ($f -eq 'html' -or $f -eq 'wiki') {
       $cmdArgs += @("--weekly-readable-format", $f)
     }
-  }
-}
-
-if (-not $hasRegenerateLast7Days -and -not $hasFromDateOverride -and -not $hasToDateOverride) {
-  if ($env:ZEPHYR_FROM_DATE) {
-    $cmdArgs += @("--from-date", "$env:ZEPHYR_FROM_DATE")
-  }
-  if ($env:ZEPHYR_TO_DATE) {
-    $cmdArgs += @("--to-date", "$env:ZEPHYR_TO_DATE")
   }
 }
 
