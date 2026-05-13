@@ -1,0 +1,355 @@
+{
+  "name": "zephyr_writeback_15m",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 15
+            }
+          ]
+        }
+      },
+      "id": "Cron_15m",
+      "name": "Cron_15m",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        140,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "return [{json: {\n  baseUrl: 'https://jira.navio.auto',\n  token: 'replace_with_real_token',\n  updateTemplate: 'rest/tests/1.0/testresult/{test_result_id}',\n  updateMethod: 'PUT',\n  statusField: 'testResultStatusId',\n  commentField: 'comment',\n  maxAttempts: 5\n}}];"
+      },
+      "id": "Build_Config",
+      "name": "Build_Config",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        360,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT id::text AS queue_id, test_result_id, payload_json, attempt_count, operation_hash\nFROM sync_queue\nWHERE status IN ('queued', 'failed')\n  AND (next_retry_at IS NULL OR next_retry_at <= NOW())\nORDER BY created_at ASC\nLIMIT 50;",
+        "options": {}
+      },
+      "id": "Read_Queue_Postgres",
+      "name": "Read_Queue_Postgres",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        600,
+        300
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "PostgresZephyrOps",
+          "name": "PostgresZephyrOps"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "return items.map((item) => {\n  const row = item.json;\n  const payload = row.payload_json || {};\n  return {\n    json: {\n      queue_id: String(row.queue_id),\n      test_result_id: String(row.test_result_id),\n      desired_status_id: payload.desired_status_id,\n      desired_comment: payload.desired_comment || '',\n      attempt_count: Number(row.attempt_count || 0),\n      operation_hash: String(row.operation_hash || '')\n    }\n  };\n});"
+      },
+      "id": "Normalize_Queue_Row",
+      "name": "Normalize_Queue_Row",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        740,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const cfg = $items('Build_Config', 0, 0)[0].json;\nreturn items.map((item) => {\n  const row = item.json;\n  const endpoint = cfg.updateTemplate.replace('{test_result_id}', String(row.test_result_id));\n  return {\n    json: {\n      ...row,\n      request_url: `${cfg.baseUrl}/${endpoint}`,\n      request_method: cfg.updateMethod,\n      request_body: {\n        [cfg.statusField]: row.desired_status_id,\n        [cfg.commentField]: row.desired_comment || ''\n      },\n      max_attempts: cfg.maxAttempts\n    }\n  };\n});"
+      },
+      "id": "Build_Request",
+      "name": "Build_Request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        860,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "={{$json.request_method}}",
+        "url": "={{$json.request_url}}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "={{'Bearer ' + $items('Build_Config', 0, 0)[0].json.token}}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "jsonBody": "={{$json.request_body}}",
+        "options": {
+          "redirect": {
+            "redirect": {}
+          },
+          "response": {
+            "response": {
+              "responseFormat": "json"
+            }
+          }
+        }
+      },
+      "id": "Send_To_Zephyr",
+      "name": "Send_To_Zephyr",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1130,
+        300
+      ],
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "jsCode": "return items.map((item) => {\n  const j = item.json || {};\n  const err = j.error;\n  const code = Number(\n    j.statusCode ??\n    (err && err.status) ??\n    (err && err.statusCode) ??\n    0\n  );\n  const ok = !err && code >= 200 && code < 300;\n  return { json: { ...j, __http_ok: ok, __http_status: code } };\n});"
+      },
+      "id": "Classify_Http_Result",
+      "name": "Classify_Http_Result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1250,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "boolean": [
+            {
+              "value1": "={{$json.__http_ok === true}}",
+              "operation": "isTrue"
+            }
+          ]
+        }
+      },
+      "id": "Is_Success",
+      "name": "Is_Success",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1490,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "return items.map((item) => ({json: {\n  ...item.json,\n  queue_status: 'done',\n  sync_state: 'done',\n  audit_success: true\n}}));"
+      },
+      "id": "Mark_Done",
+      "name": "Mark_Done",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1720,
+        220
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "return items.map((item) => {\n  const row = item.json;\n  const attempts = Number(row.attempt_count || 0) + 1;\n  const retryDelayMin = Math.min(8, Math.pow(2, Math.max(0, attempts - 1)));\n  const nextRetry = new Date(Date.now() + retryDelayMin * 60000).toISOString();\n  const dead = attempts >= Number(row.max_attempts || 5);\n  return {json: {\n    ...row,\n    attempt_count: attempts,\n    queue_status: dead ? 'dead_letter' : 'failed',\n    sync_state: dead ? 'dead_letter' : 'failed',\n    next_retry_at: dead ? null : nextRetry,\n    audit_success: false\n  }};\n});"
+      },
+      "id": "Mark_Failed_Or_Dead",
+      "name": "Mark_Failed_Or_Dead",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1720,
+        380
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const esc = (value) => {\n  if (value === null || value === undefined) return 'NULL';\n  return `'${String(value).replace(/'/g, \"''\")}'`;\n};\n\nconst sourceItems = $items('Build_Request', 0, 0);\n\nreturn items.map((item, idx) => {\n  const row = item.json || {};\n  const src = (sourceItems[idx] && sourceItems[idx].json) ? sourceItems[idx].json : {};\n\n  const queueId = row.queue_id ?? src.queue_id ?? null;\n  const testResultId = row.test_result_id ?? src.test_result_id ?? null;\n  const requestMethod = row.request_method ?? src.request_method ?? '';\n  const requestUrl = row.request_url ?? src.request_url ?? '';\n  const requestBody = row.request_body ?? src.request_body ?? {};\n\n  const queueStatus = row.queue_status || 'failed';\n  const syncState = row.sync_state || 'failed';\n  const attemptCount = Number(row.attempt_count ?? src.attempt_count ?? 0);\n  const nextRetry = row.next_retry_at ? `${esc(row.next_retry_at)}::timestamptz` : 'NULL';\n  const errorText = row.audit_success ? 'NULL' : esc((row.error && row.error.message) ? row.error.message : 'request failed');\n  const responseStatus = Number(row.__http_status || (row.error && row.error.status) || row.statusCode || 200);\n  const responseBody = esc(row.error ? JSON.stringify(row.error) : JSON.stringify(row));\n\n  if (!queueId || !testResultId) {\n    throw new Error(`Missing queue linkage fields: queue_id=${queueId}, test_result_id=${testResultId}`);\n  }\n\n  const sql = `\n    UPDATE sync_queue\n    SET status = ${esc(queueStatus)},\n        attempt_count = ${attemptCount},\n        next_retry_at = ${nextRetry},\n        last_error = ${errorText},\n        updated_at = NOW()\n    WHERE id::text = ${esc(queueId)};\n\n    UPDATE test_results\n    SET sync_state = ${esc(syncState)},\n        sync_error = ${errorText},\n        last_synced_status_name = CASE WHEN ${esc(syncState)} = 'done' THEN desired_status_name ELSE last_synced_status_name END,\n        last_synced_comment = CASE WHEN ${esc(syncState)} = 'done' THEN desired_comment ELSE last_synced_comment END,\n        updated_at = NOW()\n    WHERE test_result_id = ${esc(testResultId)};\n\n    INSERT INTO sync_audit (\n      queue_id,\n      test_result_id,\n      request_method,\n      request_url,\n      request_body_json,\n      response_status,\n      response_body,\n      success,\n      executed_at\n    ) VALUES (\n      ${esc(queueId)}::uuid,\n      ${esc(testResultId)},\n      ${esc(requestMethod)},\n      ${esc(requestUrl)},\n      ${esc(JSON.stringify(requestBody))}::jsonb,\n      ${responseStatus},\n      ${responseBody},\n      ${row.audit_success ? 'true' : 'false'},\n      NOW()\n    );\n  `;\n\n  return { json: { ...row, queue_id: queueId, test_result_id: testResultId, sql_query: sql } };\n});"
+      },
+      "id": "Build_Persist_SQL",
+      "name": "Build_Persist_SQL",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1970,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "={{$json.sql_query}}",
+        "options": {}
+      },
+      "id": "Persist_Queue_And_Audit",
+      "name": "Persist_Queue_And_Audit",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        2230,
+        300
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "PostgresZephyrOps",
+          "name": "PostgresZephyrOps"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Cron_15m": {
+      "main": [
+        [
+          {
+            "node": "Build_Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build_Config": {
+      "main": [
+        [
+          {
+            "node": "Read_Queue_Postgres",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read_Queue_Postgres": {
+      "main": [
+        [
+          {
+            "node": "Normalize_Queue_Row",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize_Queue_Row": {
+      "main": [
+        [
+          {
+            "node": "Build_Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build_Request": {
+      "main": [
+        [
+          {
+            "node": "Send_To_Zephyr",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send_To_Zephyr": {
+      "main": [
+        [
+          {
+            "node": "Classify_Http_Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Classify_Http_Result": {
+      "main": [
+        [
+          {
+            "node": "Is_Success",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is_Success": {
+      "main": [
+        [
+          {
+            "node": "Mark_Done",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Mark_Failed_Or_Dead",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark_Done": {
+      "main": [
+        [
+          {
+            "node": "Build_Persist_SQL",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark_Failed_Or_Dead": {
+      "main": [
+        [
+          {
+            "node": "Build_Persist_SQL",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build_Persist_SQL": {
+      "main": [
+        [
+          {
+            "node": "Persist_Queue_And_Audit",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "c4bb4e06-98e5-4d8f-b27a-fcfa77336a9f",
+  "id": "zephyr_writeback_15m",
+  "tags": []
+}

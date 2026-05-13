@@ -1,0 +1,239 @@
+{
+  "name": "zephyr_writeback_realtime",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "nocodb/zephyr-writeback",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "Webhook_Input",
+      "name": "Webhook_Input",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        180,
+        280
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const body = $json.body || $json;\nconst enabled = String(body.enable_realtime ?? 'false').toLowerCase() === 'true';\nreturn [{json: {\n  body,\n  enable_realtime_num: enabled ? 1 : 0\n}}];"
+      },
+      "id": "Load_Runtime_Flags",
+      "name": "Load_Runtime_Flags",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        420,
+        160
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "number": [
+            {
+              "value1": "={{$json.enable_realtime_num}}",
+              "operation": "equal",
+              "value2": 1
+            }
+          ]
+        }
+      },
+      "id": "Realtime_Enabled",
+      "name": "Realtime_Enabled",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        420,
+        280
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const body = $json.body || $json;\nconst statusField = body.status_field || 'testResultStatusId';\nconst commentField = body.comment_field || 'comment';\nconst updateMethod = body.update_method || 'PUT';\nconst baseUrl = body.base_url || 'https://jira.navio.auto';\nconst endpointTemplate = body.update_endpoint_template || 'rest/tests/1.0/testresult/{test_result_id}';\nconst token = body.zephyr_api_token || '';\nconst testResultId = String(body.test_result_id || body.testResultId || '');\nif (!testResultId) {\n  throw new Error('Missing test_result_id in webhook payload');\n}\nconst endpoint = endpointTemplate.replace('{test_result_id}', testResultId);\nreturn [{json: {\n  request_url: `${baseUrl}/${endpoint}`,\n  request_method: updateMethod,\n  token,\n  request_body: {\n    [statusField]: body.desired_status_id,\n    [commentField]: body.desired_comment || ''\n  },\n  source_payload: body\n}}];"
+      },
+      "id": "Build_Realtime_Request",
+      "name": "Build_Realtime_Request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        670,
+        220
+      ]
+    },
+    {
+      "parameters": {
+        "method": "={{$json.request_method}}",
+        "url": "={{$json.request_url}}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "={{'Bearer ' + $json.token}}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "jsonBody": "={{$json.request_body}}",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "json"
+            }
+          }
+        }
+      },
+      "id": "Send_Realtime_Update",
+      "name": "Send_Realtime_Update",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        930,
+        220
+      ],
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "jsCode": "return [{json: {\n  response_code: 200,\n  response_body: {\n    ok: true,\n    mode: 'realtime',\n    result: $json\n  }\n}}];"
+      },
+      "id": "Build_Response_Ok",
+      "name": "Build_Response_Ok",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1170,
+        220
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "return [{json: {\n  response_code: 202,\n  response_body: {\n    ok: false,\n    reason: 'ENABLE_REALTIME_SYNC is false'\n  }\n}}];"
+      },
+      "id": "Build_Response_Disabled",
+      "name": "Build_Response_Disabled",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        920,
+        380
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseCode": "={{$json.response_code || 200}}",
+        "responseBody": "={{$json.response_body}}"
+      },
+      "id": "Respond_Result",
+      "name": "Respond_Result",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.2,
+      "position": [
+        1410,
+        300
+      ]
+    }
+  ],
+  "connections": {
+    "Webhook_Input": {
+      "main": [
+        [
+          {
+            "node": "Load_Runtime_Flags",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load_Runtime_Flags": {
+      "main": [
+        [
+          {
+            "node": "Realtime_Enabled",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Realtime_Enabled": {
+      "main": [
+        [
+          {
+            "node": "Build_Realtime_Request",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build_Response_Disabled",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build_Realtime_Request": {
+      "main": [
+        [
+          {
+            "node": "Send_Realtime_Update",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send_Realtime_Update": {
+      "main": [
+        [
+          {
+            "node": "Build_Response_Ok",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build_Response_Ok": {
+      "main": [
+        [
+          {
+            "node": "Respond_Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build_Response_Disabled": {
+      "main": [
+        [
+          {
+            "node": "Respond_Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "6ff2f2bc-c2a1-4c7a-a8e4-671859a65962",
+  "id": "zephyr_writeback_realtime",
+  "tags": []
+}
