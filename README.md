@@ -24,6 +24,19 @@ Run report via launcher:
 bash ./run_navio_folder_report.sh
 ```
 
+On **Linux or macOS**, you can use the same entry points as on Windows (after `cp .env.example .env` and filling secrets):
+
+```bash
+chmod +x run_zephyr.sh run_zephyr_weekly_report.sh run_navio_folder_report.sh
+./run_zephyr.sh
+```
+
+- **`./run_zephyr.sh`** — same behavior as `run_zephyr.ps1` (tree discovery, cycles/case steps, daily HTML/wiki, `report_templates/readable`, `--continue-on-folder-error`; weekly readable when `ZEPHYR_EXPORT_WEEKLY_READABLE=true`).
+- **`bash ./run_navio_folder_report.sh`** — full env-driven launcher (optional create-folder, execution discovery, toggles per `ZEPHYR_*` in `.env`).
+- **`./run_zephyr_weekly_report.sh`** — same as `run_zephyr_weekly_report.ps1` (SmartBear Zephyr Scale Cloud `/v2/testexecutions` with `--token` from env).
+
+Python is resolved via `PYTHON_BIN`, then `python3`, then `python`.
+
 Run Google Sheets pipeline launcher:
 
 ```bash
