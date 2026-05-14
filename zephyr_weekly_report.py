@@ -355,6 +355,27 @@ def parse_args() -> argparse.Namespace:
         help="Readable report format. Can repeat; default is both html and wiki.",
     )
     parser.add_argument(
+        "--export-build-log-report",
+        action="store_true",
+        help=(
+            "Export a standalone HTML/wiki report per folder: Jira keys from tasks, "
+            "nightly-dev build label, logviewer URLs from comments, plus reproduction line "
+            "and bullet list of all log links."
+        ),
+    )
+    parser.add_argument(
+        "--build-log-report-dir",
+        default="reports/build_log_reports",
+        help="Output directory for standalone build/log reports.",
+    )
+    parser.add_argument(
+        "--build-log-report-format",
+        action="append",
+        choices=("html", "wiki"),
+        default=[],
+        help="Standalone build log report format. Can repeat; default is both html and wiki.",
+    )
+    parser.add_argument(
         "--cycle-progress-output",
         default=None,
         help="Optional CSV path for per-cycle progress export (folder discovery mode).",
@@ -3921,7 +3942,7 @@ def nightly_dev_build_label_iso(folder_name: str) -> str | None:
     return f"{m.group(1).lower()}-{m.group(2)}-{m.group(3)}-{m.group(4)}"
 
 
-def _daily_report_build_label(folder_name: str, cycles: dict[str, Any]) -> str:
+def _build_log_report_build_label(folder_name: str, cycles: dict[str, Any]) -> str:
     parsed = nightly_dev_build_label_iso(folder_name)
     if parsed:
         return parsed
@@ -3951,11 +3972,11 @@ def _parse_jira_keys_from_tasks_field(tasks: str) -> list[str]:
     return out
 
 
-def _daily_collect_defect_log_aggregate(
+def _build_log_report_collect(
     folder_name: str, cycles: dict[str, Any]
 ) -> tuple[str, list[tuple[str, list[str]]], list[str]]:
     """(build_label, table rows as (bug_key_or_dash, urls), all_log_urls_for_folder)."""
-    build_label = _daily_report_build_label(folder_name, cycles)
+    build_label = _build_log_report_build_label(folder_name, cycles)
     bug_to_urls: dict[str, list[str]] = {}
 
     def _append_urls(bug: str, urls: list[str]) -> None:
@@ -3998,17 +4019,38 @@ def _daily_collect_defect_log_aggregate(
     return build_label, rows, all_urls
 
 
-def _daily_defect_logs_section_has_content(folder_name: str, cycles: dict[str, Any]) -> bool:
-    _build_label, rows, all_u = _daily_collect_defect_log_aggregate(folder_name, cycles)
+def _build_log_report_has_content(folder_name: str, cycles: dict[str, Any]) -> bool:
+    _build_label, rows, all_u = _build_log_report_collect(folder_name, cycles)
     return bool(rows or all_u)
 
 
-def _daily_defect_logs_section_html(folder_name: str, cycles: dict[str, Any]) -> str:
-    if not _daily_defect_logs_section_has_content(folder_name, cycles):
+def render_build_log_report_html(
+    folder_name: str,
+    cycles: dict[str, Any],
+    *,
+    folder_id: str,
+) -> str:
+    if not _build_log_report_has_content(folder_name, cycles):
         return ""
-    build_label, rows, all_urls = _daily_collect_defect_log_aggregate(folder_name, cycles)
+    build_label, rows, all_urls = _build_log_report_collect(folder_name, cycles)
+    doc_title = f"Баги, сборка и логи — {folder_name}"
     parts: list[str] = [
-        "<h3 id='sec_defect_logs'><strong>Баги, сборка и логи (из комментариев)</strong></h3>",
+        "<!doctype html>",
+        "<html><head><meta charset='utf-8'>",
+        f"<title>{html.escape(doc_title)}</title>",
+        (
+            "<style>"
+            "body{font-family:Arial,sans-serif;margin:24px;}"
+            "table{border-collapse:collapse;width:100%;margin:16px 0;}"
+            "th,td{border:1px solid #d6d6d6;padding:8px;vertical-align:top;text-align:left;}"
+            "th{background:#f0f2f5;font-weight:600;}"
+            "ul{margin:6px 0;padding-left:20px;}"
+            "</style>"
+        ),
+        "</head><body>",
+        f"<h1>{html.escape(doc_title)}</h1>",
+        f"<p><em>folder_id:</em> {html.escape(folder_id)}</p>",
+        "<h2>Баги, сборка и логи (из комментариев)</h2>",
         "<table>",
         "<thead><tr>"
         "<th>Баг (Jira)</th><th>Сборка</th><th>Ссылки logviewer</th>"
@@ -4016,7 +4058,6 @@ def _daily_defect_logs_section_html(folder_name: str, cycles: dict[str, Any]) ->
     ]
     for bug_disp, urls in rows:
         jira_cell = _html_tasks_cell(bug_disp) if bug_disp != "—" else "—"
-        url_cell = ""
         if urls:
             url_cell = "<ul>" + "".join(
                 f"<li><a href='{html.escape(u, quote=True)}' rel='noopener' target='_blank'>"
@@ -4024,7 +4065,7 @@ def _daily_defect_logs_section_html(folder_name: str, cycles: dict[str, Any]) ->
                 for u in urls
             ) + "</ul>"
         else:
-            url_cell = "<span class='pie-empty'>—</span>"
+            url_cell = "—"
         parts.append(
             "<tr>"
             f"<td>{jira_cell}</td>"
@@ -4044,16 +4085,22 @@ def _daily_defect_logs_section_html(folder_name: str, cycles: dict[str, Any]) ->
             for u in all_urls
         )
         parts.append("</ul>")
+    parts.append("</body></html>")
     return "\n".join(parts)
 
 
-def _daily_defect_logs_section_wiki(folder_name: str, cycles: dict[str, Any]) -> str:
-    if not _daily_defect_logs_section_has_content(folder_name, cycles):
+def render_build_log_report_wiki(
+    folder_name: str, cycles: dict[str, Any], *, folder_id: str
+) -> str:
+    if not _build_log_report_has_content(folder_name, cycles):
         return ""
-    build_label, rows, all_urls = _daily_collect_defect_log_aggregate(folder_name, cycles)
+    build_label, rows, all_urls = _build_log_report_collect(folder_name, cycles)
     lines: list[str] = [
-        "{anchor:sec_defect_logs}",
-        "h3. *Баги, сборка и логи (из комментариев)*",
+        f"h1. {_wiki_escape(f'Баги, сборка и логи — {folder_name}')}",
+        "",
+        f"_{_wiki_escape('folder_id')}: {_wiki_escape(folder_id)}_",
+        "",
+        "h2. *Баги, сборка и логи (из комментариев)*",
         "|| Баг (Jira) || Сборка || Ссылки logviewer ||",
     ]
     for bug_disp, urls in rows:
@@ -7499,11 +7546,7 @@ def _daily_toc_child_label(cycle: dict[str, Any]) -> str:
     return tail or stripped or "Unnamed cycle"
 
 
-def _daily_render_html_toc(
-    sorted_cycles: list[dict[str, Any]],
-    *,
-    show_defect_logs_anchor: bool = False,
-) -> str:
+def _daily_render_html_toc(sorted_cycles: list[dict[str, Any]]) -> str:
     groups = _daily_toc_groups_from_sorted_cycles(sorted_cycles)
     scenarios_anchor = "#scenarios"
     parts: list[str] = [
@@ -7512,11 +7555,6 @@ def _daily_render_html_toc(
         "<li><a href='#sec-environment'><strong>2. Условия окружения</strong></a></li>",
         f"<li><a href='{html.escape(scenarios_anchor, quote=True)}'><strong>3. Результаты тестирования</strong></a></li>",
     ]
-    if show_defect_logs_anchor:
-        parts.append(
-            "<li><a href='#sec_defect_logs'>&nbsp;&nbsp;&nbsp;&nbsp;"
-            "Баги, сборка и логи</a></li>"
-        )
     for _gid, heading, group_cycles in groups:
         first = group_cycles[0]
         anchor, _ = _daily_cycle_heading_parts(first)
@@ -8109,10 +8147,7 @@ def render_daily_html_report(
     )
     sorted_cycles = sorted(cycles.values(), key=_cycle_sort_key)
     status_counts = _daily_aggregate_case_status_counts(cycles)
-    show_defect_logs = _daily_defect_logs_section_has_content(folder_name, cycles)
-    toc_html = _daily_render_html_toc(
-        sorted_cycles, show_defect_logs_anchor=show_defect_logs
-    )
+    toc_html = _daily_render_html_toc(sorted_cycles)
     sections = [
         "<!doctype html>",
         "<html><head><meta charset='utf-8'>",
@@ -8175,9 +8210,6 @@ def render_daily_html_report(
             status_counts, extra_wrap_class="daily-pie-strip-publish"
         )
     )
-    defect_logs_html = _daily_defect_logs_section_html(folder_name, cycles)
-    if defect_logs_html:
-        sections.append(defect_logs_html)
     for cycle in sorted_cycles:
         anchor, heading_plain = _daily_cycle_heading_parts(cycle)
         heading_display = re.sub(r"^\s*\d+\.\d+\s+", "", heading_plain).strip() or heading_plain
@@ -8347,10 +8379,6 @@ def render_daily_wiki_report(
     toc_lines.append(f"* [{_wiki_escape('1. Объект тестирования')}|#sec_object]")
     toc_lines.append(f"* [{_wiki_escape('2. Условия окружения')}|#sec_environment]")
     toc_lines.append(f"* [{_wiki_escape('3. Результаты тестирования')}|#scenarios]")
-    if _daily_defect_logs_section_has_content(folder_name, cycles):
-        toc_lines.append(
-            f"** [{_wiki_escape('Баги, сборка и логи')}|#sec_defect_logs]"
-        )
     for _gid, heading, group_cycles in grouped_cycles:
         first = group_cycles[0]
         anchor, _ = _daily_cycle_heading_parts(first)
@@ -8379,10 +8407,6 @@ def render_daily_wiki_report(
     if chart_section:
         lines.append("\t")
         lines.extend(chart_section.splitlines())
-        lines.append("")
-    defect_logs_wiki = _daily_defect_logs_section_wiki(folder_name, cycles)
-    if defect_logs_wiki:
-        lines.extend(defect_logs_wiki.splitlines())
         lines.append("")
     for cycle in sorted_cycles:
         anchor, heading_plain = _daily_cycle_heading_parts(cycle)
@@ -8513,6 +8537,40 @@ def write_daily_readable_reports(
                 written_paths.append(wiki_path)
             if chart_written:
                 written_paths.append(chart_path)
+    return written_paths
+
+
+def write_build_log_reports(
+    output_dir: str,
+    report_data: dict[tuple[str, str], dict[str, Any]],
+    formats: set[str],
+) -> list[str]:
+    """Write per-folder standalone build/log reports (HTML and/or Confluence wiki)."""
+    os.makedirs(output_dir, exist_ok=True)
+    written_paths: list[str] = []
+    for (folder_id, folder_name), payload in sorted(
+        report_data.items(), key=lambda item: item[0][1]
+    ):
+        cycles = payload["cycles"]
+        fid = str(folder_id)
+        if not _build_log_report_has_content(folder_name, cycles):
+            continue
+        base_name = _build_daily_report_base_name(fid, folder_name, cycles)
+        stem = f"{base_name}_build_log"
+        if "html" in formats:
+            html_path = os.path.join(output_dir, f"{stem}.html")
+            body = render_build_log_report_html(
+                folder_name, cycles, folder_id=fid
+            )
+            if body and _write_text_if_changed(html_path, body):
+                written_paths.append(html_path)
+        if "wiki" in formats:
+            wiki_path = os.path.join(output_dir, f"{stem}.confluence.txt")
+            body = render_build_log_report_wiki(
+                folder_name, cycles, folder_id=fid
+            )
+            if body and _write_text_if_changed(wiki_path, body):
+                written_paths.append(wiki_path)
     return written_paths
 
 
@@ -8841,6 +8899,7 @@ def run_once(args: argparse.Namespace) -> int:
             case_steps_rows: list[list[str]] = []
             report_data: dict[tuple[str, str], dict[str, Any]] | None = None
             daily_readable_paths: list[str] = []
+            build_log_report_paths: list[str] = []
             daily_html_publish_paths: list[str] = []
             weekly_html_publish_paths: list[str] = []
             readable_template_dir = args.readable_template_dir or os.getenv(
@@ -8851,8 +8910,16 @@ def run_once(args: argparse.Namespace) -> int:
             confluence_cfg = _load_confluence_publish_config()
             publish_confluence_daily = bool(confluence_cfg and confluence_cfg.publish_daily)
             publish_confluence_weekly = bool(confluence_cfg and confluence_cfg.publish_weekly)
-            need_cycles_cases_data = args.export_cycles_cases or args.export_daily_readable
-            collect_case_steps = args.export_case_steps or args.export_daily_readable
+            need_cycles_cases_data = (
+                args.export_cycles_cases
+                or args.export_daily_readable
+                or args.export_build_log_report
+            )
+            collect_case_steps = (
+                args.export_case_steps
+                or args.export_daily_readable
+                or args.export_build_log_report
+            )
             total_executions = 0
             total_skipped = Counter()
             errors: list[str] = []
@@ -9169,7 +9236,7 @@ def run_once(args: argparse.Namespace) -> int:
             )
             # One aggregation for readable/matrix paths, then rolling filter **before** writing
             # daily/weekly artifacts so HTML/wiki/Confluence targets match the same date window.
-            if args.export_daily_readable or needs_report_data:
+            if args.export_daily_readable or needs_report_data or args.export_build_log_report:
                 if case_steps_rows:
                     report_data = aggregate_readable_daily_reports_from_steps(
                         case_steps_rows, cycles_cases_rows
@@ -9211,6 +9278,23 @@ def run_once(args: argparse.Namespace) -> int:
                         daily_html_publish_paths = _expected_daily_readable_html_paths(
                             args.daily_readable_dir, report_data
                         )
+            if args.export_build_log_report:
+                if not report_data:
+                    print(
+                        "Skipping build log reports: no folder payloads "
+                        "(empty cycles/case steps or outside rolling window)."
+                    )
+                else:
+                    bl_formats = set(args.build_log_report_format or ["html", "wiki"])
+                    print(
+                        f"Building standalone build log reports for {len(report_data)} "
+                        f"folder payload(s) (formats: {', '.join(sorted(bl_formats))})..."
+                    )
+                    build_log_report_paths = write_build_log_reports(
+                        output_dir=args.build_log_report_dir,
+                        report_data=report_data,
+                        formats=bl_formats,
+                    )
             cycle_progress_csv_updated: bool | None = None
             weekly_matrix_csv_updates: list[tuple[str, bool]] = []
             report_data_for_matrix = report_data or {}
@@ -9518,6 +9602,9 @@ def run_once(args: argparse.Namespace) -> int:
             if args.export_daily_readable:
                 print(f"Saved daily readable reports: {args.daily_readable_dir}")
                 print(f"Daily readable files updated: {len(daily_readable_paths)}")
+            if args.export_build_log_report:
+                print(f"Saved build log reports: {args.build_log_report_dir}")
+                print(f"Build log report files updated: {len(build_log_report_paths)}")
             if args.cycle_progress_output:
                 status = (
                     "content changed"
