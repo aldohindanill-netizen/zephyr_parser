@@ -356,13 +356,22 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--export-build-log-report",
+        dest="export_build_log_report",
         action="store_true",
+        default=True,
         help=(
-            "Export one standalone HTML/wiki page per Jira issue linked in Zephyr tasks: "
-            "title uses the Jira summary when available. For each issue, blocks "
-            "\"Воспроизводится на nightly-dev-YYYY.MM.DD:\" with logviewer links from "
-            "comments; newest build at the top. Requires the same case-step fetch as "
-            "daily readable reports."
+            "Per-Jira build log HTML/wiki export is on by default in folder discovery mode "
+            "(one page per issue; see --no-export-build-log-report). "
+            "Passing this flag is optional and only forces the feature on."
+        ),
+    )
+    parser.add_argument(
+        "--no-export-build-log-report",
+        dest="export_build_log_report",
+        action="store_false",
+        help=(
+            "Disable per-Jira build log export (standalone pages with "
+            "\"Воспроизводится на nightly-dev-…\" blocks and logviewer links)."
         ),
     )
     parser.add_argument(
