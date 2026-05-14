@@ -358,9 +358,11 @@ def parse_args() -> argparse.Namespace:
         "--export-build-log-report",
         action="store_true",
         help=(
-            "Export a standalone HTML/wiki report per folder: Jira keys from tasks, "
-            "nightly-dev build label, logviewer URLs from comments, plus reproduction line "
-            "and bullet list of all log links."
+            "Export one standalone HTML/wiki page per Jira issue linked in Zephyr tasks: "
+            "title uses the Jira summary when available. For each issue, blocks "
+            "\"Воспроизводится на nightly-dev-YYYY.MM.DD:\" with logviewer links from "
+            "comments; newest build at the top. Requires the same case-step fetch as "
+            "daily readable reports."
         ),
     )
     parser.add_argument(
@@ -3927,32 +3929,34 @@ def extract_logviewer_urls(text: str) -> list[str]:
     return out
 
 
-def nightly_dev_build_label_iso(folder_name: str) -> str | None:
-    """Return nightly-dev-YYYY-MM-DD parsed from folder name prefix, or None."""
+def _build_log_folder_nightly_display_and_date(
+    folder_name: str,
+    cycles: dict[str, Any],
+) -> tuple[str, date | None]:
+    """Label like nightly-dev-YYYY.MM.DD (as in UI) plus a sortable calendar date."""
     raw = _parse_weekly_column_label_from_folder_name(folder_name)
-    if not raw:
-        return None
-    m = re.match(
-        r"^(nightly-dev)-(\d{4})[._-](\d{2})[._-](\d{2})\b",
-        raw,
-        flags=re.IGNORECASE,
-    )
-    if not m:
-        return None
-    return f"{m.group(1).lower()}-{m.group(2)}-{m.group(3)}-{m.group(4)}"
-
-
-def _build_log_report_build_label(folder_name: str, cycles: dict[str, Any]) -> str:
-    parsed = nightly_dev_build_label_iso(folder_name)
-    if parsed:
-        return parsed
+    if raw:
+        m = re.match(
+            r"^(nightly-dev)[._-](\d{4})[._-](\d{2})[._-](\d{2})\b",
+            str(raw).strip(),
+            flags=re.IGNORECASE,
+        )
+        if m:
+            disp = f"{m.group(1).lower()}-{m.group(2)}.{m.group(3)}.{m.group(4)}"
+            d = date(int(m.group(2)), int(m.group(3)), int(m.group(4)))
+            return disp, d
     dd = _resolve_daily_title_date(cycles)
     if dd:
-        normalized = _normalize_display_date(dd)
-        if normalized:
-            return f"nightly-dev-{normalized}"
-    slug = str(folder_name or "").strip()
-    return f"nightly-dev-{slug}" if slug else "nightly-dev-unknown"
+        norm = _normalize_display_date(dd)
+        if norm:
+            try:
+                d = date.fromisoformat(norm)
+                disp = f"nightly-dev-{d.strftime('%Y.%m.%d')}"
+                return disp, d
+            except ValueError:
+                pass
+    slug = str(folder_name or "").strip() or "unknown"
+    return slug, None
 
 
 def _parse_jira_keys_from_tasks_field(tasks: str) -> list[str]:
@@ -3972,149 +3976,118 @@ def _parse_jira_keys_from_tasks_field(tasks: str) -> list[str]:
     return out
 
 
-def _build_log_report_collect(
-    folder_name: str, cycles: dict[str, Any]
-) -> tuple[str, list[tuple[str, list[str]]], list[str]]:
-    """(build_label, table rows as (bug_key_or_dash, urls), all_log_urls_for_folder)."""
-    build_label = _build_log_report_build_label(folder_name, cycles)
-    bug_to_urls: dict[str, list[str]] = {}
-
-    def _append_urls(bug: str, urls: list[str]) -> None:
-        lst = bug_to_urls.setdefault(bug, [])
-        seen_local = set(lst)
-        for u in urls:
-            if u not in seen_local:
-                seen_local.add(u)
-                lst.append(u)
-
-    all_urls: list[str] = []
-    seen_global: set[str] = set()
-    for cycle in cycles.values():
-        if not isinstance(cycle, dict):
+def _gather_jira_issue_build_log_pages(
+    report_data: dict[tuple[str, str], dict[str, Any]],
+) -> dict[str, list[tuple[str, date | None, list[str]]]]:
+    """Map Jira issue key -> blocks (build_display, sort_date, urls), newest build first."""
+    bucket: defaultdict[str, dict[str, dict[str, Any]]] = defaultdict(dict)
+    for (_folder_id, folder_name), payload in report_data.items():
+        cycles = payload.get("cycles") or {}
+        if not isinstance(cycles, dict):
             continue
-        for case in cycle.get("cases", {}).values():
-            if not isinstance(case, dict):
+        build_display, sort_d = _build_log_folder_nightly_display_and_date(folder_name, cycles)
+        for cycle in cycles.values():
+            if not isinstance(cycle, dict):
                 continue
-            text = str(case.get("logs_source_text") or case.get("comment") or "")
-            urls = extract_logviewer_urls(text)
-            for u in urls:
-                low = u.lower()
-                if low not in seen_global:
-                    seen_global.add(low)
-                    all_urls.append(u)
-            keys = _parse_jira_keys_from_tasks_field(str(case.get("tasks") or ""))
-            if keys:
-                for k in keys:
-                    _append_urls(k, urls)
-            elif urls:
-                _append_urls("", urls)
+            for case in cycle.get("cases", {}).values():
+                if not isinstance(case, dict):
+                    continue
+                text = str(case.get("logs_source_text") or case.get("comment") or "")
+                urls = extract_logviewer_urls(text)
+                if not urls:
+                    continue
+                keys = _parse_jira_keys_from_tasks_field(str(case.get("tasks") or ""))
+                for ik in keys:
+                    cell = bucket[ik].setdefault(
+                        build_display,
+                        {"sort_date": sort_d, "urls": []},
+                    )
+                    if sort_d and (
+                        cell["sort_date"] is None or sort_d > cell["sort_date"]
+                    ):
+                        cell["sort_date"] = sort_d
+                    lst: list[str] = cell["urls"]
+                    seen_lower = {x.lower() for x in lst}
+                    for u in urls:
+                        low = u.lower()
+                        if low not in seen_lower:
+                            seen_lower.add(low)
+                            lst.append(u)
+    out: dict[str, list[tuple[str, date | None, list[str]]]] = {}
+    for issue_key, by_build in bucket.items():
+        blocks: list[tuple[str, date | None, list[str]]] = []
+        for bdisp, info in by_build.items():
+            ulist = info.get("urls") or []
+            if not ulist:
+                continue
+            blocks.append((bdisp, info.get("sort_date"), ulist))
+        if not blocks:
+            continue
+        blocks.sort(
+            key=lambda row: (row[1] or date.min, row[0]),
+            reverse=True,
+        )
+        out[issue_key] = blocks
+    return out
 
-    def _bug_sort_key(bug: str) -> tuple[int, str]:
-        return (0 if bug else 1, bug.upper())
 
-    rows: list[tuple[str, list[str]]] = []
-    for bug in sorted(bug_to_urls.keys(), key=_bug_sort_key):
-        display = bug if bug else "—"
-        rows.append((display, bug_to_urls[bug]))
-    return build_label, rows, all_urls
-
-
-def _build_log_report_has_content(folder_name: str, cycles: dict[str, Any]) -> bool:
-    _build_label, rows, all_u = _build_log_report_collect(folder_name, cycles)
-    return bool(rows or all_u)
-
-
-def render_build_log_report_html(
-    folder_name: str,
-    cycles: dict[str, Any],
-    *,
-    folder_id: str,
+def render_jira_issue_build_log_html(
+    issue_key: str,
+    summary: str,
+    blocks: list[tuple[str, date | None, list[str]]],
 ) -> str:
-    if not _build_log_report_has_content(folder_name, cycles):
-        return ""
-    build_label, rows, all_urls = _build_log_report_collect(folder_name, cycles)
-    doc_title = f"Баги, сборка и логи — {folder_name}"
+    page_heading = summary.strip() if summary.strip() else issue_key
+    doc_title = f"{page_heading} ({issue_key})" if summary.strip() else issue_key
     parts: list[str] = [
         "<!doctype html>",
         "<html><head><meta charset='utf-8'>",
         f"<title>{html.escape(doc_title)}</title>",
         (
             "<style>"
-            "body{font-family:Arial,sans-serif;margin:24px;}"
-            "table{border-collapse:collapse;width:100%;margin:16px 0;}"
-            "th,td{border:1px solid #d6d6d6;padding:8px;vertical-align:top;text-align:left;}"
-            "th{background:#f0f2f5;font-weight:600;}"
-            "ul{margin:6px 0;padding-left:20px;}"
+            "body{font-family:Arial,sans-serif;margin:24px;line-height:1.45;}"
+            ".issue-key{color:#666;font-size:0.95rem;margin:-8px 0 20px;}"
+            ".blk{margin:20px 0 28px;}"
+            "ul{margin:8px 0;padding-left:22px;}"
+            "li{margin:4px 0;}"
+            "a{color:#0969da;word-break:break-all;}"
             "</style>"
         ),
         "</head><body>",
-        f"<h1>{html.escape(doc_title)}</h1>",
-        f"<p><em>folder_id:</em> {html.escape(folder_id)}</p>",
-        "<h2>Баги, сборка и логи (из комментариев)</h2>",
-        "<table>",
-        "<thead><tr>"
-        "<th>Баг (Jira)</th><th>Сборка</th><th>Ссылки logviewer</th>"
-        "</tr></thead><tbody>",
+        f"<h1>{html.escape(page_heading)}</h1>",
     ]
-    for bug_disp, urls in rows:
-        jira_cell = _html_tasks_cell(bug_disp) if bug_disp != "—" else "—"
-        if urls:
-            url_cell = "<ul>" + "".join(
-                f"<li><a href='{html.escape(u, quote=True)}' rel='noopener' target='_blank'>"
-                f"{html.escape(u)}</a></li>"
-                for u in urls
-            ) + "</ul>"
-        else:
-            url_cell = "—"
-        parts.append(
-            "<tr>"
-            f"<td>{jira_cell}</td>"
-            f"<td>{html.escape(build_label)}</td>"
-            f"<td>{url_cell}</td>"
-            "</tr>"
-        )
-    parts.append("</tbody></table>")
-    if all_urls:
-        parts.append(
-            f"<p><strong>Воспроизводится на сборке {html.escape(build_label)}</strong></p>"
-        )
+    if summary.strip():
+        parts.append(f"<p class='issue-key'>{html.escape(issue_key)}</p>")
+    for build_display, _sd, urls in blocks:
+        line = f"Воспроизводится на {build_display}:"
+        parts.append("<div class='blk'>")
+        parts.append(f"<p><strong>{html.escape(line)}</strong></p>")
         parts.append("<ul>")
         parts.extend(
             f"<li><a href='{html.escape(u, quote=True)}' rel='noopener' target='_blank'>"
             f"{html.escape(u)}</a></li>"
-            for u in all_urls
+            for u in urls
         )
         parts.append("</ul>")
+        parts.append("</div>")
     parts.append("</body></html>")
     return "\n".join(parts)
 
 
-def render_build_log_report_wiki(
-    folder_name: str, cycles: dict[str, Any], *, folder_id: str
+def render_jira_issue_build_log_wiki(
+    issue_key: str,
+    summary: str,
+    blocks: list[tuple[str, date | None, list[str]]],
 ) -> str:
-    if not _build_log_report_has_content(folder_name, cycles):
-        return ""
-    build_label, rows, all_urls = _build_log_report_collect(folder_name, cycles)
-    lines: list[str] = [
-        f"h1. {_wiki_escape(f'Баги, сборка и логи — {folder_name}')}",
-        "",
-        f"_{_wiki_escape('folder_id')}: {_wiki_escape(folder_id)}_",
-        "",
-        "h2. *Баги, сборка и логи (из комментариев)*",
-        "|| Баг (Jira) || Сборка || Ссылки logviewer ||",
-    ]
-    for bug_disp, urls in rows:
-        bug_cell = _wiki_tasks_cell(bug_disp) if bug_disp != "—" else "—"
-        if urls:
-            url_cell = "\\\\".join(f"[{_wiki_escape(u)}|{u}]" for u in urls)
-        else:
-            url_cell = "—"
-        lines.append("| " + " | ".join([bug_cell, _wiki_escape(build_label), url_cell]) + " |")
-    lines.append("")
-    if all_urls:
-        lines.append(f"h4. Воспроизводится на сборке {_wiki_escape(build_label)}")
+    page_heading = summary.strip() if summary.strip() else issue_key
+    lines: list[str] = [f"h1. {_wiki_escape(page_heading)}"]
+    if summary.strip():
+        lines.append(_wiki_escape(issue_key))
         lines.append("")
-        for u in all_urls:
+    for build_display, _sd, urls in blocks:
+        line = f"Воспроизводится на {build_display}:"
+        lines.append(f"*{_wiki_escape(line)}*")
+        lines.append("")
+        for u in urls:
             lines.append(f"* [{_wiki_escape(u)}|{u}]")
         lines.append("")
     return "\n".join(lines)
@@ -4545,6 +4518,97 @@ def _fetch_jira_bug_metadata(
                 if req.upper() == key.upper():
                     _JIRA_META_CACHE[req] = entry
                     out[req] = entry
+    return out
+
+
+_JIRA_SUMMARY_CACHE: dict[str, str] = {}
+
+
+def _fetch_jira_issue_summaries(
+    keys: list[str],
+    *,
+    base_url: str,
+    auth_headers: dict[str, str] | None,
+) -> dict[str, str]:
+    """Return issue key -> summary (best-effort; cached)."""
+    out: dict[str, str] = {}
+    eff = _jira_bug_metadata_auth_headers(auth_headers) or auth_headers
+    if not keys or not base_url or not eff:
+        for k in keys:
+            ck = str(k or "").strip()
+            if ck and ck in _JIRA_SUMMARY_CACHE:
+                out[ck] = _JIRA_SUMMARY_CACHE[ck]
+        return out
+
+    pending: list[str] = []
+    seen_upper: set[str] = set()
+    for k in keys:
+        ck = str(k or "").strip()
+        if not ck:
+            continue
+        if ck in _JIRA_SUMMARY_CACHE:
+            out[ck] = _JIRA_SUMMARY_CACHE[ck]
+            continue
+        up = ck.upper()
+        if up in seen_upper:
+            continue
+        seen_upper.add(up)
+        pending.append(ck)
+
+    chunk_size = 50
+    for start in range(0, len(pending), chunk_size):
+        chunk = pending[start : start + chunk_size]
+        jql = "key in (" + ",".join(chunk) + ")"
+        issues: list[dict[str, Any]] | None = None
+        for endpoint, call_kw in (
+            (
+                "/rest/api/2/search",
+                {
+                    "params": {
+                        "jql": jql,
+                        "fields": "summary",
+                        "maxResults": str(len(chunk)),
+                    },
+                },
+            ),
+            (
+                "/rest/api/3/search",
+                {
+                    "method": "POST",
+                    "body": {
+                        "jql": jql,
+                        "fields": ["summary"],
+                        "maxResults": len(chunk),
+                    },
+                },
+            ),
+        ):
+            try:
+                payload = request_json(base_url, endpoint, eff, **call_kw)
+            except Exception:  # noqa: BLE001
+                continue
+            if not isinstance(payload, dict):
+                continue
+            raw_issues = payload.get("issues")
+            if isinstance(raw_issues, list):
+                issues = [i for i in raw_issues if isinstance(i, dict)]
+                break
+        if not issues:
+            continue
+        for issue in issues:
+            key = str(issue.get("key") or "").strip()
+            if not key:
+                continue
+            fields = issue.get("fields") or {}
+            summary = ""
+            if isinstance(fields, dict):
+                summary = str(fields.get("summary") or "").strip()
+            _JIRA_SUMMARY_CACHE[key] = summary
+            out[key] = summary
+            for req in chunk:
+                if req.upper() == key.upper():
+                    _JIRA_SUMMARY_CACHE[req] = summary
+                    out[req] = summary
     return out
 
 
@@ -8544,31 +8608,34 @@ def write_build_log_reports(
     output_dir: str,
     report_data: dict[tuple[str, str], dict[str, Any]],
     formats: set[str],
+    *,
+    jira_base_url: str,
+    jira_auth_headers: dict[str, str] | None,
 ) -> list[str]:
-    """Write per-folder standalone build/log reports (HTML and/or Confluence wiki)."""
+    """One HTML/wiki file per Jira issue: reproduction lines per build, newest build first."""
+    pages = _gather_jira_issue_build_log_pages(report_data)
+    if not pages:
+        return []
+    summaries = _fetch_jira_issue_summaries(
+        list(pages.keys()),
+        base_url=jira_base_url,
+        auth_headers=jira_auth_headers,
+    )
     os.makedirs(output_dir, exist_ok=True)
     written_paths: list[str] = []
-    for (folder_id, folder_name), payload in sorted(
-        report_data.items(), key=lambda item: item[0][1]
-    ):
-        cycles = payload["cycles"]
-        fid = str(folder_id)
-        if not _build_log_report_has_content(folder_name, cycles):
-            continue
-        base_name = _build_daily_report_base_name(fid, folder_name, cycles)
-        stem = f"{base_name}_build_log"
+    for issue_key in sorted(pages.keys()):
+        blocks = pages[issue_key]
+        summary = summaries.get(issue_key, "")
+        safe_name = re.sub(r"[^\w.-]+", "_", issue_key.strip()) or "issue"
+        stem = f"{safe_name}_build_log"
         if "html" in formats:
             html_path = os.path.join(output_dir, f"{stem}.html")
-            body = render_build_log_report_html(
-                folder_name, cycles, folder_id=fid
-            )
+            body = render_jira_issue_build_log_html(issue_key, summary, blocks)
             if body and _write_text_if_changed(html_path, body):
                 written_paths.append(html_path)
         if "wiki" in formats:
             wiki_path = os.path.join(output_dir, f"{stem}.confluence.txt")
-            body = render_build_log_report_wiki(
-                folder_name, cycles, folder_id=fid
-            )
+            body = render_jira_issue_build_log_wiki(issue_key, summary, blocks)
             if body and _write_text_if_changed(wiki_path, body):
                 written_paths.append(wiki_path)
     return written_paths
@@ -9287,13 +9354,17 @@ def run_once(args: argparse.Namespace) -> int:
                 else:
                     bl_formats = set(args.build_log_report_format or ["html", "wiki"])
                     print(
-                        f"Building standalone build log reports for {len(report_data)} "
+                        f"Building per-issue build log reports from {len(report_data)} "
                         f"folder payload(s) (formats: {', '.join(sorted(bl_formats))})..."
                     )
+                    jira_meta_base = _resolve_weekly_jira_metadata_base(args.base_url)
+                    jira_meta_headers = _jira_bug_metadata_auth_headers(headers) or headers
                     build_log_report_paths = write_build_log_reports(
                         output_dir=args.build_log_report_dir,
                         report_data=report_data,
                         formats=bl_formats,
+                        jira_base_url=jira_meta_base,
+                        jira_auth_headers=jira_meta_headers,
                     )
             cycle_progress_csv_updated: bool | None = None
             weekly_matrix_csv_updates: list[tuple[str, bool]] = []
