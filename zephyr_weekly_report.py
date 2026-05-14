@@ -3719,6 +3719,10 @@ def aggregate_readable_daily_reports_from_steps(
 
         mkey = (folder_id, folder_name, test_run_id, test_case_key)
         if mkey not in case_merge:
+            parts_init: list[str] = []
+            sc0 = step_comment.strip() if step_comment else ""
+            if sc0:
+                parts_init.append(sc0)
             case_merge[mkey] = {
                 "test_case_name": test_case_name or "",
                 "cycle_key": cycle_key_disp or "",
@@ -3726,7 +3730,8 @@ def aggregate_readable_daily_reports_from_steps(
                 "cycle_objective": cycle_objective or "",
                 "step_status_name": step_status_name or "",
                 "test_result_status_name": test_result_status_name or "",
-                "step_comment": step_comment.strip() if step_comment else "",
+                "step_comment": sc0,
+                "logs_comment_parts": parts_init,
                 "step_execution_date": step_execution_date or "",
                 "actual_start_date": cycle_actual_start_date or "",
                 "case_iteration_key": case_iteration_key or "",
@@ -3747,8 +3752,11 @@ def aggregate_readable_daily_reports_from_steps(
                 m["step_status_name"] = step_status_name
             if test_result_status_name and not m["test_result_status_name"]:
                 m["test_result_status_name"] = test_result_status_name
-            if step_comment.strip() and not m["step_comment"]:
-                m["step_comment"] = step_comment.strip()
+            sc = step_comment.strip() if step_comment else ""
+            if sc and sc not in m.setdefault("logs_comment_parts", []):
+                m["logs_comment_parts"].append(sc)
+            if sc and not m["step_comment"]:
+                m["step_comment"] = sc
             if step_execution_date and step_execution_date > (m["step_execution_date"] or ""):
                 m["step_execution_date"] = step_execution_date
             if cycle_actual_start_date and not m["actual_start_date"]:
@@ -3791,6 +3799,8 @@ def aggregate_readable_daily_reports_from_steps(
             or m["step_status_name"]
             or fallback_status.get((folder_id, test_run_id), "")
         )
+        parts = m.get("logs_comment_parts") or []
+        logs_source = "\n".join(dict.fromkeys(parts)) if parts else (m.get("step_comment") or "")
         cycle_bucket["cases"][test_case_key] = {
             "test_case_key": test_case_key,
             "test_case_name": m["test_case_name"],
@@ -3801,6 +3811,7 @@ def aggregate_readable_daily_reports_from_steps(
             "comment": m["step_comment"],
             "objective": m["objective"],
             "tasks": m["task_links"],
+            "logs_source_text": logs_source,
         }
 
     return reports
@@ -3847,6 +3858,7 @@ def aggregate_readable_daily_reports_legacy(
             "comment": "",
             "objective": "",
             "tasks": "",
+            "logs_source_text": "",
         }
         if existing is None:
             cycle_bucket["cases"][case_bucket_key] = candidate
@@ -3860,6 +3872,205 @@ def aggregate_readable_daily_reports_legacy(
 
 def _wiki_escape(value: str) -> str:
     return value.replace("|", "\\|").replace("\n", "\\\\")
+
+
+_LOGVIEWER_URL_DEFAULT_RE = re.compile(
+    r"https://logviewer\.df\.sbauto\.tech/logs/[^\s)\"'<>]+",
+    re.IGNORECASE,
+)
+
+
+def _logviewer_url_regex() -> re.Pattern[str]:
+    raw = (os.getenv("ZEPHYR_LOGVIEWER_URL_REGEX") or "").strip()
+    if raw:
+        try:
+            return re.compile(raw, re.IGNORECASE)
+        except re.error:
+            pass
+    return _LOGVIEWER_URL_DEFAULT_RE
+
+
+def extract_logviewer_urls(text: str) -> list[str]:
+    """Return unique logviewer URLs in first-seen order."""
+    if not text:
+        return []
+    seen_lower: set[str] = set()
+    out: list[str] = []
+    for match in _logviewer_url_regex().finditer(text):
+        url = match.group(0).rstrip(".,;)>]")
+        low = url.lower()
+        if low in seen_lower:
+            continue
+        seen_lower.add(low)
+        out.append(url)
+    return out
+
+
+def nightly_dev_build_label_iso(folder_name: str) -> str | None:
+    """Return nightly-dev-YYYY-MM-DD parsed from folder name prefix, or None."""
+    raw = _parse_weekly_column_label_from_folder_name(folder_name)
+    if not raw:
+        return None
+    m = re.match(
+        r"^(nightly-dev)-(\d{4})[._-](\d{2})[._-](\d{2})\b",
+        raw,
+        flags=re.IGNORECASE,
+    )
+    if not m:
+        return None
+    return f"{m.group(1).lower()}-{m.group(2)}-{m.group(3)}-{m.group(4)}"
+
+
+def _daily_report_build_label(folder_name: str, cycles: dict[str, Any]) -> str:
+    parsed = nightly_dev_build_label_iso(folder_name)
+    if parsed:
+        return parsed
+    dd = _resolve_daily_title_date(cycles)
+    if dd:
+        normalized = _normalize_display_date(dd)
+        if normalized:
+            return f"nightly-dev-{normalized}"
+    slug = str(folder_name or "").strip()
+    return f"nightly-dev-{slug}" if slug else "nightly-dev-unknown"
+
+
+def _parse_jira_keys_from_tasks_field(tasks: str) -> list[str]:
+    if not tasks or not str(tasks).strip():
+        return []
+    seen: set[str] = set()
+    out: list[str] = []
+    for raw in str(tasks).replace(";", ",").split(","):
+        token = raw.strip()
+        if not token:
+            continue
+        match = _ISSUE_KEY_INLINE_PATTERN.search(token)
+        key = match.group(0) if match else ""
+        if key and key not in seen:
+            seen.add(key)
+            out.append(key)
+    return out
+
+
+def _daily_collect_defect_log_aggregate(
+    folder_name: str, cycles: dict[str, Any]
+) -> tuple[str, list[tuple[str, list[str]]], list[str]]:
+    """(build_label, table rows as (bug_key_or_dash, urls), all_log_urls_for_folder)."""
+    build_label = _daily_report_build_label(folder_name, cycles)
+    bug_to_urls: dict[str, list[str]] = {}
+
+    def _append_urls(bug: str, urls: list[str]) -> None:
+        lst = bug_to_urls.setdefault(bug, [])
+        seen_local = set(lst)
+        for u in urls:
+            if u not in seen_local:
+                seen_local.add(u)
+                lst.append(u)
+
+    all_urls: list[str] = []
+    seen_global: set[str] = set()
+    for cycle in cycles.values():
+        if not isinstance(cycle, dict):
+            continue
+        for case in cycle.get("cases", {}).values():
+            if not isinstance(case, dict):
+                continue
+            text = str(case.get("logs_source_text") or case.get("comment") or "")
+            urls = extract_logviewer_urls(text)
+            for u in urls:
+                low = u.lower()
+                if low not in seen_global:
+                    seen_global.add(low)
+                    all_urls.append(u)
+            keys = _parse_jira_keys_from_tasks_field(str(case.get("tasks") or ""))
+            if keys:
+                for k in keys:
+                    _append_urls(k, urls)
+            elif urls:
+                _append_urls("", urls)
+
+    def _bug_sort_key(bug: str) -> tuple[int, str]:
+        return (0 if bug else 1, bug.upper())
+
+    rows: list[tuple[str, list[str]]] = []
+    for bug in sorted(bug_to_urls.keys(), key=_bug_sort_key):
+        display = bug if bug else "—"
+        rows.append((display, bug_to_urls[bug]))
+    return build_label, rows, all_urls
+
+
+def _daily_defect_logs_section_has_content(folder_name: str, cycles: dict[str, Any]) -> bool:
+    _build_label, rows, all_u = _daily_collect_defect_log_aggregate(folder_name, cycles)
+    return bool(rows or all_u)
+
+
+def _daily_defect_logs_section_html(folder_name: str, cycles: dict[str, Any]) -> str:
+    if not _daily_defect_logs_section_has_content(folder_name, cycles):
+        return ""
+    build_label, rows, all_urls = _daily_collect_defect_log_aggregate(folder_name, cycles)
+    parts: list[str] = [
+        "<h3 id='sec_defect_logs'><strong>Баги, сборка и логи (из комментариев)</strong></h3>",
+        "<table>",
+        "<thead><tr>"
+        "<th>Баг (Jira)</th><th>Сборка</th><th>Ссылки logviewer</th>"
+        "</tr></thead><tbody>",
+    ]
+    for bug_disp, urls in rows:
+        jira_cell = _html_tasks_cell(bug_disp) if bug_disp != "—" else "—"
+        url_cell = ""
+        if urls:
+            url_cell = "<ul>" + "".join(
+                f"<li><a href='{html.escape(u, quote=True)}' rel='noopener' target='_blank'>"
+                f"{html.escape(u)}</a></li>"
+                for u in urls
+            ) + "</ul>"
+        else:
+            url_cell = "<span class='pie-empty'>—</span>"
+        parts.append(
+            "<tr>"
+            f"<td>{jira_cell}</td>"
+            f"<td>{html.escape(build_label)}</td>"
+            f"<td>{url_cell}</td>"
+            "</tr>"
+        )
+    parts.append("</tbody></table>")
+    if all_urls:
+        parts.append(
+            f"<p><strong>Воспроизводится на сборке {html.escape(build_label)}</strong></p>"
+        )
+        parts.append("<ul>")
+        parts.extend(
+            f"<li><a href='{html.escape(u, quote=True)}' rel='noopener' target='_blank'>"
+            f"{html.escape(u)}</a></li>"
+            for u in all_urls
+        )
+        parts.append("</ul>")
+    return "\n".join(parts)
+
+
+def _daily_defect_logs_section_wiki(folder_name: str, cycles: dict[str, Any]) -> str:
+    if not _daily_defect_logs_section_has_content(folder_name, cycles):
+        return ""
+    build_label, rows, all_urls = _daily_collect_defect_log_aggregate(folder_name, cycles)
+    lines: list[str] = [
+        "{anchor:sec_defect_logs}",
+        "h3. *Баги, сборка и логи (из комментариев)*",
+        "|| Баг (Jira) || Сборка || Ссылки logviewer ||",
+    ]
+    for bug_disp, urls in rows:
+        bug_cell = _wiki_tasks_cell(bug_disp) if bug_disp != "—" else "—"
+        if urls:
+            url_cell = "\\\\".join(f"[{_wiki_escape(u)}|{u}]" for u in urls)
+        else:
+            url_cell = "—"
+        lines.append("| " + " | ".join([bug_cell, _wiki_escape(build_label), url_cell]) + " |")
+    lines.append("")
+    if all_urls:
+        lines.append(f"h4. Воспроизводится на сборке {_wiki_escape(build_label)}")
+        lines.append("")
+        for u in all_urls:
+            lines.append(f"* [{_wiki_escape(u)}|{u}]")
+        lines.append("")
+    return "\n".join(lines)
 
 
 def _load_readable_template_file(template_dir: str | None, *parts: str) -> str | None:
@@ -7288,7 +7499,11 @@ def _daily_toc_child_label(cycle: dict[str, Any]) -> str:
     return tail or stripped or "Unnamed cycle"
 
 
-def _daily_render_html_toc(sorted_cycles: list[dict[str, Any]]) -> str:
+def _daily_render_html_toc(
+    sorted_cycles: list[dict[str, Any]],
+    *,
+    show_defect_logs_anchor: bool = False,
+) -> str:
     groups = _daily_toc_groups_from_sorted_cycles(sorted_cycles)
     scenarios_anchor = "#scenarios"
     parts: list[str] = [
@@ -7297,6 +7512,11 @@ def _daily_render_html_toc(sorted_cycles: list[dict[str, Any]]) -> str:
         "<li><a href='#sec-environment'><strong>2. Условия окружения</strong></a></li>",
         f"<li><a href='{html.escape(scenarios_anchor, quote=True)}'><strong>3. Результаты тестирования</strong></a></li>",
     ]
+    if show_defect_logs_anchor:
+        parts.append(
+            "<li><a href='#sec_defect_logs'>&nbsp;&nbsp;&nbsp;&nbsp;"
+            "Баги, сборка и логи</a></li>"
+        )
     for _gid, heading, group_cycles in groups:
         first = group_cycles[0]
         anchor, _ = _daily_cycle_heading_parts(first)
@@ -7889,7 +8109,10 @@ def render_daily_html_report(
     )
     sorted_cycles = sorted(cycles.values(), key=_cycle_sort_key)
     status_counts = _daily_aggregate_case_status_counts(cycles)
-    toc_html = _daily_render_html_toc(sorted_cycles)
+    show_defect_logs = _daily_defect_logs_section_has_content(folder_name, cycles)
+    toc_html = _daily_render_html_toc(
+        sorted_cycles, show_defect_logs_anchor=show_defect_logs
+    )
     sections = [
         "<!doctype html>",
         "<html><head><meta charset='utf-8'>",
@@ -7952,6 +8175,9 @@ def render_daily_html_report(
             status_counts, extra_wrap_class="daily-pie-strip-publish"
         )
     )
+    defect_logs_html = _daily_defect_logs_section_html(folder_name, cycles)
+    if defect_logs_html:
+        sections.append(defect_logs_html)
     for cycle in sorted_cycles:
         anchor, heading_plain = _daily_cycle_heading_parts(cycle)
         heading_display = re.sub(r"^\s*\d+\.\d+\s+", "", heading_plain).strip() or heading_plain
@@ -8121,6 +8347,10 @@ def render_daily_wiki_report(
     toc_lines.append(f"* [{_wiki_escape('1. Объект тестирования')}|#sec_object]")
     toc_lines.append(f"* [{_wiki_escape('2. Условия окружения')}|#sec_environment]")
     toc_lines.append(f"* [{_wiki_escape('3. Результаты тестирования')}|#scenarios]")
+    if _daily_defect_logs_section_has_content(folder_name, cycles):
+        toc_lines.append(
+            f"** [{_wiki_escape('Баги, сборка и логи')}|#sec_defect_logs]"
+        )
     for _gid, heading, group_cycles in grouped_cycles:
         first = group_cycles[0]
         anchor, _ = _daily_cycle_heading_parts(first)
@@ -8149,6 +8379,10 @@ def render_daily_wiki_report(
     if chart_section:
         lines.append("\t")
         lines.extend(chart_section.splitlines())
+        lines.append("")
+    defect_logs_wiki = _daily_defect_logs_section_wiki(folder_name, cycles)
+    if defect_logs_wiki:
+        lines.extend(defect_logs_wiki.splitlines())
         lines.append("")
     for cycle in sorted_cycles:
         anchor, heading_plain = _daily_cycle_heading_parts(cycle)
@@ -8254,6 +8488,7 @@ def write_daily_readable_reports(
     for (folder_id, folder_name), payload in sorted(report_data.items(), key=lambda item: item[0][1]):
         cycles = payload["cycles"]
         fid = str(folder_id)
+        base_name = _build_daily_report_base_name(fid, folder_name, cycles)
         if "html" in formats:
             html_path = os.path.join(output_dir, f"{base_name}.html")
             body = render_daily_html_report(
