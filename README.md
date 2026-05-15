@@ -25,7 +25,13 @@ cp .env.example .env
 bash ./run_navio_folder_report.sh
 ```
 
-Launcher запускает в tree-режиме:
+Run Google Sheets pipeline launcher:
+
+```bash
+bash ./run_zephyr_google_pipeline.sh --help
+```
+
+The launcher runs in tree-first mode by default:
 
 - пробует кастомный источник (`ZEPHYR_TREE_SOURCE_*`) если настроен
 - делает `POST` на `ZEPHYR_FOLDER_SEARCH_ENDPOINT`
@@ -59,44 +65,71 @@ Launcher запускает в tree-режиме:
     - `Daily report: nightly-dev-<folder_name> (<most_popular_step_execution_date>)`
   - each test cycle section lists real test case keys (`QA-T...`) with result (step/execution status), execution date, and comment from the first non-empty step comment
   - output files:
-    - `nightly-dev-<slug(folder_name)>_<most_popular_step_execution_date>_<folder_id>.html` (copy/paste into Confluence editor)
-    - `nightly-dev-<slug(folder_name)>_<most_popular_step_execution_date>_<folder_id>.confluence.txt` (wiki-markup format)
-- weekly cycle matrix CSV (built from daily cycle summaries of target week):
-  - `ZEPHYR_WEEKLY_CYCLE_MATRIX_OUTPUT=reports/weekly_cycle_matrix.csv`
-  - columns:
-    - `Тестовый цикл` (`cycle_key | cycle_name`)
-    - `Всего кейсов` (max value across daily summaries of the week for this cycle)
-    - dynamic columns `nightly-dev-YYYY.MM.DD`
-  - source for weekly columns: daily “Сводка по тестовым циклам”
-  - daily summaries are joined by `Тестовый цикл`; missing values are filled as `0`
-  - labels with `(...cloned...)` are merged into base cycle label; base cycle has priority, cloned is fallback
-  - week selection is based on date from daily report title (`most_popular_step_execution_date`); latest week is exported
-- weekly readable reports for Confluence/HTML:
+    - `<folder_name>_<folder_id>.html` (copy/paste into Confluence editor)
+    - `<folder_name>_<folder_id>.confluence.txt` (wiki-markup format)
+- readable weekly reports:
   - `ZEPHYR_EXPORT_WEEKLY_READABLE=true`
   - `ZEPHYR_WEEKLY_READABLE_DIR=reports/weekly_readable`
   - `ZEPHYR_WEEKLY_READABLE_FORMATS=html,wiki`
-  - output files:
-    - `weekly_cycle_matrix_<week_start>.html`
-    - `weekly_cycle_matrix_<week_start>.confluence.txt`
-- optional auto-publish to Confluence (creates new pages, skips existing titles):
-  - `CONFLUENCE_PUBLISH_DAILY=true` (publishes each generated daily HTML report)
-  - `CONFLUENCE_PUBLISH_WEEKLY=true` (publishes generated weekly HTML report)
-  - required:
-    - `CONFLUENCE_BASE_URL` (Cloud example: `https://<org>.atlassian.net/wiki`)
-    - `CONFLUENCE_SPACE_KEY`
-    - `CONFLUENCE_PARENT_PAGE_ID`
-    - `CONFLUENCE_API_TOKEN`
-  - auth mode:
-    - `CONFLUENCE_AUTH_MODE=auto|basic|bearer` (default: `auto`)
-    - `bearer` is recommended for Confluence Server/Data Center when PAT works as `Authorization: Bearer ...`
-    - for `basic` set `CONFLUENCE_USERNAME` (Cloud: Atlassian account email)
-  - optional:
-    - `CONFLUENCE_VERIFY_SSL=true|false`
-    - `CONFLUENCE_DRY_RUN=true|false` (prints intended actions without API calls)
-    - `CONFLUENCE_UPDATE_EXISTING=true|false` (when true, existing pages with same title are updated instead of skipped)
-  - title format used for new pages:
-    - daily: `Daily report: nightly-dev-<slug(folder_name)>_<most_popular_step_execution_date>_<folder_id>`
-    - weekly: `Weekly cycle matrix: <week_start>`
+  - when Autofleet AB-test branch is resolved from Jira (`labels = autofleet_abtest`, build from `description` point `A`), weekly render adds a first column/card `Лучшая ветка: <branch>` in both `Общий score` and `Score по сценариям`
+  - insertion rule is strict: only for weeks with `week_start < best_branch_week_start` (week of that branch and later weeks are not modified)
+- Jira Autofleet AB-test extraction helpers (for downstream automation):
+  - `ZEPHYR_AUTOFLEET_ABTEST_ENABLED=true`
+  - `ZEPHYR_AUTOFLEET_ABTEST_JQL='labels = autofleet_abtest'`
+  - `ZEPHYR_AUTOFLEET_ABTEST_MAX_RESULTS=100`
+  - helper logic parses date from issue `summary`, compares it with Jira `created`, picks latest issue by max(date), then extracts build name from point `A` in `description` (`A)`, `A.`, `A:`, `А)` variants).
+  - by current behavior this value is not rendered into weekly HTML/wiki yet (explicitly disabled for now).
+- optional first step: create target Zephyr folder before report generation:
+  - `ZEPHYR_CREATE_FOLDER_FIRST=true`
+  - set one of:
+    - `ZEPHYR_CREATE_FOLDER_NAME=2026.04.14`
+    - `ZEPHYR_CREATE_FOLDER_NAME_TEMPLATE=%Y.%m.%d`
+  - optional placement and endpoint/body mapping:
+    - `ZEPHYR_CREATE_FOLDER_PARENT_ID=...`
+    - `ZEPHYR_CREATE_FOLDER_ENDPOINT=rest/tests/1.0/folder`
+    - `ZEPHYR_CREATE_FOLDER_NAME_FIELD=name`
+    - `ZEPHYR_CREATE_FOLDER_PROJECT_ID_FIELD=projectId`
+    - `ZEPHYR_CREATE_FOLDER_PARENT_ID_FIELD=parentId`
+    - `ZEPHYR_CREATE_FOLDER_BODY_JSON='{"type":"TEST_RUN"}'` (example)
+  - optional safe mode:
+    - `ZEPHYR_CREATE_FOLDER_DRY_RUN=true` (prints payload, no POST)
+  - optional scope override:
+    - `ZEPHYR_CREATE_FOLDER_USE_AS_ROOT=true` (use created/existing folder as the only root filter in current run)
+- Google Sheets daily pipeline:
+  - service account setup:
+    - create Google Cloud service account
+    - enable Google Sheets API + Google Drive API
+    - download JSON key and set `GOOGLE_SERVICE_ACCOUNT_FILE=/abs/path/key.json`
+    - share spreadsheet (or parent Drive folder) with service account email
+  - install dependencies:
+    - `pip install google-api-python-client google-auth`
+  - generate/update sheet from Zephyr folder:
+    - `ZEPHYR_GSHEET_BRANCH_NAME_TEMPLATE=%Y.%m.%d` (or set fixed `ZEPHYR_BRANCH_NAME`)
+    - `ZEPHYR_GSHEET_SPREADSHEET_ID=` (empty to auto-create)
+    - run: `bash ./run_zephyr_google_pipeline.sh generate`
+  - sync checked Pass/Fail + Comment back to Zephyr:
+    - `ZEPHYR_GSHEET_SPREADSHEET_ID=<existing_sheet_id>`
+    - run: `bash ./run_zephyr_google_pipeline.sh sync`
+  - realtime on checkbox edit:
+    - use Apps Script from `google_apps_script/Code.gs`
+    - set script properties:
+      - `ZEPHYR_BASE_URL`
+      - `ZEPHYR_API_TOKEN`
+      - optional: `RUN_SHEET_NAME` (default `Run`)
+      - optional: `UPDATE_ENDPOINT_TEMPLATE` (default `rest/tests/1.0/testresult/{test_result_id}`)
+      - optional: `UPDATE_METHOD` (default `PUT`)
+      - optional: `UPDATE_STATUS_ID_FIELD` (default `testResultStatusId`)
+      - optional: `UPDATE_COMMENT_FIELD` (default `comment`)
+    - behavior:
+      - Pass/Fail are mutually exclusive
+      - on Pass/Fail/Comment edit Apps Script reads `pass_status_id/fail_status_id` from `Config`
+      - writes status + comment directly to Zephyr API
+      - writes result to columns M:N (`sync_status`, `synced_at`)
+- new helper scripts:
+  - `zephyr_google_sheets_pipeline.py`
+    - `generate-sheet`: creates/updates Config + Run tabs with grouped daily rows
+    - `sync-sheet`: sends Pass/Fail + Comment into Zephyr update endpoint
+  - `run_zephyr_google_pipeline.sh`: environment-based launcher for both modes
 - keep `ZEPHYR_QUERY_TEMPLATE` in quotes in `.env` (contains spaces and parentheses)
 - tree-first config for 2026 folders:
   - `ZEPHYR_DISCOVERY_MODE=tree`
@@ -267,8 +300,158 @@ if __name__ == "__main__":
 
 ## Notes
 
-- Заголовок авторизации по умолчанию: `Authorization: Bearer <token>`.
-- Эндпоинты обнаружения папок настраиваются через `ZEPHYR_FOLDER_SEARCH_ENDPOINT` / `ZEPHYR_FOLDERTREE_ENDPOINT`.
-- `ZEPHYR_TREE_AUTOPROBE=true` — только для диагностики.
-- `ZEPHYR_QUERY_TEMPLATE` должен содержать плейсхолдер `{folder_id}`.
-- Для кастомных полей даты/статуса: `--date-field` / `--status-field` (можно передавать несколько).
+- Default auth header is `Authorization: Bearer <token>`.
+- Tree discovery endpoints are configurable via:
+  - `ZEPHYR_FOLDER_SEARCH_ENDPOINT`
+  - `ZEPHYR_FOLDERTREE_ENDPOINT`
+- Set `ZEPHYR_TREE_AUTOPROBE=true` only for diagnostics; keep it `false` in stable mode.
+- Folder query template must include `{folder_id}` placeholder.
+- If your Zephyr instance uses different fields for date/status, pass custom paths:
+  - `--date-field "some.path.to.date"`
+  - `--status-field "some.path.to.status"`
+- You can pass multiple `--date-field` or `--status-field` values.
+- For Zephyr write-back endpoint tune:
+  - `ZEPHYR_GSHEET_UPDATE_ENDPOINT_TEMPLATE` (default `rest/tests/1.0/testresult/{test_result_id}`)
+  - `ZEPHYR_GSHEET_UPDATE_METHOD` (`PUT|POST|PATCH`)
+  - `ZEPHYR_GSHEET_UPDATE_STATUS_ID_FIELD` (default `testResultStatusId`)
+  - `ZEPHYR_GSHEET_UPDATE_COMMENT_FIELD` (default `comment`)
+  - `ZEPHYR_GSHEET_UPDATE_EXTRA_BODY_JSON` (optional extra JSON object)
+
+## NocoDB + n8n local migration
+
+Google Sheets flow can be migrated to a local operations stack:
+
+- `NocoDB` for operator edits
+- `n8n` for ingest/sync orchestration
+- `Postgres` for state and queue persistence
+
+Migration assets in this repo:
+
+- `infra/docker-compose.nocodb-n8n.yml`
+- `infra/.env.nocodb-n8n.example`
+- `workflows/zephyr_ingest_15m.json`
+- `workflows/zephyr_writeback_15m.json`
+- `workflows/zephyr_writeback_realtime.json` (optional path, disabled by default)
+- `docs/zephyr-api-contract.md`
+- `docs/nocodb-operator-form.md`
+- `docs/n8n-postgres-credential.md`
+- `docs/production-cutover-checklist.md`
+
+### 1) Bootstrap local stack
+
+```bash
+cp infra/.env.nocodb-n8n.example infra/.env.nocodb-n8n
+# edit secrets and token
+docker compose --env-file infra/.env.nocodb-n8n -f infra/docker-compose.nocodb-n8n.yml up -d
+```
+
+Open:
+
+- n8n: `http://localhost:5678`
+- NocoDB: `http://localhost:8080`
+
+### 2) Import n8n workflows
+
+Import JSON workflows from `workflows/` in this order:
+
+1. `zephyr_ingest_15m.json`
+2. `zephyr_writeback_15m.json`
+3. `zephyr_writeback_realtime.json` (keep inactive for prod baseline)
+
+Set environment variables in n8n container from `infra/.env.nocodb-n8n`.
+
+### 3) Create NocoDB tables
+
+Create tables according to `docs/zephyr-api-contract.md`:
+
+- `folders`
+- `test_runs`
+- `test_results`
+- `sync_queue`
+- `sync_audit`
+
+Required idempotency constraint:
+
+- unique key on `sync_queue(test_result_id, operation_hash)`
+
+Operator form details:
+
+- use `operator_daily_form` as daily editable source (`execution_day = current_date`)
+- keep `desired_status_id` as the single editable status field (Pass/Fail is derived)
+- queue items are auto-created by DB trigger on desired status/comment changes
+- see `docs/nocodb-operator-form.md`
+
+### 4) Production baseline mode
+
+Use batch mode first:
+
+- `SYNC_INTERVAL_MIN=15`
+- `SYNC_MODE=batch`
+- `ENABLE_REALTIME_SYNC=false`
+
+This keeps write-back controlled and replayable via queue rows.
+
+Batch workflow DB wiring:
+
+- workflow `workflows/zephyr_writeback_15m.json` uses Postgres nodes for queue read/write
+- create n8n credential `PostgresZephyrOps` as described in `docs/n8n-postgres-credential.md`
+
+### Operations runbook
+
+- Pause sync:
+  - disable `zephyr_writeback_15m` workflow in n8n
+- Resume sync:
+  - re-enable workflow
+- Replay failed queue:
+  - in NocoDB move selected `sync_queue.status` from `failed` to `queued`
+  - clear `next_retry_at` for immediate next cycle
+- Dead-letter handling:
+  - inspect `sync_audit.response_body`
+  - fix payload/data mapping
+  - enqueue a new operation with a fresh `operation_hash`
+- Monitoring SQL (Postgres):
+  - `infra/sql/query_sync_health.sql` - queue/state snapshot + 24h success rate
+  - `infra/sql/query_sync_recent_errors.sql` - recent non-2xx / failed attempts
+  - `infra/sql/query_sync_sla.sql` - backlog, latency p50/p95/p99, retry and dead-letter rates
+  - `infra/sql/query_sync_audit_inconsistencies.sql` - success flag vs HTTP status mismatches
+  - `infra/sql/fix_sync_audit_success_flag.sql` - normalize historical `sync_audit.success`
+  - `infra/sql/query_sync_health_since_cutover.sql` - clean snapshot from cutover timestamp
+  - `infra/sql/query_sync_recent_errors_since_cutover.sql` - errors from cutover timestamp
+
+### Grist helper scripts
+
+Use these PowerShell helpers from repo root:
+
+- Offline check (no VPN, validates `Grist -> Postgres -> sync_queue`):
+  - `.\scripts\offline-sync-check.ps1 -TestResultId 112522`
+- Post-VPN smoke (final hop validation to Zephyr via queue/writeback):
+  - `.\scripts\post-vpn-smoke.ps1 -TestResultId 112522 -WaitSeconds 120`
+
+Both scripts support optional overrides:
+
+- `-EnvFile infra/.env.nocodb-n8n`
+- `-ComposeFile infra/docker-compose.nocodb-n8n.yml`
+
+VPN continuation checklist:
+
+- `docs/vpn-resume-checklist.md`
+
+### Optional near-realtime path
+
+When ready:
+
+- set `ENABLE_REALTIME_SYNC=true`
+- activate `zephyr_writeback_realtime`
+- configure NocoDB automation/webhook to send `test_result_id`, `desired_status_id`, `desired_comment`
+
+Keep the 15-minute batch workflow active as fallback.
+
+### Rollback to script mode
+
+If migration flow is degraded:
+
+1. Disable n8n write-back workflows (`zephyr_writeback_15m` and realtime).
+2. Continue operations via existing script launcher:
+   - `bash ./run_zephyr_google_pipeline.sh generate`
+   - `bash ./run_zephyr_google_pipeline.sh sync`
+3. Keep NocoDB as read-only until queue/audit issues are fixed.

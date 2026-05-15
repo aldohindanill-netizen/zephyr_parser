@@ -62,9 +62,6 @@ STATUS_FIELD="${ZEPHYR_STATUS_FIELD:-status.name}"
 FIELDS="${ZEPHYR_FIELDS:-id,key,name,folderId,iterationId,projectVersionId,environmentId,userKeys,environmentIds,plannedStartDate,plannedEndDate,executionTime,estimatedTime,testResultStatuses,testCaseCount,issueCount,status(id,name,i18nKey,color),customFieldValues,createdOn,createdBy,updatedOn,updatedBy,owner}"
 QUERY_TEMPLATE="${ZEPHYR_QUERY_TEMPLATE:-testRun.projectId IN (${PROJECT_ID}) AND testRun.folderTreeId IN ({folder_id}) ORDER BY testRun.name ASC}"
 PROJECT_QUERY="${ZEPHYR_PROJECT_QUERY:-testRun.projectId IN (${PROJECT_ID}) ORDER BY testRun.name ASC}"
-FROM_DATE="${ZEPHYR_FROM_DATE:-}"
-TO_DATE="${ZEPHYR_TO_DATE:-}"
-ROLLING_DAYS="${ZEPHYR_ROLLING_DAYS:-}"
 DEBUG_FOLDER_FIELDS="${ZEPHYR_DEBUG_FOLDER_FIELDS:-false}"
 DISCOVERY_MODE="${ZEPHYR_DISCOVERY_MODE:-tree}"
 TREE_LEAF_ONLY="${ZEPHYR_TREE_LEAF_ONLY:-true}"
@@ -75,6 +72,17 @@ TREE_SOURCE_ENDPOINT="${ZEPHYR_TREE_SOURCE_ENDPOINT:-}"
 TREE_SOURCE_METHOD="${ZEPHYR_TREE_SOURCE_METHOD:-GET}"
 TREE_SOURCE_QUERY_JSON="${ZEPHYR_TREE_SOURCE_QUERY_JSON:-}"
 TREE_SOURCE_BODY_JSON="${ZEPHYR_TREE_SOURCE_BODY_JSON:-}"
+CREATE_FOLDER_FIRST="${ZEPHYR_CREATE_FOLDER_FIRST:-false}"
+CREATE_FOLDER_NAME="${ZEPHYR_CREATE_FOLDER_NAME:-}"
+CREATE_FOLDER_NAME_TEMPLATE="${ZEPHYR_CREATE_FOLDER_NAME_TEMPLATE:-}"
+CREATE_FOLDER_PARENT_ID="${ZEPHYR_CREATE_FOLDER_PARENT_ID:-}"
+CREATE_FOLDER_ENDPOINT="${ZEPHYR_CREATE_FOLDER_ENDPOINT:-rest/tests/1.0/folder}"
+CREATE_FOLDER_NAME_FIELD="${ZEPHYR_CREATE_FOLDER_NAME_FIELD:-name}"
+CREATE_FOLDER_PROJECT_ID_FIELD="${ZEPHYR_CREATE_FOLDER_PROJECT_ID_FIELD:-projectId}"
+CREATE_FOLDER_PARENT_ID_FIELD="${ZEPHYR_CREATE_FOLDER_PARENT_ID_FIELD:-parentId}"
+CREATE_FOLDER_BODY_JSON="${ZEPHYR_CREATE_FOLDER_BODY_JSON:-}"
+CREATE_FOLDER_DRY_RUN="${ZEPHYR_CREATE_FOLDER_DRY_RUN:-false}"
+CREATE_FOLDER_USE_AS_ROOT="${ZEPHYR_CREATE_FOLDER_USE_AS_ROOT:-false}"
 EXPORT_CYCLES_CASES="${ZEPHYR_EXPORT_CYCLES_CASES:-false}"
 CYCLES_CASES_OUTPUT="${ZEPHYR_CYCLES_CASES_OUTPUT:-reports/cycles_and_cases.csv}"
 TESTCASE_ENDPOINT_TEMPLATE="${ZEPHYR_TESTCASE_ENDPOINT_TEMPLATE:-}"
@@ -121,9 +129,6 @@ STATUS_FIELD="$(strip_cr "$STATUS_FIELD")"
 FIELDS="$(strip_cr "$FIELDS")"
 QUERY_TEMPLATE="$(strip_cr "$QUERY_TEMPLATE")"
 PROJECT_QUERY="$(strip_cr "$PROJECT_QUERY")"
-FROM_DATE="$(strip_cr "$FROM_DATE")"
-TO_DATE="$(strip_cr "$TO_DATE")"
-ROLLING_DAYS="$(strip_cr "$ROLLING_DAYS")"
 DEBUG_FOLDER_FIELDS="$(strip_cr "$DEBUG_FOLDER_FIELDS")"
 DISCOVERY_MODE="$(strip_cr "$DISCOVERY_MODE")"
 TREE_LEAF_ONLY="$(strip_cr "$TREE_LEAF_ONLY")"
@@ -134,6 +139,17 @@ TREE_SOURCE_ENDPOINT="$(strip_cr "$TREE_SOURCE_ENDPOINT")"
 TREE_SOURCE_METHOD="$(strip_cr "$TREE_SOURCE_METHOD")"
 TREE_SOURCE_QUERY_JSON="$(strip_cr "$TREE_SOURCE_QUERY_JSON")"
 TREE_SOURCE_BODY_JSON="$(strip_cr "$TREE_SOURCE_BODY_JSON")"
+CREATE_FOLDER_FIRST="$(strip_cr "$CREATE_FOLDER_FIRST")"
+CREATE_FOLDER_NAME="$(strip_cr "$CREATE_FOLDER_NAME")"
+CREATE_FOLDER_NAME_TEMPLATE="$(strip_cr "$CREATE_FOLDER_NAME_TEMPLATE")"
+CREATE_FOLDER_PARENT_ID="$(strip_cr "$CREATE_FOLDER_PARENT_ID")"
+CREATE_FOLDER_ENDPOINT="$(strip_cr "$CREATE_FOLDER_ENDPOINT")"
+CREATE_FOLDER_NAME_FIELD="$(strip_cr "$CREATE_FOLDER_NAME_FIELD")"
+CREATE_FOLDER_PROJECT_ID_FIELD="$(strip_cr "$CREATE_FOLDER_PROJECT_ID_FIELD")"
+CREATE_FOLDER_PARENT_ID_FIELD="$(strip_cr "$CREATE_FOLDER_PARENT_ID_FIELD")"
+CREATE_FOLDER_BODY_JSON="$(strip_cr "$CREATE_FOLDER_BODY_JSON")"
+CREATE_FOLDER_DRY_RUN="$(strip_cr "$CREATE_FOLDER_DRY_RUN")"
+CREATE_FOLDER_USE_AS_ROOT="$(strip_cr "$CREATE_FOLDER_USE_AS_ROOT")"
 EXPORT_CYCLES_CASES="$(strip_cr "$EXPORT_CYCLES_CASES")"
 CYCLES_CASES_OUTPUT="$(strip_cr "$CYCLES_CASES_OUTPUT")"
 TESTCASE_ENDPOINT_TEMPLATE="$(strip_cr "$TESTCASE_ENDPOINT_TEMPLATE")"
@@ -223,6 +239,32 @@ fi
 
 if [[ -n "$TREE_SOURCE_BODY_JSON" ]]; then
   cmd+=(--tree-source-body-json "$TREE_SOURCE_BODY_JSON")
+fi
+
+if [[ "$CREATE_FOLDER_FIRST" == "true" ]]; then
+  cmd+=(--create-folder-first)
+  cmd+=(--create-folder-endpoint "$CREATE_FOLDER_ENDPOINT")
+  cmd+=(--create-folder-name-field "$CREATE_FOLDER_NAME_FIELD")
+  cmd+=(--create-folder-project-id-field "$CREATE_FOLDER_PROJECT_ID_FIELD")
+  cmd+=(--create-folder-parent-id-field "$CREATE_FOLDER_PARENT_ID_FIELD")
+  if [[ -n "$CREATE_FOLDER_NAME" ]]; then
+    cmd+=(--create-folder-name "$CREATE_FOLDER_NAME")
+  fi
+  if [[ -n "$CREATE_FOLDER_NAME_TEMPLATE" ]]; then
+    cmd+=(--create-folder-name-template "$CREATE_FOLDER_NAME_TEMPLATE")
+  fi
+  if [[ -n "$CREATE_FOLDER_PARENT_ID" ]]; then
+    cmd+=(--create-folder-parent-id "$CREATE_FOLDER_PARENT_ID")
+  fi
+  if [[ -n "$CREATE_FOLDER_BODY_JSON" ]]; then
+    cmd+=(--create-folder-body-json "$CREATE_FOLDER_BODY_JSON")
+  fi
+  if [[ "$CREATE_FOLDER_DRY_RUN" == "true" ]]; then
+    cmd+=(--create-folder-dry-run)
+  fi
+  if [[ "$CREATE_FOLDER_USE_AS_ROOT" == "true" ]]; then
+    cmd+=(--create-folder-use-as-root)
+  fi
 fi
 
 if [[ "$EXPORT_CYCLES_CASES" == "true" ]]; then
@@ -341,16 +383,8 @@ if [[ -n "$FOLDER_PATH_REGEX" ]]; then
   cmd+=(--folder-path-regex "$FOLDER_PATH_REGEX")
 fi
 
-if [[ -n "$ROLLING_DAYS" ]] && [[ "$ROLLING_DAYS" =~ ^[0-9]+$ ]] && (( ROLLING_DAYS > 0 )); then
-  cmd+=(--rolling-days "$ROLLING_DAYS")
-else
-  if [[ -n "$FROM_DATE" ]]; then
-    cmd+=(--from-date "$FROM_DATE")
-  fi
-  if [[ -n "$TO_DATE" ]]; then
-    cmd+=(--to-date "$TO_DATE")
-  fi
-fi
+# Date window: zephyr_weekly_report.py reads ZEPHYR_REGENERATE_LAST_N_DAYS,
+# ZEPHYR_FROM_DATE, ZEPHYR_TO_DATE from the environment (no CLI flags needed).
 
 if [[ "$DEBUG_FOLDER_FIELDS" == "true" ]]; then
   cmd+=(--debug-folder-fields)

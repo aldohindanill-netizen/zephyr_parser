@@ -1,0 +1,435 @@
+{
+  "name": "zephyr_ingest_15m",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 15
+            }
+          ]
+        }
+      },
+      "id": "Cron_15m",
+      "name": "Cron_15m",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [180, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "return [{json: {\n  baseUrl: 'https://jira.navio.auto',\n  projectId: '10904',\n  token: 'replace_with_real_token',\n  folderSearchEndpoint: 'rest/tests/1.0/folder/search',\n  foldertreeEndpoint: 'rest/tests/1.0/foldertree',\n  folderLeafOnly: false,\n  folderRootIds: '',\n  folderNameRegex: '',\n  folderPathRegex: '',\n  testrunSearchEndpoint: 'rest/tests/1.0/testrun/search',\n  testrunFields: 'id,key,name,folderId,iterationId,projectVersionId,environmentId,userKeys,environmentIds,plannedStartDate,plannedEndDate,executionTime,estimatedTime,testResultStatuses,testCaseCount,issueCount,status(id,name,i18nKey,color),customFieldValues,createdOn,createdBy,updatedOn,updatedBy,owner',\n  testresultEndpointTemplate: 'rest/tests/1.0/testrun/{test_run_id}/testrunitems',\n  testresultFields: 'id,index,$lastTestResult',\n  queryTemplate: 'testRun.projectId IN ({project_id}) AND testRun.folderTreeId IN ({folder_id}) ORDER BY testRun.name ASC',\n  maxResults: '200',\n  startAt: '0',\n  archived: 'false'\n}}];"
+      },
+      "id": "Build_Config",
+      "name": "Build_Config",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [400, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.baseUrl.replace(/\\/+$/,'') + '/' + $json.folderSearchEndpoint.replace(/^\\/+/,'') }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "={{ 'Bearer ' + $json.token }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "jsonBody": "={{ JSON.stringify({ projectId: Number($json.projectId) || $json.projectId }) }}",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "json"
+            }
+          }
+        }
+      },
+      "id": "Fetch_Folder_Search",
+      "name": "Fetch_Folder_Search",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [620, 300],
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $items('Build_Config', 0, 0)[0].json.baseUrl.replace(/\\/+$/,'') + '/rest/tests/1.0/project/' + encodeURIComponent($items('Build_Config', 0, 0)[0].json.projectId) + '/testresultstatus' }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "={{ 'Bearer ' + $items('Build_Config', 0, 0)[0].json.token }}"
+            },
+            {
+              "name": "Accept",
+              "value": "application/json"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "json"
+            }
+          }
+        }
+      },
+      "id": "Fetch_Testresult_Statuses",
+      "name": "Fetch_Testresult_Statuses",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [620, 140],
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "jsCode": "function toFolderNode(item) {\n  if (!item || typeof item !== 'object') return null;\n  const folderId = item.id ?? item.folderTreeId ?? item.folderId;\n  if (folderId == null) return null;\n  const name = item.name ?? item.folderName ?? ('folder_' + folderId);\n  let parentId = item.parentId;\n  if (parentId == null && item.parent && typeof item.parent === 'object') {\n    parentId = item.parent.id;\n  }\n  const fullPath = item.fullName ?? item.path ?? '';\n  return {\n    folder_id: String(folderId),\n    folder_name: String(name),\n    parent_id: parentId != null ? String(parentId) : null,\n    full_path: String(fullPath || ''),\n    is_leaf: false\n  };\n}\n\nfunction collectFolderNodes(payload) {\n  const collected = [];\n  function walk(p) {\n    if (p == null) return;\n    if (Array.isArray(p)) {\n      for (const e of p) walk(e);\n      return;\n    }\n    if (typeof p === 'object') {\n      const n = toFolderNode(p);\n      if (n) collected.push(n);\n      for (const key of ['values', 'results', 'items', 'content', 'folders', 'children', 'data', 'result']) {\n        const v = p[key];\n        if (Array.isArray(v)) {\n          for (const e of v) walk(e);\n        } else if (v && typeof v === 'object') {\n          walk(v);\n        }\n      }\n    }\n  }\n  walk(payload);\n  return collected;\n}\n\nconst raw = items[0].json || {};\nconst payload = raw.error ? {} : raw;\nconst nodes = collectFolderNodes(payload);\nreturn [{ json: { nodes, folder_discovery: nodes.length ? 'folder_search' : 'pending_foldertree' } }];"
+      },
+      "id": "After_Search_Collect",
+      "name": "After_Search_Collect",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [840, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "boolean": [
+            {
+              "value1": "={{ $json.nodes.length > 0 }}",
+              "operation": "isTrue"
+            }
+          ]
+        }
+      },
+      "id": "IF_Has_Folders_From_Search",
+      "name": "IF_Has_Folders_From_Search",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1060, 300]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $items('Build_Config', 0, 0)[0].json.baseUrl.replace(/\\/+$/,'') + '/' + $items('Build_Config', 0, 0)[0].json.foldertreeEndpoint.replace(/^\\/+/,'') + '?projectId=' + encodeURIComponent($items('Build_Config', 0, 0)[0].json.projectId) }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "={{ 'Bearer ' + $items('Build_Config', 0, 0)[0].json.token }}"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "json"
+            }
+          }
+        }
+      },
+      "id": "Fetch_Folder_Tree",
+      "name": "Fetch_Folder_Tree",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1060, 480],
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "jsCode": "function toFolderNode(item) {\n  if (!item || typeof item !== 'object') return null;\n  const folderId = item.id ?? item.folderTreeId ?? item.folderId;\n  if (folderId == null) return null;\n  const name = item.name ?? item.folderName ?? ('folder_' + folderId);\n  let parentId = item.parentId;\n  if (parentId == null && item.parent && typeof item.parent === 'object') {\n    parentId = item.parent.id;\n  }\n  const fullPath = item.fullName ?? item.path ?? '';\n  return {\n    folder_id: String(folderId),\n    folder_name: String(name),\n    parent_id: parentId != null ? String(parentId) : null,\n    full_path: String(fullPath || ''),\n    is_leaf: false\n  };\n}\n\nfunction collectFolderNodes(payload) {\n  const collected = [];\n  function walk(p) {\n    if (p == null) return;\n    if (Array.isArray(p)) {\n      for (const e of p) walk(e);\n      return;\n    }\n    if (typeof p === 'object') {\n      const n = toFolderNode(p);\n      if (n) collected.push(n);\n      for (const key of ['values', 'results', 'items', 'content', 'folders', 'children', 'data', 'result']) {\n        const v = p[key];\n        if (Array.isArray(v)) {\n          for (const e of v) walk(e);\n        } else if (v && typeof v === 'object') {\n          walk(v);\n        }\n      }\n    }\n  }\n  walk(payload);\n  return collected;\n}\n\nconst raw = items[0].json || {};\nconst payload = raw.error ? {} : raw;\nconst nodes = collectFolderNodes(payload);\nreturn [{ json: { nodes, folder_discovery: nodes.length ? 'foldertree' : 'none' } }];"
+      },
+      "id": "After_Tree_Collect",
+      "name": "After_Tree_Collect",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1280, 480]
+    },
+    {
+      "parameters": {
+        "jsCode": "const cfg = $items('Build_Config', 0, 0)[0].json;\nconst rawNodes = (items[0].json && items[0].json.nodes) ? items[0].json.nodes : [];\nif (!rawNodes.length) {\n  return [];\n}\nconst byId = {};\nfor (const n of rawNodes) {\n  byId[n.folder_id] = { ...n };\n}\nconst nodes = Object.values(byId);\nconst childrenByParent = {};\nfor (const n of nodes) {\n  const p = n.parent_id || '';\n  if (!childrenByParent[p]) childrenByParent[p] = [];\n  childrenByParent[p].push(n.folder_id);\n}\nconst cache = {};\nfunction buildPath(folderId) {\n  if (cache[folderId] !== undefined) return cache[folderId];\n  const node = byId[folderId];\n  if (!node) {\n    cache[folderId] = '';\n    return '';\n  }\n  const fp = (node.full_path || '').trim();\n  if (fp) {\n    cache[folderId] = fp;\n    return fp;\n  }\n  if (node.parent_id && byId[node.parent_id]) {\n    const pp = buildPath(node.parent_id);\n    const path = (pp ? pp + '/' : '') + node.folder_name;\n    cache[folderId] = path.replace(/\\/+/g, '/').replace(/^\\/+/, '');\n    return cache[folderId];\n  }\n  cache[folderId] = node.folder_name;\n  return cache[folderId];\n}\nfor (const n of nodes) {\n  if (!(n.full_path || '').trim()) {\n    n.full_path = buildPath(n.folder_id);\n  }\n}\nfor (const n of nodes) {\n  const kids = childrenByParent[n.folder_id] || [];\n  n.is_leaf = kids.length === 0;\n}\nconst rootIds = String(cfg.folderRootIds || '').split(',').map((s) => s.trim()).filter(Boolean);\nlet allowed = null;\nif (rootIds.length) {\n  allowed = new Set();\n  const stack = [...rootIds];\n  while (stack.length) {\n    const id = stack.pop();\n    if (allowed.has(id)) continue;\n    allowed.add(id);\n    const kids = childrenByParent[id] || [];\n    for (const k of kids) stack.push(k);\n  }\n}\nconst leafOnly = cfg.folderLeafOnly === true || cfg.folderLeafOnly === 'true';\nlet nameRe = null;\nif (cfg.folderNameRegex && String(cfg.folderNameRegex).trim()) {\n  try { nameRe = new RegExp(cfg.folderNameRegex); } catch (e) { nameRe = null; }\n}\nlet pathRe = null;\nif (cfg.folderPathRegex && String(cfg.folderPathRegex).trim()) {\n  try { pathRe = new RegExp(cfg.folderPathRegex); } catch (e) { pathRe = null; }\n}\nconst now = new Date().toISOString();\nconst out = [];\nfor (const n of nodes) {\n  if (allowed && !allowed.has(n.folder_id)) continue;\n  if (leafOnly && !n.is_leaf) continue;\n  if (nameRe && !nameRe.test(n.folder_name)) continue;\n  if (pathRe && !pathRe.test(n.full_path || '')) continue;\n  out.push({\n    json: {\n      folder_id: n.folder_id,\n      folder_name: n.folder_name,\n      folder_path: n.full_path || '',\n      is_active: true,\n      last_ingested_at: now\n    }\n  });\n}\nreturn out;"
+      },
+      "id": "Prepare_Folder_Rows",
+      "name": "Prepare_Folder_Rows",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1500, 360]
+    },
+    {
+      "parameters": {
+        "jsCode": "const esc = (value) => {\n  if (value === null || value === undefined) return 'NULL';\n  return \"'\" + String(value).replace(/'/g, \"''\") + \"'\";\n};\nif (!items.length) {\n  return [{ json: { sql_query: 'SELECT 1 AS zephyr_ingest_folders_noop;' } }];\n}\nconst vals = items.map((item) => {\n  const r = item.json;\n  return '(' + esc(r.folder_id) + ', ' + esc(r.folder_name) + ', ' + esc(r.folder_path) + ', true, ' + esc(r.last_ingested_at) + '::timestamptz)';\n}).join(',\\n');\nconst sql = 'INSERT INTO folders (folder_id, folder_name, folder_path, is_active, last_ingested_at)\\nVALUES ' + vals + '\\nON CONFLICT (folder_id) DO UPDATE SET\\n  folder_name = EXCLUDED.folder_name,\\n  folder_path = EXCLUDED.folder_path,\\n  is_active = EXCLUDED.is_active,\\n  last_ingested_at = EXCLUDED.last_ingested_at;';\nreturn [{ json: { sql_query: sql, row_count: items.length } }];"
+      },
+      "id": "Build_Folders_Upsert_SQL",
+      "name": "Build_Folders_Upsert_SQL",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1720, 360]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "={{ $json.sql_query }}",
+        "options": {}
+      },
+      "id": "Upsert_Folders_Postgres",
+      "name": "Upsert_Folders_Postgres",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [1940, 360],
+      "credentials": {
+        "postgres": {
+          "id": "PostgresZephyrOps",
+          "name": "PostgresZephyrOps"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "function sanitizeTql(q) {\n  let cleaned = String(q || '').trim();\n  if ((cleaned.startsWith(\"'\") && cleaned.endsWith(\"'\")) || (cleaned.startsWith('\"') && cleaned.endsWith('\"'))) {\n    cleaned = cleaned.slice(1, -1).trim();\n  }\n  const re = /\\bORDER\\s+BY\\b/gi;\n  const matches = [...cleaned.matchAll(re)];\n  if (matches.length > 1) {\n    cleaned = cleaned.slice(0, matches[1].index).trim();\n  }\n  return cleaned;\n}\n\nfunction buildQueryString(params) {\n  return Object.entries(params)\n    .filter(([, value]) => value !== undefined && value !== null && String(value) !== '')\n    .map(([key, value]) => `${encodeURIComponent(key)}=${encodeURIComponent(String(value))}`)\n    .join('&');\n}\n\nconst cfg = $items('Build_Config', 0, 0)[0].json;\nconst base = String(cfg.baseUrl || '').replace(/\\/+$/, '');\nconst endpoint = String(cfg.testrunSearchEndpoint || 'rest/tests/1.0/testrun/search').replace(/^\\/+/, '');\nconst template = cfg.queryTemplate || 'testRun.projectId IN ({project_id}) AND testRun.folderTreeId IN ({folder_id}) ORDER BY testRun.name ASC';\nconst fields = String(cfg.testrunFields || '').trim();\nconst maxResults = String(cfg.maxResults ?? '100');\nconst startAt = String(cfg.startAt ?? '0');\nconst archived = String(cfg.archived ?? 'false');\nconst projectId = String(cfg.projectId || '');\n\nreturn items.map((item) => {\n  const folderId = String(item.json.folder_id || '');\n  let q = String(template)\n    .split('{project_id}').join(projectId)\n    .split('{folder_id}').join(folderId);\n  q = sanitizeTql(q);\n  const params = { query: q, maxResults, startAt, archived };\n  if (fields) {\n    params.fields = fields;\n  }\n  const qs = buildQueryString(params);\n  return {\n    json: {\n      folder_id: folderId,\n      request_url: base + '/' + endpoint + '?' + qs,\n    },\n  };\n});"
+      },
+      "id": "Build_Testrun_Request_Items",
+      "name": "Build_Testrun_Request_Items",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1720, 520]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $json.request_url }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "={{ 'Bearer ' + $items('Build_Config', 0, 0)[0].json.token }}"
+            },
+            {
+              "name": "Accept",
+              "value": "application/json"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "json"
+            }
+          }
+        }
+      },
+      "id": "Fetch_Testruns",
+      "name": "Fetch_Testruns",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1940, 520],
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "jsCode": "function getByPath(obj, path) {\n  let cur = obj;\n  for (const p of path.split('.')) {\n    if (!cur || typeof cur !== 'object') return null;\n    cur = cur[p];\n  }\n  return cur;\n}\n\nfunction readField(row, paths, fallback) {\n  const fb = fallback === undefined ? '' : fallback;\n  for (const path of paths) {\n    if (path.indexOf('.') !== -1) {\n      const v = getByPath(row, path);\n      if (v != null && v !== '') return String(v);\n    } else if (row[path] != null && row[path] !== '') {\n      return String(row[path]);\n    }\n  }\n  return fb;\n}\n\nconst reqItems = $items('Build_Testrun_Request_Items', 0, 0);\nconst now = new Date().toISOString();\nconst out = [];\n\nfor (let i = 0; i < items.length; i++) {\n  const http = items[i].json || {};\n  const folderId = (reqItems[i] && reqItems[i].json) ? String(reqItems[i].json.folder_id || '') : '';\n  const payload = http.error ? {} : http;\n  const list = payload.values || payload.results || payload.executions || payload.items || [];\n  if (!Array.isArray(list)) continue;\n  for (const cycle of list) {\n    if (!cycle || typeof cycle !== 'object') continue;\n    const testRunId = readField(cycle, ['id', 'testRunId'], '');\n    if (!testRunId) continue;\n    const execRaw = readField(cycle, ['updatedOn', 'executedOn', 'executionDate'], '');\n    let execDay = execRaw ? execRaw.slice(0, 10) : null;\n    if (execDay === '') execDay = null;\n    out.push({\n      json: {\n        test_run_id: testRunId,\n        folder_id: folderId,\n        cycle_id: readField(cycle, ['iterationId', 'iteration.id'], ''),\n        run_name: readField(cycle, ['iteration.name', 'testRunName', 'name'], ''),\n        execution_day: execDay,\n        source_status_name: readField(cycle, ['status.name', 'status', 'result'], ''),\n        last_ingested_at: now,\n      },\n    });\n  }\n}\n\nreturn out;"
+      },
+      "id": "Expand_Testruns_To_Rows",
+      "name": "Expand_Testruns_To_Rows",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2160, 520]
+    },
+    {
+      "parameters": {
+        "jsCode": "const esc = (value) => {\n  if (value === null || value === undefined) return 'NULL';\n  return \"'\" + String(value).replace(/'/g, \"''\") + \"'\";\n};\nconst escDate = (value) => {\n  if (!value || String(value).trim() === '') return 'NULL';\n  return \"'\" + String(value).replace(/'/g, \"''\") + \"'::date\";\n};\n\nconst byId = new Map();\nfor (const item of items) {\n  const r = item.json;\n  if (r.test_run_id) byId.set(String(r.test_run_id), r);\n}\nconst rows = Array.from(byId.values());\nif (!rows.length) {\n  return [{ json: { sql_query: 'SELECT 1 AS zephyr_ingest_testruns_noop;' } }];\n}\n\nconst vals = rows.map((r) => {\n  return '(' + esc(r.test_run_id) + ', ' + esc(r.folder_id) + ', ' + esc(r.cycle_id || '') + ', ' + esc(r.run_name || '') + ', ' + escDate(r.execution_day) + ', ' + esc(r.source_status_name || '') + ', ' + esc(r.last_ingested_at) + '::timestamptz)';\n}).join(',\\n');\n\nconst sql = 'INSERT INTO test_runs (test_run_id, folder_id, cycle_id, run_name, execution_day, source_status_name, last_ingested_at)\\nVALUES ' + vals + '\\nON CONFLICT (test_run_id) DO UPDATE SET\\n  folder_id = EXCLUDED.folder_id,\\n  cycle_id = EXCLUDED.cycle_id,\\n  run_name = EXCLUDED.run_name,\\n  execution_day = EXCLUDED.execution_day,\\n  source_status_name = EXCLUDED.source_status_name,\\n  last_ingested_at = EXCLUDED.last_ingested_at;';\n\nreturn [{ json: { sql_query: sql, row_count: rows.length } }];"
+      },
+      "id": "Build_Testruns_Upsert_SQL",
+      "name": "Build_Testruns_Upsert_SQL",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2380, 520]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "={{ $json.sql_query }}",
+        "options": {}
+      },
+      "id": "Upsert_Testruns_Postgres",
+      "name": "Upsert_Testruns_Postgres",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [2600, 520],
+      "credentials": {
+        "postgres": {
+          "id": "PostgresZephyrOps",
+          "name": "PostgresZephyrOps"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "function buildQueryString(params) {\n  return Object.entries(params)\n    .filter(([, value]) => value !== undefined && value !== null && String(value) !== '')\n    .map(([key, value]) => `${encodeURIComponent(key)}=${encodeURIComponent(String(value))}`)\n    .join('&');\n}\n\nconst cfg = $items('Build_Config', 0, 0)[0].json;\nconst base = String(cfg.baseUrl || '').replace(/\\/+$/, '');\nconst endpointTemplate = String(cfg.testresultEndpointTemplate || 'rest/tests/1.0/testrun/{test_run_id}/testrunitems');\nconst fields = String(cfg.testresultFields || '').trim();\n\nreturn items.map((item) => {\n  const runId = String(item.json.test_run_id || '');\n  const endpoint = endpointTemplate.split('{test_run_id}').join(runId).replace(/^\\/+/, '');\n  const params = {};\n  if (fields) {\n    params.fields = fields;\n  }\n  const qs = buildQueryString(params);\n  return {\n    json: {\n      test_run_id: runId,\n      request_url: base + '/' + endpoint + (qs ? '?' + qs : ''),\n    },\n  };\n});"
+      },
+      "id": "Build_Testresult_Request_Items",
+      "name": "Build_Testresult_Request_Items",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2380, 660]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $json.request_url }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "={{ 'Bearer ' + $items('Build_Config', 0, 0)[0].json.token }}"
+            },
+            {
+              "name": "Accept",
+              "value": "application/json"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "json"
+            }
+          }
+        }
+      },
+      "id": "Fetch_Testresults",
+      "name": "Fetch_Testresults",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2600, 660],
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "jsCode": "function getByPath(obj, path) {\n  let cur = obj;\n  for (const p of path.split('.')) {\n    if (!cur || typeof cur !== 'object') return null;\n    cur = cur[p];\n  }\n  return cur;\n}\n\nfunction readField(row, paths, fallback) {\n  const fb = fallback === undefined ? '' : fallback;\n  for (const path of paths) {\n    if (path.indexOf('.') !== -1) {\n      const v = getByPath(row, path);\n      if (v != null && v !== '') return String(v);\n    } else if (row[path] != null && row[path] !== '') {\n      return String(row[path]);\n    }\n  }\n  return fb;\n}\n\nconst reqItems = $items('Build_Testresult_Request_Items', 0, 0);\nconst statusItems = $items('Fetch_Testresult_Statuses', 0, 0);\nconst statusMap = {};\nfor (const sItem of statusItems) {\n  const payload = sItem.json;\n  const list = Array.isArray(payload)\n    ? payload\n    : (payload && Array.isArray(payload.values)\n      ? payload.values\n      : (payload && typeof payload === 'object' && payload.id != null ? [payload] : []));\n  for (const s of list) {\n    if (!s || typeof s !== 'object') continue;\n    const sid = s.id;\n    const sname = s.name;\n    if (sid != null && sname) {\n      statusMap[String(sid)] = String(sname);\n    }\n  }\n}\n\nconst now = new Date().toISOString();\nconst out = [];\n\nfor (let i = 0; i < items.length; i++) {\n  const http = items[i].json || {};\n  const runId = (reqItems[i] && reqItems[i].json) ? String(reqItems[i].json.test_run_id || '') : '';\n  const payload = http.error ? {} : http;\n\n  let list = [];\n  if (Array.isArray(payload)) {\n    list = payload;\n  } else {\n    list = payload.testRunItems || payload.values || payload.results || payload.items || payload.content || payload.testResults || [];\n  }\n  if (!Array.isArray(list)) continue;\n\n  for (const row of list) {\n    if (!row || typeof row !== 'object') continue;\n    const lastResult = (row.$lastTestResult && typeof row.$lastTestResult === 'object') ? row.$lastTestResult : row;\n    const testResultId = readField(lastResult, ['id', 'testResultId'], '');\n    if (!testResultId) continue;\n    const statusId = readField(lastResult, ['testResultStatusId'], '');\n    const statusNameRaw = readField(lastResult, ['status.name', 'testResultStatus.name', 'status', 'result'], '');\n    const statusFromRawMap = statusNameRaw ? (statusMap[statusNameRaw] || '') : '';\n    const statusNameMapped = statusId ? (statusMap[statusId] || '') : '';\n    const statusName = statusFromRawMap || statusNameMapped || statusNameRaw || statusId;\n    out.push({\n      json: {\n        test_result_id: testResultId,\n        test_run_id: runId,\n        test_case_key: readField(lastResult, ['testCase.key', 'testCaseKey'], ''),\n        test_case_name: readField(lastResult, ['testCase.name', 'testCaseName', 'name'], ''),\n        current_status_name: statusName,\n        updated_at: now,\n      },\n    });\n  }\n}\n\nreturn out;"
+      },
+      "id": "Expand_Testresults_To_Rows",
+      "name": "Expand_Testresults_To_Rows",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2820, 660]
+    },
+    {
+      "parameters": {
+        "jsCode": "const esc = (value) => {\n  if (value === null || value === undefined) return 'NULL';\n  return \"'\" + String(value).replace(/'/g, \"''\") + \"'\";\n};\n\nconst byId = new Map();\nfor (const item of items) {\n  const r = item.json || {};\n  if (r.test_result_id) byId.set(String(r.test_result_id), r);\n}\nconst rows = Array.from(byId.values());\nif (!rows.length) {\n  return [{ json: { sql_query: 'SELECT 1 AS zephyr_ingest_testresults_noop;' } }];\n}\n\nconst vals = rows.map((r) => {\n  return '(' + esc(r.test_result_id) + ', ' + esc(r.test_run_id) + ', ' + esc(r.test_case_key || '') + ', ' + esc(r.test_case_name || '') + ', ' + esc(r.current_status_name || '') + ', ' + esc(r.updated_at) + '::timestamptz)';\n}).join(',\\n');\n\nconst sql = 'INSERT INTO test_results (test_result_id, test_run_id, test_case_key, test_case_name, current_status_name, updated_at)\\nVALUES ' + vals + '\\nON CONFLICT (test_result_id) DO UPDATE SET\\n  test_run_id = EXCLUDED.test_run_id,\\n  test_case_key = EXCLUDED.test_case_key,\\n  test_case_name = EXCLUDED.test_case_name,\\n  current_status_name = EXCLUDED.current_status_name,\\n  updated_at = EXCLUDED.updated_at;';\n\nreturn [{ json: { sql_query: sql, row_count: rows.length } }];"
+      },
+      "id": "Build_Testresults_Upsert_SQL",
+      "name": "Build_Testresults_Upsert_SQL",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [3040, 660]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "={{ $json.sql_query }}",
+        "options": {}
+      },
+      "id": "Upsert_Testresults_Postgres",
+      "name": "Upsert_Testresults_Postgres",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [3260, 660],
+      "credentials": {
+        "postgres": {
+          "id": "PostgresZephyrOps",
+          "name": "PostgresZephyrOps"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Cron_15m": {
+      "main": [[{ "node": "Build_Config", "type": "main", "index": 0 }]]
+    },
+    "Build_Config": {
+      "main": [[
+        { "node": "Fetch_Folder_Search", "type": "main", "index": 0 },
+        { "node": "Fetch_Testresult_Statuses", "type": "main", "index": 0 }
+      ]]
+    },
+    "Fetch_Folder_Search": {
+      "main": [[{ "node": "After_Search_Collect", "type": "main", "index": 0 }]]
+    },
+    "After_Search_Collect": {
+      "main": [[{ "node": "IF_Has_Folders_From_Search", "type": "main", "index": 0 }]]
+    },
+    "IF_Has_Folders_From_Search": {
+      "main": [
+        [{ "node": "Fetch_Folder_Tree", "type": "main", "index": 0 }],
+        [{ "node": "Prepare_Folder_Rows", "type": "main", "index": 0 }]
+      ]
+    },
+    "Fetch_Folder_Tree": {
+      "main": [[{ "node": "After_Tree_Collect", "type": "main", "index": 0 }]]
+    },
+    "After_Tree_Collect": {
+      "main": [[{ "node": "Prepare_Folder_Rows", "type": "main", "index": 0 }]]
+    },
+    "Prepare_Folder_Rows": {
+      "main": [
+        [
+          { "node": "Build_Folders_Upsert_SQL", "type": "main", "index": 0 },
+          { "node": "Build_Testrun_Request_Items", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Build_Folders_Upsert_SQL": {
+      "main": [[{ "node": "Upsert_Folders_Postgres", "type": "main", "index": 0 }]]
+    },
+    "Build_Testrun_Request_Items": {
+      "main": [[{ "node": "Fetch_Testruns", "type": "main", "index": 0 }]]
+    },
+    "Fetch_Testruns": {
+      "main": [[{ "node": "Expand_Testruns_To_Rows", "type": "main", "index": 0 }]]
+    },
+    "Expand_Testruns_To_Rows": {
+      "main": [[
+        { "node": "Build_Testruns_Upsert_SQL", "type": "main", "index": 0 },
+        { "node": "Build_Testresult_Request_Items", "type": "main", "index": 0 }
+      ]]
+    },
+    "Build_Testruns_Upsert_SQL": {
+      "main": [[{ "node": "Upsert_Testruns_Postgres", "type": "main", "index": 0 }]]
+    },
+    "Build_Testresult_Request_Items": {
+      "main": [[{ "node": "Fetch_Testresults", "type": "main", "index": 0 }]]
+    },
+    "Fetch_Testresults": {
+      "main": [[{ "node": "Expand_Testresults_To_Rows", "type": "main", "index": 0 }]]
+    },
+    "Expand_Testresults_To_Rows": {
+      "main": [[{ "node": "Build_Testresults_Upsert_SQL", "type": "main", "index": 0 }]]
+    },
+    "Build_Testresults_Upsert_SQL": {
+      "main": [[{ "node": "Upsert_Testresults_Postgres", "type": "main", "index": 0 }]]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "2f3d5a4f-87ea-4700-9d8f-c2cf6120e1ea",
+  "id": "zephyr_ingest_15m",
+  "tags": []
+}

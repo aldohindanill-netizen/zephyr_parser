@@ -1,0 +1,7 @@
+ZEPHYR_BASE_URL=https://jira.navio.auto
+ZEPHYR_API_TOKEN=__PUT_REAL_ZEPHYR_TOKEN__
+RUN_SHEET_NAME=Run
+UPDATE_ENDPOINT_TEMPLATE=rest/tests/1.0/testresult/{test_result_id}
+UPDATE_METHOD=PUT
+UPDATE_STATUS_ID_FIELD=testResultStatusId
+UPDATE_COMMENT_FIELD=comment

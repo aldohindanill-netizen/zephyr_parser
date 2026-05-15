@@ -6,31 +6,21 @@ param(
 $ErrorActionPreference = "Stop"
 
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-$EnvFile = Join-Path $ScriptDir ".env"
-
-function Import-DotEnvFile {
-    param([string]$Path)
-    if (-not (Test-Path $Path)) {
-        return
-    }
-    Get-Content $Path | ForEach-Object {
+$envPath = Join-Path $ScriptDir ".env"
+if (Test-Path -LiteralPath $envPath) {
+    Get-Content -LiteralPath $envPath | ForEach-Object {
         $line = $_.Trim()
-        if (-not $line -or $line.StartsWith("#") -or -not $line.Contains("=")) {
-            return
-        }
-        $pair = $line.Split("=", 2)
-        $name = $pair[0].Trim()
-        $value = $pair[1].Trim()
-        if ($value.StartsWith("'") -and $value.EndsWith("'")) {
-            $value = $value.Substring(1, $value.Length - 2)
-        } elseif ($value.StartsWith('"') -and $value.EndsWith('"')) {
+        if (-not $line -or $line.StartsWith('#') -or -not $line.Contains('=')) { return }
+        $parts = $line -split '=', 2
+        $name = $parts[0].Trim()
+        $value = $parts[1].Trim()
+        if (($value.StartsWith("'") -and $value.EndsWith("'")) -or
+            ($value.StartsWith('"') -and $value.EndsWith('"'))) {
             $value = $value.Substring(1, $value.Length - 2)
         }
-        [System.Environment]::SetEnvironmentVariable($name, $value, "Process")
+        [Environment]::SetEnvironmentVariable($name, $value, 'Process')
     }
 }
-
-Import-DotEnvFile -Path $EnvFile
 
 $PythonBin = if ($env:PYTHON_BIN) { $env:PYTHON_BIN } else { "py" }
 $PythonBinArgs = @()
@@ -86,7 +76,7 @@ $ConfluenceDryRun = if ($env:CONFLUENCE_DRY_RUN) { $env:CONFLUENCE_DRY_RUN } els
 $ConfluenceUpdateExisting = if ($env:CONFLUENCE_UPDATE_EXISTING) { $env:CONFLUENCE_UPDATE_EXISTING } else { "false" }
 
 if (-not $env:ZEPHYR_API_TOKEN) {
-    throw "Set ZEPHYR_API_TOKEN environment variable before running."
+    throw "Set ZEPHYR_API_TOKEN in .env or environment before running."
 }
 
 $ArgsList = @(
@@ -116,113 +106,6 @@ $ArgsList = @(
     "--cycle-progress-output", $CycleProgressOutput
     "--weekly-cycle-matrix-output", $WeeklyCycleMatrixOutput
 )
-
-$RollingDaysRaw = if ($env:ZEPHYR_ROLLING_DAYS) { $env:ZEPHYR_ROLLING_DAYS.Trim() } else { "" }
-$RollingDaysInt = 0
-if ($RollingDaysRaw -match '^\d+$') {
-    $RollingDaysInt = [int]$RollingDaysRaw
-}
-if ($RollingDaysInt -gt 0) {
-    $ArgsList += @("--rolling-days", "$RollingDaysInt")
-} else {
-    if ($env:ZEPHYR_FROM_DATE) {
-        $ArgsList += @("--from-date", $env:ZEPHYR_FROM_DATE)
-    }
-    if ($env:ZEPHYR_TO_DATE) {
-        $ArgsList += @("--to-date", $env:ZEPHYR_TO_DATE)
-    }
-}
-
-if ($TreeLeafOnly -eq "true") {
-    $ArgsList += "--tree-leaf-only"
-}
-if ($TreeAutoProbe -eq "true") {
-    $ArgsList += "--tree-autoprobe"
-}
-if ($TreeNameRegex) {
-    $ArgsList += @("--tree-name-regex", $TreeNameRegex)
-}
-if ($TreeRootPathRegex) {
-    $ArgsList += @("--tree-root-path-regex", $TreeRootPathRegex)
-}
-if ($FolderNameRegex) {
-    $ArgsList += @("--folder-name-regex", $FolderNameRegex)
-}
-if ($FolderPathRegex) {
-    $ArgsList += @("--folder-path-regex", $FolderPathRegex)
-}
-if ($RootFolderIds) {
-    $RootFolderIds.Split(",") | ForEach-Object {
-        $rootId = $_.Trim()
-        if ($rootId) {
-            $ArgsList += @("--root-folder-id", $rootId)
-        }
-    }
-}
-
-if ($ExportWeeklyReadable -eq "true") {
-    $ArgsList += @("--export-weekly-readable", "--weekly-readable-dir", $WeeklyReadableDir)
-    $WeeklyReadableFormats.Split(",") | ForEach-Object {
-        $fmt = $_.Trim()
-        if ($fmt) {
-            $ArgsList += @("--weekly-readable-format", $fmt)
-        }
-    }
-}
-
-if ($ExportDailyReadable -eq "true") {
-    $ArgsList += @("--export-daily-readable", "--daily-readable-dir", $DailyReadableDir)
-    $DailyReadableFormats.Split(",") | ForEach-Object {
-        $fmt = $_.Trim()
-        if ($fmt) {
-            $ArgsList += @("--daily-readable-format", $fmt)
-        }
-    }
-}
-
-if ($ConfluencePublishDaily -eq "true") {
-    $ArgsList += "--publish-confluence-daily"
-}
-
-if ($ConfluencePublishWeekly -eq "true") {
-    $ArgsList += "--publish-confluence-weekly"
-}
-
-if ($ConfluenceBaseUrl) {
-    $ArgsList += @("--confluence-base-url", $ConfluenceBaseUrl)
-}
-
-if ($ConfluenceSpaceKey) {
-    $ArgsList += @("--confluence-space-key", $ConfluenceSpaceKey)
-}
-
-if ($ConfluenceParentPageId) {
-    $ArgsList += @("--confluence-parent-page-id", $ConfluenceParentPageId)
-}
-
-if ($ConfluenceUsername) {
-    $ArgsList += @("--confluence-username", $ConfluenceUsername)
-}
-
-if ($ConfluenceApiToken) {
-    $ArgsList += @("--confluence-api-token", $ConfluenceApiToken)
-}
-
-if ($ConfluenceAuthMode -in @("auto", "basic", "bearer")) {
-    $ArgsList += @("--confluence-auth-mode", $ConfluenceAuthMode)
-}
-
-if ($ConfluenceVerifySsl -in @("true", "false")) {
-    $ArgsList += @("--confluence-verify-ssl", $ConfluenceVerifySsl)
-}
-
-if ($ConfluenceDryRun -eq "true") {
-    $ArgsList += "--confluence-dry-run"
-}
-
-if ($ConfluenceUpdateExisting -eq "true") {
-    $ArgsList += "--confluence-update-existing"
-}
 
 if ($env:ZEPHYR_EXTRA_PARAMS) {
     $env:ZEPHYR_EXTRA_PARAMS.Split(",") | ForEach-Object {
