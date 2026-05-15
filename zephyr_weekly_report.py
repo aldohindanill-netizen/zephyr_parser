@@ -8970,44 +8970,20 @@ def run_once(args: argparse.Namespace) -> int:
                 write_cycles_cases_csv(args.cycles_cases_output, cycles_cases_rows)
             if args.export_case_steps:
                 write_case_steps_csv(args.case_steps_output, case_steps_rows)
-            report_data: dict[tuple[str, str], dict[str, Any]] | None = None
-            daily_readable_paths: list[str] = []
-            if args.export_daily_readable:
-                selected_formats = set(args.daily_readable_format or ["html", "wiki"])
+            needs_report_data = bool(
+                args.cycle_progress_output
+                or args.weekly_cycle_matrix_output
+                or args.export_weekly_readable
+            )
+            # One aggregation for readable/matrix paths, then rolling filter **before** writing
+            # daily/weekly artifacts so HTML/wiki/Confluence targets match the same date window.
+            if args.export_daily_readable or needs_report_data:
                 if case_steps_rows:
                     report_data = aggregate_readable_daily_reports_from_steps(
                         case_steps_rows, cycles_cases_rows
                     )
                 else:
                     report_data = aggregate_readable_daily_reports_legacy(cycles_cases_rows)
-                fmt_join = ", ".join(sorted(selected_formats))
-                print(
-                    f"Building daily readable reports for {len(report_data)} folder payload(s) "
-                    f"(formats: {fmt_join})..."
-                )
-                daily_readable_paths = write_daily_readable_reports(
-                    output_dir=args.daily_readable_dir,
-                    report_data=report_data,
-                    formats=selected_formats,
-                    template_dir=readable_template_dir,
-                )
-                if "html" in selected_formats:
-                    daily_html_publish_paths = _expected_daily_readable_html_paths(
-                        args.daily_readable_dir, report_data
-                    )
-            needs_report_data = bool(
-                args.cycle_progress_output
-                or args.weekly_cycle_matrix_output
-                or args.export_weekly_readable
-            )
-            if needs_report_data:
-                if report_data is None:
-                    if case_steps_rows:
-                        report_data = aggregate_readable_daily_reports_from_steps(
-                            case_steps_rows, cycles_cases_rows
-                        )
-                    else:
-                        report_data = aggregate_readable_daily_reports_legacy(cycles_cases_rows)
             if (
                 effective_rolling_days > 0
                 and from_date is not None
@@ -9020,6 +8996,29 @@ def run_once(args: argparse.Namespace) -> int:
                     to_date,
                     extra_report_days=drv_extra_report_days if drv_extra_report_days else None,
                 )
+            if args.export_daily_readable:
+                selected_formats = set(args.daily_readable_format or ["html", "wiki"])
+                if not report_data:
+                    print(
+                        "Skipping daily readable reports: no folder payloads "
+                        "(empty cycles/case steps or outside rolling window)."
+                    )
+                else:
+                    fmt_join = ", ".join(sorted(selected_formats))
+                    print(
+                        f"Building daily readable reports for {len(report_data)} folder payload(s) "
+                        f"(formats: {fmt_join})..."
+                    )
+                    daily_readable_paths = write_daily_readable_reports(
+                        output_dir=args.daily_readable_dir,
+                        report_data=report_data,
+                        formats=selected_formats,
+                        template_dir=readable_template_dir,
+                    )
+                    if "html" in selected_formats:
+                        daily_html_publish_paths = _expected_daily_readable_html_paths(
+                            args.daily_readable_dir, report_data
+                        )
             cycle_progress_csv_updated: bool | None = None
             weekly_matrix_csv_updates: list[tuple[str, bool]] = []
             report_data_for_matrix = report_data or {}
