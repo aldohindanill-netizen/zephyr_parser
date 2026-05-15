@@ -1449,7 +1449,10 @@ def _inject_confluence_anchor_macros(storage_html: str) -> str:
     def _repl(match: re.Match[str]) -> str:
         tag = match.group("tag")
         anchor_id = match.group("id")
-        attrs = (match.group("before") or "") + (match.group("after") or "")
+        before = match.group("before") or ""
+        after = match.group("after") or ""
+        # Keep id on the heading so publish-time parsers (excerpt span, CSS) still work.
+        attrs = f"{before} id=\"{anchor_id}\"{after}"
         text = match.group("text")
         anchor_macro = (
             '<ac:structured-macro ac:name="anchor">'
@@ -6000,8 +6003,59 @@ def _replace_weekly_jira_key_spans_with_confluence_macro(body_html: str) -> str:
     return _WEEKLY_JIRA_KEY_SPAN_RE.sub(_repl, body_html)
 
 
+_WEEKLY_DEFECTS_HEADER_RE = re.compile(
+    r"<h3\b[^>]*>\s*<strong>\s*Завед[её]нные дефекты\s*</strong>\s*</h3>\s*",
+    flags=re.IGNORECASE,
+)
+_WEEKLY_DEFECTS_JIRA_OPEN_RE = re.compile(
+    r"<div\b[^>]*\bclass=(?:'|\")[^'\"]*\bweekly-defects-jira\b[^'\"]*(?:'|\")[^>]*>",
+    flags=re.IGNORECASE,
+)
+_WEEKLY_EXCERPT_MACRO_RE = re.compile(
+    r"<ac:structured-macro\b[^>]*\bac:name=['\"]excerpt['\"][^>]*>\s*"
+    r"<ac:rich-text-body>(?P<body>.*?)</ac:rich-text-body>\s*</ac:structured-macro>",
+    flags=re.IGNORECASE | re.DOTALL,
+)
+
+
+def _unwrap_weekly_excerpt_macro(body_html: str) -> str:
+    """Drop a single weekly excerpt wrapper so the span can be rebuilt."""
+    match = _WEEKLY_EXCERPT_MACRO_RE.search(body_html)
+    if not match:
+        return body_html
+    return body_html[: match.start()] + match.group("body") + body_html[match.end() :]
+
+
+def _find_weekly_excerpt_block_span(body_html: str) -> tuple[int, int] | None:
+    """Return [start, end) for the weekly Confluence excerpt (выборка).
+
+    Span covers Weekly title, overall/scenario score blocks, and «Заведённые дефекты».
+    """
+    start_match = re.search(r"<h1\b[^>]*>\s*Weekly\b", body_html, flags=re.IGNORECASE)
+    if not start_match:
+        return None
+    start = start_match.start()
+
+    scenario_match = re.search(
+        r"<h3\b[^>]*>\s*<strong>\s*Score по сценариям\s*</strong>\s*</h3>\s*"
+        r"<table\b[^>]*>.*?</table>",
+        body_html[start:],
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if not scenario_match:
+        return None
+    end = start + scenario_match.end()
+
+    tail = body_html[end:]
+    if not _WEEKLY_DEFECTS_HEADER_RE.search(tail):
+        return start, end
+
+    # Defects are the last weekly section (before </body>); include all trailing content.
+    return start, len(body_html)
+
+
 def _wrap_weekly_scenario_block_with_excerpt_macro(body_html: str) -> str:
-    """Wrap weekly block from top Weekly heading to scenario table."""
+    """Wrap weekly excerpt block (выборка): Weekly heading through «Заведённые дефекты»."""
     if (
         not body_html
         or "Score по сценариям" not in body_html
@@ -6009,28 +6063,18 @@ def _wrap_weekly_scenario_block_with_excerpt_macro(body_html: str) -> str:
         or not _parse_bool_env(os.getenv("ZEPHYR_CONFLUENCE_WEEKLY_EXCERPT", "true"))
     ):
         return body_html
-    if (
-        "ac:name=\"excerpt\"" in body_html
-        or "ac:name='excerpt'" in body_html
-    ):
+    body_html = _unwrap_weekly_excerpt_macro(body_html)
+    span = _find_weekly_excerpt_block_span(body_html)
+    if span is None:
         return body_html
-    pattern = re.compile(
-        r"(?P<block><h1\b[^>]*>\s*Weekly\b.*?</h1>.*?"
-        r"<h3\b[^>]*>\s*<strong>\s*Score по сценариям\s*</strong>\s*</h3>\s*"
-        r"<table\b[^>]*>.*?</table>)",
-        flags=re.IGNORECASE | re.DOTALL,
+    block_start, block_end = span
+    block_html = body_html[block_start:block_end]
+    wrapped = (
+        '<ac:structured-macro ac:name="excerpt" ac:schema-version="1">'
+        f"<ac:rich-text-body>{block_html}</ac:rich-text-body>"
+        "</ac:structured-macro>"
     )
-
-    def _repl(match: re.Match[str]) -> str:
-        block_html = match.group("block")
-        wrapped = (
-            '<ac:structured-macro ac:name="excerpt" ac:schema-version="1">'
-            f"<ac:rich-text-body>{block_html}</ac:rich-text-body>"
-            "</ac:structured-macro>"
-        )
-        return wrapped
-
-    return pattern.sub(_repl, body_html, count=1)
+    return body_html[:block_start] + wrapped + body_html[block_end:]
 
 
 def _replace_legacy_weekly_table_macros_with_excerpt(body_html: str) -> str:
@@ -6410,7 +6454,6 @@ def render_weekly_html_report(
             ".weekly-overall-cell{flex:1 1 240px;min-width:240px;max-width:360px;}"
             ".weekly-overall-cell h4{margin:0 0 6px;}"
             ".weekly-defects-list{margin:8px 0 16px;padding-left:24px;}"
-            ".weekly-defects-jira{margin:12px 0 20px;}"
             ".weekly-defects-table{font-size:14px;}"
             ".weekly-defects-table th{background:#f4f5f7;color:#42526e;font-weight:600;}"
             ".weekly-defects-matrix{table-layout:fixed;width:100%;}"
