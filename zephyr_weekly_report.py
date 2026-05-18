@@ -93,13 +93,16 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--base-url",
-        required=True,
-        help="Zephyr base URL, e.g. https://api.zephyrscale.smartbear.com",
+        default=os.getenv("ZEPHYR_BASE_URL"),
+        help=(
+            "Zephyr base URL, e.g. https://api.zephyrscale.smartbear.com "
+            "(default: ZEPHYR_BASE_URL from environment or .env)"
+        ),
     )
     parser.add_argument(
         "--endpoint",
-        default="/v2/testexecutions",
-        help="API endpoint path (default: /v2/testexecutions)",
+        default=os.getenv("ZEPHYR_ENDPOINT", "/v2/testexecutions"),
+        help="API endpoint path (default: ZEPHYR_ENDPOINT or /v2/testexecutions)",
     )
     parser.add_argument(
         "--token",
@@ -144,7 +147,8 @@ def parse_args() -> argparse.Namespace:
         default=_env_int("ZEPHYR_ROLLING_DAYS", 0),
         help=(
             "If >0, set from/to to a rolling window ending today (inclusive), "
-            "overriding --from-date and --to-date. Default 0 (off); ZEPHYR_ROLLING_DAYS."
+            "overriding --from-date and --to-date, and filter aggregated readable "
+            "report_data by resolved folder day. Default 0 (off); ZEPHYR_ROLLING_DAYS."
         ),
     )
     parser.add_argument(
@@ -402,15 +406,6 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--rolling-days",
-        type=int,
-        default=0,
-        help=(
-            "When >0 with --from-date and --to-date, filter aggregated readable "
-            "report_data by resolved folder day."
-        ),
-    )
-    parser.add_argument(
         "--regenerate-last-7-days",
         action="store_true",
         help=(
@@ -487,6 +482,20 @@ def parse_args() -> argparse.Namespace:
         "--create-folder-use-as-root",
         action="store_true",
         help="Use created/existing folder id as the only --root-folder-id for this run.",
+    )
+    parser.add_argument(
+        "--loop-interval-minutes",
+        type=int,
+        default=None,
+        help=(
+            "Run continuously with this many minutes between runs "
+            "(default: ZEPHYR_LOOP_INTERVAL_MINUTES, off when unset)."
+        ),
+    )
+    parser.add_argument(
+        "--run-lock-file",
+        default=os.getenv("ZEPHYR_RUN_LOCK_FILE"),
+        help="Optional lock file path to prevent overlapping runs.",
     )
     return parser.parse_args()
 
@@ -3071,6 +3080,12 @@ def _extract_key_from_entry(entry: dict[str, Any]) -> str:
 
 
 _TASK_LINKS_DEBUG_REMAINING = 3
+_CASE_STEP_TASK_LINKS_INDEX = 22
+
+
+def _task_links_fallback_enabled() -> bool:
+    """Probe optional Zephyr link endpoints when inline fields do not expose defects."""
+    return _parse_bool_env(os.getenv("ZEPHYR_FETCH_TASK_LINKS_FALLBACK", "true"))
 
 
 def _maybe_debug_task_links_payload(label: str, payload: Any) -> None:
@@ -3341,7 +3356,9 @@ def build_case_step_rows(
                     )
                 test_result_links = run_item_links + test_result_links
                 if not test_result_links and (
-                    issue_count_int > 0 or _parse_bool_env(os.getenv("ZEPHYR_DEBUG_TASK_LINKS"))
+                    issue_count_int > 0
+                    or _task_links_fallback_enabled()
+                    or _parse_bool_env(os.getenv("ZEPHYR_DEBUG_TASK_LINKS"))
                 ):
                     test_result_links = fetch_links_for_run_item(
                         base_url,
@@ -3424,16 +3441,14 @@ def build_case_step_rows(
                         ]
                     )
 
-    # Final pass: collect all "id:N" markers from task_links column (last
-    # element of every row), batch-resolve them to Jira keys, and rewrite
-    # the column in place. This converts Zephyr-internal numeric ids
-    # (returned in traceLinks[].issueId) into human-readable keys like
-    # CSD-47277.
+    # Final pass: collect all "id:N" markers from task_links, batch-resolve them
+    # to Jira keys, and rewrite the column in place. This converts Zephyr-internal
+    # numeric ids (returned in traceLinks[].issueId) into human-readable keys.
     pending_ids: set[str] = set()
     for row in rows:
-        if not row:
+        if len(row) <= _CASE_STEP_TASK_LINKS_INDEX:
             continue
-        cell = str(row[-1] or "")
+        cell = str(row[_CASE_STEP_TASK_LINKS_INDEX] or "")
         if "id:" not in cell:
             continue
         for token in cell.split(","):
@@ -3444,12 +3459,12 @@ def build_case_step_rows(
         id_to_key = _resolve_jira_issue_keys(base_url, headers, pending_ids)
         if id_to_key:
             for row in rows:
-                if not row:
+                if len(row) <= _CASE_STEP_TASK_LINKS_INDEX:
                     continue
-                cell = str(row[-1] or "")
+                cell = str(row[_CASE_STEP_TASK_LINKS_INDEX] or "")
                 if "id:" not in cell:
                     continue
-                row[-1] = _resolve_id_markers_in_links(cell, id_to_key)
+                row[_CASE_STEP_TASK_LINKS_INDEX] = _resolve_id_markers_in_links(cell, id_to_key)
     return rows
 
 
@@ -8297,6 +8312,7 @@ def write_daily_readable_reports(
     for (folder_id, folder_name), payload in sorted(report_data.items(), key=lambda item: item[0][1]):
         cycles = payload["cycles"]
         fid = str(folder_id)
+        base_name = _build_daily_report_base_name(fid, folder_name, cycles)
         if "html" in formats:
             html_path = os.path.join(output_dir, f"{base_name}.html")
             body = render_daily_html_report(
@@ -8332,7 +8348,8 @@ def _expected_daily_readable_html_paths(
     for (folder_id, folder_name), _payload in sorted(
         report_data.items(), key=lambda item: item[0][1]
     ):
-        base_name = f"{slugify(folder_name)}_{folder_id}"
+        cycles = _payload.get("cycles", {})
+        base_name = _build_daily_report_base_name(str(folder_id), folder_name, cycles)
         paths.append(os.path.join(output_dir, f"{base_name}.html"))
     return paths
 
@@ -8554,6 +8571,28 @@ def put_test_step_result(
 def main() -> int:
     _load_repo_dotenv_if_absent()
     args = parse_args()
+
+    lock_acquired = False
+    try:
+        if args.run_lock_file:
+            lock_acquired = _try_acquire_run_lock(args.run_lock_file)
+            if not lock_acquired:
+                print(
+                    f"Another run is already active; lock file is held: {args.run_lock_file}",
+                    file=sys.stderr,
+                )
+                return 0
+
+        loop_interval_minutes = _resolve_loop_interval_minutes(args)
+        if loop_interval_minutes is not None:
+            return _run_loop(args, loop_interval_minutes)
+
+        return run_once(args)
+    finally:
+        if lock_acquired:
+            _release_run_lock()
+
+
 def run_once(args: argparse.Namespace) -> int:
     try:
         effective_rolling_days = args.rolling_days
@@ -8586,6 +8625,11 @@ def run_once(args: argparse.Namespace) -> int:
                 if td:
                     args.to_date = td
         token = args.token or os.getenv("ZEPHYR_API_TOKEN")
+        if not args.base_url:
+            raise ValueError(
+                "Missing Zephyr base URL. Pass --base-url or set ZEPHYR_BASE_URL "
+                "in the environment or .env file."
+            )
         if not token:
             raise ValueError(
                 "Missing API token. Pass --token or set ZEPHYR_API_TOKEN environment variable."
