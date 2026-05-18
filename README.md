@@ -84,6 +84,7 @@ The launcher runs in tree-first mode by default:
   - `ZEPHYR_EXPORT_WEEKLY_READABLE=true`
   - `ZEPHYR_WEEKLY_READABLE_DIR=reports/weekly_readable`
   - `ZEPHYR_WEEKLY_READABLE_FORMATS=html,wiki`
+  - standalone build-log pages are exported by default into `reports/build_log_reports/`; HTML pages are included in weekly Confluence publishing
   - when Autofleet AB-test branch is resolved from Jira (`labels = autofleet_abtest`, build from `description` point `A`), weekly render adds a first column/card `Лучшая ветка: <branch>` in both `Общий score` and `Score по сценариям`
   - insertion rule is strict: only for weeks with `week_start < best_branch_week_start` (week of that branch and later weeks are not modified)
 - Jira Autofleet AB-test extraction helpers (for downstream automation):
