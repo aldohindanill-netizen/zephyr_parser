@@ -32,6 +32,17 @@ Get-Content -LiteralPath $envPath | ForEach-Object {
     [Environment]::SetEnvironmentVariable($name, $value, 'Process')
 }
 
+function Test-EnvEnabled {
+  param(
+    [string]$Value,
+    [bool]$Default = $false
+  )
+  if ([string]::IsNullOrWhiteSpace($Value)) {
+    return $Default
+  }
+  return @("1", "true", "yes", "y", "on") -contains $Value.Trim().ToLowerInvariant()
+}
+
 $env:ZEPHYR_CONFLUENCE_AUTH_SCHEME = "bearer"
 
 $extraArgs = @($args)
@@ -63,21 +74,46 @@ $cmdArgs = @(
   "--tree-leaf-only",
   "--tree-name-regex", "$env:ZEPHYR_TREE_NAME_REGEX",
   "--folder-name-endpoint-template", "$env:ZEPHYR_FOLDER_NAME_ENDPOINT_TEMPLATE",
-  "--export-cycles-cases",
   "--cycles-cases-output", "$env:ZEPHYR_CYCLES_CASES_OUTPUT",
   "--testcase-endpoint-template", "$env:ZEPHYR_TESTCASE_ENDPOINT_TEMPLATE",
-  "--synthetic-cycle-ids",
-  "--export-case-steps",
   "--case-steps-output", "$env:ZEPHYR_CASE_STEPS_OUTPUT",
-  "--export-daily-readable",
   "--daily-readable-dir", "$env:ZEPHYR_DAILY_READABLE_DIR",
-  "--daily-readable-format", "html",
-  "--daily-readable-format", "wiki",
   "--readable-template-dir", $readableTemplateDir,
   "--continue-on-folder-error"
 )
 
-if ($env:ZEPHYR_EXPORT_WEEKLY_READABLE -eq 'true') {
+if ($env:ZEPHYR_FOLDER_WORKERS) {
+  $cmdArgs += @("--folder-workers", "$env:ZEPHYR_FOLDER_WORKERS")
+}
+
+if ($env:ZEPHYR_DETAIL_WORKERS) {
+  $cmdArgs += @("--detail-workers", "$env:ZEPHYR_DETAIL_WORKERS")
+}
+
+if (Test-EnvEnabled $env:ZEPHYR_EXPORT_CYCLES_CASES $true) {
+  $cmdArgs += @("--export-cycles-cases")
+}
+
+if (Test-EnvEnabled $env:ZEPHYR_SYNTHETIC_CYCLE_IDS $true) {
+  $cmdArgs += @("--synthetic-cycle-ids")
+}
+
+if (Test-EnvEnabled $env:ZEPHYR_EXPORT_CASE_STEPS $true) {
+  $cmdArgs += @("--export-case-steps")
+}
+
+if (Test-EnvEnabled $env:ZEPHYR_EXPORT_DAILY_READABLE $true) {
+  $cmdArgs += @("--export-daily-readable")
+  $dailyFmtRaw = if ($env:ZEPHYR_DAILY_READABLE_FORMATS) { $env:ZEPHYR_DAILY_READABLE_FORMATS } else { "html,wiki" }
+  foreach ($part in ($dailyFmtRaw -split ',')) {
+    $f = $part.Trim().ToLowerInvariant()
+    if ($f -eq 'html' -or $f -eq 'wiki') {
+      $cmdArgs += @("--daily-readable-format", $f)
+    }
+  }
+}
+
+if (Test-EnvEnabled $env:ZEPHYR_EXPORT_WEEKLY_READABLE $false) {
   $cmdArgs += @("--export-weekly-readable")
   if ($env:ZEPHYR_WEEKLY_READABLE_DIR) {
     $cmdArgs += @("--weekly-readable-dir", "$env:ZEPHYR_WEEKLY_READABLE_DIR")

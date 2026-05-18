@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import atexit
 import base64
+import concurrent.futures
 import io
 import csv
 import io
@@ -22,6 +23,8 @@ import os
 import re
 import signal
 import sys
+import threading
+import time
 import uuid
 import zlib
 import urllib.error
@@ -87,6 +90,66 @@ class ConfluencePublishConfig:
     publish_weekly: bool = False
 
 
+@dataclass
+class StepTiming:
+    name: str
+    duration_seconds: float
+    detail: str = ""
+
+
+class TimingRecorder:
+    def __init__(self) -> None:
+        self.records: list[StepTiming] = []
+
+    def record(self, name: str, duration_seconds: float, detail: str = "") -> None:
+        self.records.append(StepTiming(name, duration_seconds, detail))
+        suffix = f" ({detail})" if detail else ""
+        print(f"Timing: {name} took {duration_seconds:.2f}s{suffix}")
+
+    def summarize(self, limit: int = 12) -> None:
+        if not self.records:
+            return
+        total = sum(item.duration_seconds for item in self.records)
+        print(f"Timing summary: {len(self.records)} step(s), total measured {total:.2f}s")
+        for item in sorted(
+            self.records, key=lambda rec: rec.duration_seconds, reverse=True
+        )[:limit]:
+            suffix = f" ({item.detail})" if item.detail else ""
+            print(f"- {item.name}: {item.duration_seconds:.2f}s{suffix}")
+
+
+class _TimedStep:
+    def __init__(self, recorder: TimingRecorder, name: str, detail: str = "") -> None:
+        self.recorder = recorder
+        self.name = name
+        self.detail = detail
+        self.started_at = 0.0
+
+    def __enter__(self) -> "_TimedStep":
+        self.started_at = time.perf_counter()
+        return self
+
+    def __exit__(self, _exc_type: Any, _exc: Any, _tb: Any) -> None:
+        self.recorder.record(
+            self.name, time.perf_counter() - self.started_at, self.detail
+        )
+
+
+def timed_step(recorder: TimingRecorder, name: str, detail: str = "") -> _TimedStep:
+    return _TimedStep(recorder, name, detail)
+
+
+def _bounded_worker_count(raw: int | None, item_count: int | None = None) -> int:
+    try:
+        workers = int(raw or 1)
+    except (TypeError, ValueError):
+        workers = 1
+    workers = max(1, workers)
+    if item_count is not None and item_count > 0:
+        workers = min(workers, item_count)
+    return workers
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Fetch Zephyr executions and build weekly pass/fail report."
@@ -130,6 +193,24 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=100,
         help="Page size for paginated APIs (default: 100)",
+    )
+    parser.add_argument(
+        "--folder-workers",
+        type=int,
+        default=_env_int("ZEPHYR_FOLDER_WORKERS", 1),
+        help=(
+            "Number of folders to fetch/process concurrently in tree discovery mode "
+            "(default: ZEPHYR_FOLDER_WORKERS or 1)."
+        ),
+    )
+    parser.add_argument(
+        "--detail-workers",
+        type=int,
+        default=_env_int("ZEPHYR_DETAIL_WORKERS", 1),
+        help=(
+            "Number of test-run item detail requests to process concurrently "
+            "(default: ZEPHYR_DETAIL_WORKERS or 1)."
+        ),
     )
     parser.add_argument(
         "--from-date",
@@ -1023,19 +1104,44 @@ def request_json(
     request = urllib.request.Request(
         url, headers=request_headers, method=method.upper(), data=payload
     )
-    try:
-        with urllib.request.urlopen(request, timeout=30) as response:
-            raw = response.read()
-            if not raw:
-                return None
-            return json.loads(raw.decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        body = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(
-            f"HTTP {exc.code} while requesting '{url}' [{method.upper()}]. Response: {body}"
-        ) from exc
-    except urllib.error.URLError as exc:
-        raise RuntimeError(f"Network error while requesting '{url}': {exc}") from exc
+    method_upper = method.upper()
+    retries = _env_int("ZEPHYR_GET_RETRIES", 2) if method_upper == "GET" else 0
+    for attempt in range(retries + 1):
+        try:
+            with urllib.request.urlopen(request, timeout=30) as response:
+                raw = response.read()
+                if not raw:
+                    return None
+                return json.loads(raw.decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            retryable = exc.code == 429 or 500 <= exc.code <= 599
+            if method_upper == "GET" and retryable and attempt < retries:
+                retry_after = exc.headers.get("Retry-After") if exc.headers else None
+                try:
+                    delay = float(retry_after) if retry_after else 0.5 * (2**attempt)
+                except ValueError:
+                    delay = 0.5 * (2**attempt)
+                print(
+                    f"Retrying GET after HTTP {exc.code} in {delay:.1f}s: {url}",
+                    file=sys.stderr,
+                )
+                time.sleep(delay)
+                continue
+            body = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(
+                f"HTTP {exc.code} while requesting '{url}' [{method_upper}]. Response: {body}"
+            ) from exc
+        except urllib.error.URLError as exc:
+            if method_upper == "GET" and attempt < retries:
+                delay = 0.5 * (2**attempt)
+                print(
+                    f"Retrying GET after network error in {delay:.1f}s: {url}",
+                    file=sys.stderr,
+                )
+                time.sleep(delay)
+                continue
+            raise RuntimeError(f"Network error while requesting '{url}': {exc}") from exc
+    raise RuntimeError(f"Unexpected retry exhaustion while requesting '{url}'")
 
 
 def _parse_bool_env(value: str | None) -> bool:
@@ -2895,9 +3001,20 @@ def fetch_test_result_status_names(
     return resolved
 
 
+_TESTRUN_ITEMS_CACHE: dict[tuple[str, str], list[dict[str, Any]]] = {}
+_TEST_RESULTS_CACHE: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
+_DETAIL_CACHE_LOCK = threading.Lock()
+
+
 def fetch_testrun_items(
     base_url: str, headers: dict[str, str], test_run_id: str
 ) -> list[dict[str, Any]]:
+    cache_key = (base_url.rstrip("/"), str(test_run_id))
+    with _DETAIL_CACHE_LOCK:
+        cached = _TESTRUN_ITEMS_CACHE.get(cache_key)
+    if cached is not None:
+        return list(cached)
+
     endpoint = f"rest/tests/1.0/testrun/{test_run_id}/testrunitems"
     # Pull link-shaped fields too: depending on Zephyr deployment the
     # linked Jira issues may sit on the run item (`traceLinks`/`issueLinks`/
@@ -2912,7 +3029,12 @@ def fetch_testrun_items(
     if isinstance(payload, dict):
         items = payload.get("testRunItems")
         if isinstance(items, list):
-            return [item for item in items if isinstance(item, dict)]
+            out = [item for item in items if isinstance(item, dict)]
+            with _DETAIL_CACHE_LOCK:
+                _TESTRUN_ITEMS_CACHE[cache_key] = list(out)
+            return out
+    with _DETAIL_CACHE_LOCK:
+        _TESTRUN_ITEMS_CACHE[cache_key] = []
     return []
 
 
@@ -2989,6 +3111,12 @@ def fetch_test_results_for_item(
     test_run_id: str,
     item_id: str,
 ) -> list[dict[str, Any]]:
+    cache_key = (base_url.rstrip("/"), str(test_run_id), str(item_id))
+    with _DETAIL_CACHE_LOCK:
+        cached = _TEST_RESULTS_CACHE.get(cache_key)
+    if cached is not None:
+        return list(cached)
+
     endpoint = f"rest/tests/1.0/testrun/{test_run_id}/testresults"
     # Some Zephyr deployments expose linked Jira issues as `traceLinks`,
     # others as `issueLinks`, `defects`, or even on the testCase itself
@@ -3009,11 +3137,18 @@ def fetch_test_results_for_item(
     }
     payload = request_json(base_url, endpoint, headers, params=params, method="GET")
     if isinstance(payload, list):
-        return [item for item in payload if isinstance(item, dict)]
+        out = [item for item in payload if isinstance(item, dict)]
+        with _DETAIL_CACHE_LOCK:
+            _TEST_RESULTS_CACHE[cache_key] = list(out)
+        return out
     if isinstance(payload, dict):
         extracted = extract_items(payload)
         if extracted:
+            with _DETAIL_CACHE_LOCK:
+                _TEST_RESULTS_CACHE[cache_key] = list(extracted)
             return extracted
+    with _DETAIL_CACHE_LOCK:
+        _TEST_RESULTS_CACHE[cache_key] = []
     return []
 
 
@@ -3245,7 +3380,32 @@ def build_case_step_rows(
     headers: dict[str, str],
     status_names: dict[str, str],
     synthetic_cycle_ids: bool = False,
+    detail_workers: int = 1,
 ) -> list[list[str]]:
+    worker_count = _bounded_worker_count(detail_workers, len(cycles))
+    if worker_count > 1:
+        indexed_rows: list[tuple[int, list[list[str]]]] = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count) as executor:
+            future_to_index = {
+                executor.submit(
+                    build_case_step_rows,
+                    folder,
+                    [cycle],
+                    base_url,
+                    headers,
+                    status_names,
+                    synthetic_cycle_ids,
+                    1,
+                ): idx
+                for idx, cycle in enumerate(cycles)
+            }
+            for future in concurrent.futures.as_completed(future_to_index):
+                indexed_rows.append((future_to_index[future], future.result()))
+        rows: list[list[str]] = []
+        for _idx, part in sorted(indexed_rows, key=lambda item: item[0]):
+            rows.extend(part)
+        return rows
+
     rows: list[list[str]] = []
     for cycle in cycles:
         test_run_id = _read_cycle_field(cycle, ["id", "testRunId"], "")
@@ -8705,30 +8865,34 @@ def run_once(args: argparse.Namespace) -> int:
             publish_confluence_weekly = bool(confluence_cfg and confluence_cfg.publish_weekly)
             need_cycles_cases_data = args.export_cycles_cases or args.export_daily_readable
             collect_case_steps = args.export_case_steps or args.export_daily_readable
+            timings = TimingRecorder()
             total_executions = 0
             total_skipped = Counter()
             errors: list[str] = []
-            status_names = (
-                fetch_test_result_status_names(args.base_url, headers, args.project_id)
-                if collect_case_steps
-                else {}
-            )
+            if collect_case_steps:
+                with timed_step(timings, "fetch test result status names"):
+                    status_names = fetch_test_result_status_names(
+                        args.base_url, headers, args.project_id
+                    )
+            else:
+                status_names = {}
             abtest_issues: list[dict[str, Any]] | None = None
             drv_extra_report_days: set[date] = set()
             if from_date is not None and to_date is not None:
-                jira_rb_drv = _resolve_weekly_jira_metadata_base(args.base_url)
-                jira_rh_drv = _jira_bug_metadata_auth_headers(headers) or headers
-                abtest_issues = fetch_autofleet_abtest_candidates(
-                    base_url=jira_rb_drv,
-                    auth_headers=jira_rh_drv,
-                )
-                drv_extra_report_days = _drv_extra_folder_days_outside_rolling_window(
-                    from_date,
-                    to_date,
-                    jira_base=jira_rb_drv,
-                    jira_headers=jira_rh_drv,
-                    issues=abtest_issues,
-                )
+                with timed_step(timings, "fetch DRV/Jira metadata"):
+                    jira_rb_drv = _resolve_weekly_jira_metadata_base(args.base_url)
+                    jira_rh_drv = _jira_bug_metadata_auth_headers(headers) or headers
+                    abtest_issues = fetch_autofleet_abtest_candidates(
+                        base_url=jira_rb_drv,
+                        auth_headers=jira_rh_drv,
+                    )
+                    drv_extra_report_days = _drv_extra_folder_days_outside_rolling_window(
+                        from_date,
+                        to_date,
+                        jira_base=jira_rb_drv,
+                        jira_headers=jira_rh_drv,
+                        issues=abtest_issues,
+                    )
                 print(
                     "DRV: summary — "
                     f"Jira issues={len(abtest_issues)}, "
@@ -8754,13 +8918,14 @@ def run_once(args: argparse.Namespace) -> int:
                 )
                 scan_params = dict(extra_params)
                 scan_params["query"] = project_query
-                executions = fetch_executions(
-                    base_url=args.base_url,
-                    endpoint=args.endpoint,
-                    headers=headers,
-                    extra_params=scan_params,
-                    page_size=args.page_size,
-                )
+                with timed_step(timings, "execution discovery fetch", project_query):
+                    executions = fetch_executions(
+                        base_url=args.base_url,
+                        endpoint=args.endpoint,
+                        headers=headers,
+                        extra_params=scan_params,
+                        page_size=args.page_size,
+                    )
                 if args.debug_folder_fields:
                     print_folder_field_debug(executions)
                 folder_ids_from_executions = set()
@@ -8772,28 +8937,39 @@ def run_once(args: argparse.Namespace) -> int:
                     resolved_folder_names,
                     resolved_folder_paths,
                     name_resolution_stats,
-                ) = resolve_folder_names_by_id(
-                    folder_ids=folder_ids_from_executions,
-                    endpoint_templates=args.folder_name_endpoint_template,
-                    base_url=args.base_url,
-                    headers=headers,
-                )
+                ) = ({}, {}, Counter())
+                with timed_step(
+                    timings,
+                    "resolve folder names",
+                    f"{len(folder_ids_from_executions)} folder id(s)",
+                ):
+                    (
+                        resolved_folder_names,
+                        resolved_folder_paths,
+                        name_resolution_stats,
+                    ) = resolve_folder_names_by_id(
+                        folder_ids=folder_ids_from_executions,
+                        endpoint_templates=args.folder_name_endpoint_template,
+                        base_url=args.base_url,
+                        headers=headers,
+                    )
                 if args.debug_folder_fields:
                     print_resolved_folder_names(resolved_folder_names)
                     print_resolved_folder_paths(resolved_folder_paths)
-                folder_rows, filter_stats = aggregate_by_folder_from_executions(
-                    items=executions,
-                    date_fields=date_fields,
-                    status_fields=status_fields,
-                    from_date=from_date,
-                    to_date=to_date,
-                    root_folder_ids=root_folder_ids,
-                    allowed_root_folder_ids=allowed_root_folder_ids or None,
-                    folder_name_pattern=folder_name_pattern,
-                    resolved_folder_names=resolved_folder_names,
-                    folder_path_pattern=folder_path_pattern,
-                    resolved_folder_paths=resolved_folder_paths,
-                )
+                with timed_step(timings, "aggregate execution discovery folders"):
+                    folder_rows, filter_stats = aggregate_by_folder_from_executions(
+                        items=executions,
+                        date_fields=date_fields,
+                        status_fields=status_fields,
+                        from_date=from_date,
+                        to_date=to_date,
+                        root_folder_ids=root_folder_ids,
+                        allowed_root_folder_ids=allowed_root_folder_ids or None,
+                        folder_name_pattern=folder_name_pattern,
+                        resolved_folder_names=resolved_folder_names,
+                        folder_path_pattern=folder_path_pattern,
+                        resolved_folder_paths=resolved_folder_paths,
+                    )
                 total_executions = len(executions)
                 if need_cycles_cases_data:
                     grouped_cycles: dict[str, list[dict[str, Any]]] = defaultdict(list)
@@ -8834,6 +9010,7 @@ def run_once(args: argparse.Namespace) -> int:
                                     headers=headers,
                                     status_names=status_names,
                                     synthetic_cycle_ids=args.synthetic_cycle_ids,
+                                    detail_workers=args.detail_workers,
                                 )
                             )
                 if filter_stats:
@@ -8841,6 +9018,7 @@ def run_once(args: argparse.Namespace) -> int:
                 if name_resolution_stats:
                     print(f"Folder name resolution stats: {dict(name_resolution_stats)}")
             else:
+                tree_started_at = time.perf_counter()
                 discovery_errors: list[str] = []
                 folders: list[FolderNode] = []
                 source = "none"
@@ -8914,6 +9092,11 @@ def run_once(args: argparse.Namespace) -> int:
                     f"Tree folders discovered: {len(folders)}; "
                     f"selected after filters: {len(selected_folders)} folder(s)"
                 )
+                timings.record(
+                    "tree discovery",
+                    time.perf_counter() - tree_started_at,
+                    f"source={source}, selected={len(selected_folders)}",
+                )
 
                 n_selected = len(selected_folders)
                 if n_selected:
@@ -8936,7 +9119,17 @@ def run_once(args: argparse.Namespace) -> int:
                         roadmap_parts.append("Confluence weekly publish")
                     print("Next: " + ", then ".join(roadmap_parts) + ".")
 
-                for idx, folder in enumerate(selected_folders, start=1):
+                folder_worker_count = _bounded_worker_count(args.folder_workers, n_selected)
+                detail_worker_count = _bounded_worker_count(args.detail_workers)
+                if n_selected:
+                    print(
+                        "Workers: "
+                        f"folder_workers={folder_worker_count}, "
+                        f"detail_workers={detail_worker_count}"
+                    )
+
+                def _process_tree_folder(idx: int, folder: FolderNode) -> dict[str, Any]:
+                    folder_started_at = time.perf_counter()
                     per_folder_params = dict(extra_params)
                     per_folder_params["query"] = sanitize_tql_query(
                         fill_template(
@@ -8950,58 +9143,115 @@ def run_once(args: argparse.Namespace) -> int:
                         f"[{idx}/{n_selected}] Folder {folder.folder_id} ({folder.folder_name}): "
                         "fetching executions..."
                     )
-                    try:
-                        executions = fetch_executions(
+                    executions = fetch_executions(
+                        base_url=args.base_url,
+                        endpoint=args.endpoint,
+                        headers=headers,
+                        extra_params=per_folder_params,
+                        page_size=args.page_size,
+                    )
+                    weekly, skipped = aggregate_weekly(
+                        items=executions,
+                        date_fields=date_fields,
+                        status_fields=status_fields,
+                        from_date=from_date,
+                        to_date=to_date,
+                    )
+                    folder_cycles_cases_rows: list[list[str]] = []
+                    folder_case_steps_rows: list[list[str]] = []
+                    if need_cycles_cases_data:
+                        folder_cycles_cases_rows = build_cycle_case_rows(
+                            folder=folder,
+                            cycles=executions,
+                            testcase_endpoint_templates=args.testcase_endpoint_template,
                             base_url=args.base_url,
-                            endpoint=args.endpoint,
                             headers=headers,
-                            extra_params=per_folder_params,
-                            page_size=args.page_size,
+                            synthetic_cycle_ids=args.synthetic_cycle_ids,
                         )
-                        weekly, skipped = aggregate_weekly(
-                            items=executions,
-                            date_fields=date_fields,
-                            status_fields=status_fields,
-                            from_date=from_date,
-                            to_date=to_date,
+                    if collect_case_steps:
+                        folder_case_steps_rows = build_case_step_rows(
+                            folder=folder,
+                            cycles=executions,
+                            base_url=args.base_url,
+                            headers=headers,
+                            status_names=status_names,
+                            synthetic_cycle_ids=args.synthetic_cycle_ids,
+                            detail_workers=detail_worker_count,
                         )
-                        folder_rows.append((folder, weekly))
-                        total_executions += len(executions)
-                        total_skipped.update(skipped)
-                        if need_cycles_cases_data:
-                            cycles_cases_rows.extend(
-                                build_cycle_case_rows(
-                                    folder=folder,
-                                    cycles=executions,
-                                    testcase_endpoint_templates=args.testcase_endpoint_template,
-                                    base_url=args.base_url,
-                                    headers=headers,
-                                    synthetic_cycle_ids=args.synthetic_cycle_ids,
-                                )
-                            )
-                        if collect_case_steps:
-                            case_steps_rows.extend(
-                                build_case_step_rows(
-                                    folder=folder,
-                                    cycles=executions,
-                                    base_url=args.base_url,
-                                    headers=headers,
-                                    status_names=status_names,
-                                    synthetic_cycle_ids=args.synthetic_cycle_ids,
-                                )
-                            )
-                        print(
-                            f"[{idx}/{n_selected}] Folder {folder.folder_id} ({folder.folder_name}): "
-                            f"done ({len(executions)} execution(s))"
-                        )
-                    except Exception as exc:  # pylint: disable=broad-except
-                        message = f"Folder {folder.folder_id} ({folder.folder_name}) failed: {exc}"
-                        if args.continue_on_folder_error:
-                            errors.append(message)
-                            print(f"[{idx}/{n_selected}] FAILED (continuing): {message}")
-                            continue
-                        raise RuntimeError(message) from exc
+                    duration = time.perf_counter() - folder_started_at
+                    print(
+                        f"[{idx}/{n_selected}] Folder {folder.folder_id} ({folder.folder_name}): "
+                        f"done ({len(executions)} execution(s), {duration:.2f}s)"
+                    )
+                    return {
+                        "idx": idx,
+                        "folder": folder,
+                        "weekly": weekly,
+                        "skipped": skipped,
+                        "executions_count": len(executions),
+                        "cycles_cases_rows": folder_cycles_cases_rows,
+                        "case_steps_rows": folder_case_steps_rows,
+                        "duration": duration,
+                    }
 
+                folder_results: list[dict[str, Any]] = []
+                if n_selected:
+                    with timed_step(
+                        timings,
+                        "process tree folders",
+                        f"folders={n_selected}, workers={folder_worker_count}",
+                    ):
+                        if folder_worker_count == 1:
+                            for idx, folder in enumerate(selected_folders, start=1):
+                                try:
+                                    folder_results.append(_process_tree_folder(idx, folder))
+                                except Exception as exc:  # pylint: disable=broad-except
+                                    message = (
+                                        f"Folder {folder.folder_id} ({folder.folder_name}) failed: {exc}"
+                                    )
+                                    if args.continue_on_folder_error:
+                                        errors.append(message)
+                                        print(f"[{idx}/{n_selected}] FAILED (continuing): {message}")
+                                        continue
+                                    raise RuntimeError(message) from exc
+                        else:
+                            with concurrent.futures.ThreadPoolExecutor(
+                                max_workers=folder_worker_count
+                            ) as executor:
+                                future_to_context = {
+                                    executor.submit(_process_tree_folder, idx, folder): (idx, folder)
+                                    for idx, folder in enumerate(selected_folders, start=1)
+                                }
+                                for future in concurrent.futures.as_completed(future_to_context):
+                                    idx, folder = future_to_context[future]
+                                    try:
+                                        folder_results.append(future.result())
+                                    except Exception as exc:  # pylint: disable=broad-except
+                                        message = (
+                                            f"Folder {folder.folder_id} ({folder.folder_name}) failed: {exc}"
+                                        )
+                                        if args.continue_on_folder_error:
+                                            errors.append(message)
+                                            print(f"[{idx}/{n_selected}] FAILED (continuing): {message}")
+                                            continue
+                                        raise RuntimeError(message) from exc
+
+                for result in sorted(folder_results, key=lambda item: int(item["idx"])):
+                    folder_rows.append((result["folder"], result["weekly"]))
+                    total_executions += int(result["executions_count"])
+                    total_skipped.update(result["skipped"])
+                    cycles_cases_rows.extend(result["cycles_cases_rows"])
+                    case_steps_rows.extend(result["case_steps_rows"])
+                    timings.record(
+                        "process folder",
+                        float(result["duration"]),
+                        (
+                            f"{result['folder'].folder_id} "
+                            f"{result['folder'].folder_name}"
+                        )
+                    )
+
+            write_csv_started_at = time.perf_counter()
             print("Writing per-folder weekly CSVs...")
             os.makedirs(args.per_folder_dir, exist_ok=True)
             for folder, weekly in folder_rows:
@@ -9014,6 +9264,7 @@ def run_once(args: argparse.Namespace) -> int:
                 write_cycles_cases_csv(args.cycles_cases_output, cycles_cases_rows)
             if args.export_case_steps:
                 write_case_steps_csv(args.case_steps_output, case_steps_rows)
+            timings.record("write CSV outputs", time.perf_counter() - write_csv_started_at)
             needs_report_data = bool(
                 args.cycle_progress_output
                 or args.weekly_cycle_matrix_output
@@ -9022,12 +9273,13 @@ def run_once(args: argparse.Namespace) -> int:
             # One aggregation for readable/matrix paths, then rolling filter **before** writing
             # daily/weekly artifacts so HTML/wiki/Confluence targets match the same date window.
             if args.export_daily_readable or needs_report_data:
-                if case_steps_rows:
-                    report_data = aggregate_readable_daily_reports_from_steps(
-                        case_steps_rows, cycles_cases_rows
-                    )
-                else:
-                    report_data = aggregate_readable_daily_reports_legacy(cycles_cases_rows)
+                with timed_step(timings, "aggregate readable report data"):
+                    if case_steps_rows:
+                        report_data = aggregate_readable_daily_reports_from_steps(
+                            case_steps_rows, cycles_cases_rows
+                        )
+                    else:
+                        report_data = aggregate_readable_daily_reports_legacy(cycles_cases_rows)
             if (
                 effective_rolling_days > 0
                 and from_date is not None
@@ -9053,12 +9305,17 @@ def run_once(args: argparse.Namespace) -> int:
                         f"Building daily readable reports for {len(report_data)} folder payload(s) "
                         f"(formats: {fmt_join})..."
                     )
-                    daily_readable_paths = write_daily_readable_reports(
-                        output_dir=args.daily_readable_dir,
-                        report_data=report_data,
-                        formats=selected_formats,
-                        template_dir=readable_template_dir,
-                    )
+                    with timed_step(
+                        timings,
+                        "write daily readable reports",
+                        f"payloads={len(report_data)}, formats={fmt_join}",
+                    ):
+                        daily_readable_paths = write_daily_readable_reports(
+                            output_dir=args.daily_readable_dir,
+                            report_data=report_data,
+                            formats=selected_formats,
+                            template_dir=readable_template_dir,
+                        )
                     if "html" in selected_formats:
                         daily_html_publish_paths = _expected_daily_readable_html_paths(
                             args.daily_readable_dir, report_data
@@ -9089,6 +9346,7 @@ def run_once(args: argparse.Namespace) -> int:
                     dict[str, Any],
                 ]
             ] = []
+            weekly_matrix_started_at = time.perf_counter()
             if args.weekly_cycle_matrix_output:
                 weekly_cycle_matrices = _weekly_cycle_matrix_data_all(report_data_for_matrix)
                 if weekly_cycle_matrices:
@@ -9114,8 +9372,14 @@ def run_once(args: argparse.Namespace) -> int:
                     week_path = _weekly_output_path_for_week(args.weekly_cycle_matrix_output, week_start)
                     week_updated = write_weekly_cycle_matrix_csv(week_path, weekday_labels, rows)
                     weekly_matrix_csv_updates.append((week_path, week_updated))
+                timings.record(
+                    "write weekly cycle matrix",
+                    time.perf_counter() - weekly_matrix_started_at,
+                    f"matrices={len(weekly_cycle_matrices)}",
+                )
             weekly_readable_paths: list[str] = []
             if args.export_weekly_readable:
+                weekly_readable_started_at = time.perf_counter()
                 if not weekly_cycle_matrices:
                     weekly_cycle_matrices = _weekly_cycle_matrix_data_all(report_data_for_matrix)
                 if weekly_cycle_matrices:
@@ -9284,6 +9548,11 @@ def run_once(args: argparse.Namespace) -> int:
                         report_data_for_matrix,
                         per_folder=args.weekly_readable_per_folder,
                     )
+                timings.record(
+                    "write weekly readable reports",
+                    time.perf_counter() - weekly_readable_started_at,
+                    f"files={len(weekly_readable_paths)}",
+                )
             if confluence_cfg and publish_confluence_daily:
                 if not args.export_daily_readable:
                     print(
@@ -9309,9 +9578,14 @@ def run_once(args: argparse.Namespace) -> int:
                             f"{len(missing_daily)} expected daily HTML file(s) missing on disk."
                         )
                     if existing_daily_html:
-                        outcomes = publish_reports_to_confluence(
-                            existing_daily_html, confluence_cfg
-                        )
+                        with timed_step(
+                            timings,
+                            "publish daily reports to Confluence",
+                            f"files={len(existing_daily_html)}",
+                        ):
+                            outcomes = publish_reports_to_confluence(
+                                existing_daily_html, confluence_cfg
+                            )
                         print("Confluence daily publish:")
                         for line in outcomes:
                             print(f"- {line}")
@@ -9350,9 +9624,14 @@ def run_once(args: argparse.Namespace) -> int:
                             f"{len(missing_weekly)} expected weekly HTML file(s) missing on disk."
                         )
                     if existing_weekly_html:
-                        outcomes = publish_reports_to_confluence(
-                            existing_weekly_html, confluence_cfg
-                        )
+                        with timed_step(
+                            timings,
+                            "publish weekly reports to Confluence",
+                            f"files={len(existing_weekly_html)}",
+                        ):
+                            outcomes = publish_reports_to_confluence(
+                                existing_weekly_html, confluence_cfg
+                            )
                         print("Confluence weekly publish:")
                         for line in outcomes:
                             print(f"- {line}")
@@ -9400,6 +9679,7 @@ def run_once(args: argparse.Namespace) -> int:
                 print("Folder errors:")
                 for item in errors:
                     print(f"- {item}")
+            timings.summarize()
             return 0
 
         executions = fetch_executions(
