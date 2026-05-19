@@ -1,5 +1,0 @@
-SELECT id, status, mode, "workflowId", "startedAt", "stoppedAt"
-FROM execution_entity
-WHERE "workflowId" = 'zephyr_writeback_15m'
-ORDER BY id DESC
-LIMIT 10;

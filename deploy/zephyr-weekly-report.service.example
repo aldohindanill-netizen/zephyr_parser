@@ -19,7 +19,7 @@ Restart=always
 RestartSec=10
 WorkingDirectory=/path/to/zephyr_parser
 Environment=PYTHONUNBUFFERED=1
-ExecStart=/path/to/zephyr_parser/run_zephyr_weekly_report.sh
+ExecStart=/path/to/zephyr_parser/run_zephyr.sh
 
 [Install]
 WantedBy=multi-user.target

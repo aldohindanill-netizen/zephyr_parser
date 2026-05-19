@@ -2838,17 +2838,41 @@ def _resolve_daily_title_date(cycles: dict[str, Any]) -> str:
     return candidates[0]
 
 
+def _resolve_nightly_build_version_day(
+    folder_name: str,
+    cycles: dict[str, Any],
+    *,
+    allow_report_day_fallback: bool = True,
+) -> date | None:
+    """Calendar day for nightly-dev-YYYY.MM.DD build label.
+
+    With a nightly-dev prefix in the folder name: prefix date + 1 day (daily title left).
+    Otherwise, when allow_report_day_fallback: folder report day (weekly matrix logic).
+    """
+    left = _parse_weekly_column_label_from_folder_name(folder_name)
+    if left:
+        left_date = left.replace("nightly-dev-", "", 1)
+        try:
+            return datetime.strptime(left_date, "%Y.%m.%d").date() + timedelta(days=1)
+        except ValueError:
+            pass
+    if allow_report_day_fallback:
+        return _resolve_folder_report_day(folder_name, cycles)
+    return None
+
+
 def _build_daily_report_title(folder_name: str, cycles: dict[str, Any]) -> str:
     # Daily title format:
     # nightly-dev-YYYY.MM.DD, dow, dd.mm.yyyy
     left = _parse_weekly_column_label_from_folder_name(folder_name)
     left_date = left.replace("nightly-dev-", "", 1) if left else ""
-    left_day: date | None = None
-    if left_date:
-        try:
-            left_day = datetime.strptime(left_date, "%Y.%m.%d").date()
-        except ValueError:
-            left_day = None
+    left_day = (
+        _resolve_nightly_build_version_day(
+            folder_name, cycles, allow_report_day_fallback=False
+        )
+        if left
+        else None
+    )
     right_day = _parse_report_day_from_folder_name(folder_name)
     if right_day is None:
         right_day = _resolve_folder_dominant_actual_date(cycles)
@@ -2857,8 +2881,6 @@ def _build_daily_report_title(folder_name: str, cycles: dict[str, Any]) -> str:
         right_day = _parse_display_date(report_date) if report_date else None
 
     # Shift title dates by +1 day (titles/pages only; report columns unchanged).
-    if left_day is not None:
-        left_day = left_day + timedelta(days=1)
     if right_day is not None:
         right_day = right_day + timedelta(days=1)
 
@@ -4135,28 +4157,11 @@ def _build_log_folder_nightly_display_and_date(
     folder_name: str,
     cycles: dict[str, Any],
 ) -> tuple[str, date | None]:
-    """Label like nightly-dev-YYYY.MM.DD (as in UI) plus a sortable calendar date."""
-    raw = _parse_weekly_column_label_from_folder_name(folder_name)
-    if raw:
-        m = re.match(
-            r"^(nightly-dev)[._-](\d{4})[._-](\d{2})[._-](\d{2})\b",
-            str(raw).strip(),
-            flags=re.IGNORECASE,
-        )
-        if m:
-            disp = f"{m.group(1).lower()}-{m.group(2)}.{m.group(3)}.{m.group(4)}"
-            d = date(int(m.group(2)), int(m.group(3)), int(m.group(4)))
-            return disp, d
-    dd = _resolve_daily_title_date(cycles)
-    if dd:
-        norm = _normalize_display_date(dd)
-        if norm:
-            try:
-                d = date.fromisoformat(norm)
-                disp = f"nightly-dev-{d.strftime('%Y.%m.%d')}"
-                return disp, d
-            except ValueError:
-                pass
+    """Label like nightly-dev-YYYY.MM.DD (daily title left date) plus sortable date."""
+    build_day = _resolve_nightly_build_version_day(folder_name, cycles)
+    if build_day is not None:
+        disp = f"nightly-dev-{build_day.strftime('%Y.%m.%d')}"
+        return disp, build_day
     slug = str(folder_name or "").strip() or "unknown"
     return slug, None
 
