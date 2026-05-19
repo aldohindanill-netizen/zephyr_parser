@@ -86,7 +86,8 @@ Python: `PYTHON_BIN`, затем `python3`, затем `python` (Windows: `py -3
 | `ZEPHYR_CYCLE_PROGRESS_OUTPUT` | `reports/cycle_progress.csv` | Прогресс по циклам |
 | `ZEPHYR_WEEKLY_CYCLE_MATRIX_OUTPUT` | `reports/weekly_cycle_matrix.csv` | Недельная матрица (+ dated copies) |
 | `ZEPHYR_DAILY_READABLE_DIR` | `reports/daily_readable/` | HTML и wiki для Confluence |
-| `ZEPHYR_WEEKLY_READABLE_DIR` | `reports/weekly_readable/` | Недельные HTML/wiki |
+| `ZEPHYR_WEEKLY_READABLE_DIR` | `reports/weekly_readable/` | Недельные HTML/wiki (операционный отчёт) |
+| `ZEPHYR_WEEKLY_ANALYTICS_DIR` | `reports/weekly_analytics/` | Аналитика: тренд, rolling, по неделям |
 | `ZEPHYR_BUILD_LOG_REPORT_DIR` | `reports/build_log_reports/` | Build-log по Jira issue |
 
 Шаблоны: `report_templates/readable/`
@@ -97,7 +98,8 @@ Python: `PYTHON_BIN`, затем `python3`, затем `python` (Windows: `py -3
 
 Включить в `.env`:
 
-- `ZEPHYR_CONFLUENCE_PUBLISH_DAILY=true` и/или `ZEPHYR_CONFLUENCE_PUBLISH_WEEKLY=true`
+- `ZEPHYR_CONFLUENCE_PUBLISH_DAILY=true`, `ZEPHYR_CONFLUENCE_PUBLISH_WEEKLY=true` и/или `ZEPHYR_CONFLUENCE_PUBLISH_WEEKLY_ANALYTICS=true`
+- Для analytics: одна страница с фиксированным title (`ZEPHYR_CONFLUENCE_WEEKLY_ANALYTICS_TITLE`)
 - `ZEPHYR_CONFLUENCE_BASE_URL`, `ZEPHYR_CONFLUENCE_API_TOKEN`, `ZEPHYR_CONFLUENCE_SPACE_KEY`
 - Для basic auth: `ZEPHYR_CONFLUENCE_USER`
 
@@ -108,8 +110,12 @@ Python: `PYTHON_BIN`, затем `python3`, затем `python` (Windows: `py -3
 ## Безопасность
 
 - Не передавайте токен через `--token` в обычном использовании — только `ZEPHYR_API_TOKEN` в `.env`.
-- Не коммитьте `.env` в git.
-- `.env.example` — безопасный шаблон в репозитории.
+- Production: `ZEPHYR_ENFORCE_ENV_TOKEN=true` (запрет `--token` в CLI).
+- Не коммитьте `.env` в git; ограничьте ACL на файл service account.
+- **Audit:** `reports/audit/audit.jsonl` — события run/export/publish (`ZEPHYR_AUDIT_*`, см. `.env.example`).
+- **Logviewer:** только URL из `ZEPHYR_LOGVIEWER_URL_REGEX` (`ZEPHYR_LOGVIEWER_STRICT=true`).
+- **TLS:** по умолчанию системный контекст SSL (без принудительного TLS 1.3). Для жёсткого пола: `ZEPHYR_SSL_MIN_VERSION=1.2` или `1.3`.
+- Документация: `docs/security-passport.md`, `docs/security-topology.md`, `docs/security-deploy.md`.
 
 ---
 

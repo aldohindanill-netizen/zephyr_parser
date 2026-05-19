@@ -17,9 +17,17 @@ Wants=network-online.target
 Type=simple
 Restart=always
 RestartSec=10
+User=zephyr
+Group=zephyr
 WorkingDirectory=/path/to/zephyr_parser
 Environment=PYTHONUNBUFFERED=1
+# Secrets: chmod 600, keys ZEPHYR_API_TOKEN, ZEPHYR_CONFLUENCE_API_TOKEN, etc.
+EnvironmentFile=-/etc/zephyr-parser/env
 ExecStart=/path/to/zephyr_parser/run_zephyr.sh
+ProtectSystem=strict
+ProtectHome=true
+NoNewPrivileges=true
+PrivateTmp=true
 
 [Install]
 WantedBy=multi-user.target
