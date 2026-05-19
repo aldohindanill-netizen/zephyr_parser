@@ -1,5 +1,7 @@
 # Scheduled wrapper for run_zephyr.ps1 (Task Scheduler / manual).
 # Logs to reports\logs\scheduled_YYYY-MM-DD.log; skips if previous run still active.
+# Runs run_zephyr.ps1 in a child PowerShell process (not Start-Job) so Python is not
+# killed prematurely. Full stdout/stderr: logs\zephyr_*.log
 
 $ErrorActionPreference = "Stop"
 
@@ -7,7 +9,38 @@ $RepoRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $LogDir = Join-Path $RepoRoot "reports\logs"
 $LockFile = Join-Path $RepoRoot "reports\.zephyr_scheduled.lock"
 $Runner = Join-Path $RepoRoot "run_zephyr.ps1"
+$EnvFile = Join-Path $RepoRoot ".env"
 $LogFile = Join-Path $LogDir ("scheduled_{0:yyyy-MM-dd}.log" -f (Get-Date))
+
+function Import-RepoDotEnv {
+    if (-not (Test-Path -LiteralPath $EnvFile)) { return }
+    Get-Content -LiteralPath $EnvFile | ForEach-Object {
+        $line = $_.Trim()
+        if (-not $line -or $line.StartsWith('#') -or -not $line.Contains('=')) { return }
+        $parts = $line -split '=', 2
+        $name = $parts[0].Trim()
+        $value = $parts[1].Trim()
+        if (($value.StartsWith("'") -and $value.EndsWith("'")) -or
+            ($value.StartsWith('"') -and $value.EndsWith('"'))) {
+            $value = $value.Substring(1, $value.Length - 2)
+        }
+        [Environment]::SetEnvironmentVariable($name, $value, 'Process')
+    }
+}
+
+function Get-RunTimeoutMinutes {
+    $raw = $env:ZEPHYR_RUN_TIMEOUT_MINUTES
+    if ([string]::IsNullOrWhiteSpace($raw)) {
+        return 90
+    }
+    $minutes = 0
+    if (-not [int]::TryParse($raw.Trim(), [ref]$minutes) -or $minutes -lt 1) {
+        return 90
+    }
+    return $minutes
+}
+
+Import-RepoDotEnv
 
 New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
 
@@ -38,15 +71,33 @@ catch [System.IO.IOException] {
     exit 0
 }
 
+$exitCode = 1
 try {
-    Write-Log "START cwd=$RepoRoot"
+    $timeoutMinutes = Get-RunTimeoutMinutes
+    Write-Log "START cwd=$RepoRoot timeout=${timeoutMinutes}m (details: logs\zephyr_*.log)"
     Set-Location -LiteralPath $RepoRoot
 
-    & $Runner *>&1 | ForEach-Object { Write-Log $_.ToString() }
-    $code = if ($null -ne $LASTEXITCODE) { $LASTEXITCODE } else { 0 }
+    $powershell = (Get-Command powershell.exe).Source
+    $arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$Runner`""
+    $timeoutMs = $timeoutMinutes * 60 * 1000
 
-    Write-Log "END exit=$code"
-    exit $code
+    $proc = Start-Process -FilePath $powershell `
+        -ArgumentList $arguments `
+        -WorkingDirectory $RepoRoot `
+        -PassThru -NoNewWindow
+
+    $completed = $proc.WaitForExit($timeoutMs)
+    if (-not $completed) {
+        & taskkill.exe /PID $proc.Id /T /F 2>$null | Out-Null
+        Write-Log "TIMEOUT: run exceeded ${timeoutMinutes} minute(s); stopped process tree pid=$($proc.Id)"
+        $exitCode = 124
+    }
+    else {
+        $proc.Refresh()
+        $exitCode = if ($null -ne $proc.ExitCode) { $proc.ExitCode } else { 0 }
+    }
+
+    Write-Log "END exit=$exitCode"
 }
 finally {
     if ($null -ne $lock) {
@@ -56,3 +107,5 @@ finally {
         Remove-Item -LiteralPath $LockFile -Force -ErrorAction SilentlyContinue
     }
 }
+
+exit $exitCode

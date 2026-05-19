@@ -1893,6 +1893,7 @@ def publish_reports_to_confluence(
         chart_name = os.path.basename(chart_path)
         if os.path.exists(chart_path) and not use_native_chart and not use_zephyr_macro:
             body_html = _append_confluence_attachment_image(body_html, chart_name)
+        body_html = _wrap_daily_report_with_excerpt_macro(body_html)
         title_from_html = _extract_html_title(raw_html).strip()
         title_from_file = _confluence_page_title_for_file(html_path, cfg)
         primary_title = title_from_html or title_from_file
@@ -6921,6 +6922,18 @@ def _find_weekly_excerpt_block_span(body_html: str) -> tuple[int, int] | None:
     return start, len(body_html)
 
 
+def _wrap_html_span_with_excerpt_macro(
+    body_html: str, block_start: int, block_end: int
+) -> str:
+    block_html = body_html[block_start:block_end]
+    wrapped = (
+        '<ac:structured-macro ac:name="excerpt" ac:schema-version="1">'
+        f"<ac:rich-text-body>{block_html}</ac:rich-text-body>"
+        "</ac:structured-macro>"
+    )
+    return body_html[:block_start] + wrapped + body_html[block_end:]
+
+
 def _wrap_weekly_scenario_block_with_excerpt_macro(body_html: str) -> str:
     """Wrap weekly excerpt block (выборка): Weekly heading through «Заведённые дефекты»."""
     if (
@@ -6935,13 +6948,67 @@ def _wrap_weekly_scenario_block_with_excerpt_macro(body_html: str) -> str:
     if span is None:
         return body_html
     block_start, block_end = span
-    block_html = body_html[block_start:block_end]
-    wrapped = (
-        '<ac:structured-macro ac:name="excerpt" ac:schema-version="1">'
-        f"<ac:rich-text-body>{block_html}</ac:rich-text-body>"
-        "</ac:structured-macro>"
+    return _wrap_html_span_with_excerpt_macro(body_html, block_start, block_end)
+
+
+_DAILY_REPORT_PREAMBLE_OPEN_RE = re.compile(
+    r"<div\b[^>]*\bclass=(?:'|\")[^'\"]*\breport-preamble\b",
+    flags=re.IGNORECASE,
+)
+
+
+def _daily_has_scenarios_section(body_html: str) -> bool:
+    return bool(
+        re.search(
+            r"<h2\b[^>]*\bid\s*=\s*['\"]scenarios['\"]",
+            body_html,
+            flags=re.IGNORECASE,
+        )
     )
-    return body_html[:block_start] + wrapped + body_html[block_end:]
+
+
+def _find_daily_excerpt_block_span(body_html: str) -> tuple[int, int] | None:
+    """Return [start, end) for the daily Confluence excerpt (выборка).
+
+    Span covers preamble (sections 1–2) through conclusion (section 4); TOC stays outside.
+    """
+    if not body_html or not _daily_has_scenarios_section(body_html):
+        return None
+    start_match = _DAILY_REPORT_PREAMBLE_OPEN_RE.search(body_html)
+    if not start_match:
+        start_match = re.search(
+            r"<h2\b[^>]*\bid\s*=\s*['\"]sec-object['\"][^>]*>",
+            body_html,
+            flags=re.IGNORECASE,
+        )
+    if not start_match:
+        start_match = re.search(
+            r"<h2\b[^>]*\bid\s*=\s*['\"]scenarios['\"][^>]*>",
+            body_html,
+            flags=re.IGNORECASE,
+        )
+    if not start_match:
+        return None
+    start = start_match.start()
+    body_close = body_html.lower().rfind("</body>")
+    end = body_close if body_close > start else len(body_html)
+    return start, end
+
+
+def _wrap_daily_report_with_excerpt_macro(body_html: str) -> str:
+    """Wrap daily excerpt block (выборка): preamble through conclusion; TOC outside."""
+    if not body_html or not _parse_bool_env(
+        os.getenv("ZEPHYR_CONFLUENCE_DAILY_EXCERPT", "true")
+    ):
+        return body_html
+    if not _daily_has_scenarios_section(body_html):
+        return body_html
+    body_html = _unwrap_weekly_excerpt_macro(body_html)
+    span = _find_daily_excerpt_block_span(body_html)
+    if span is None:
+        return body_html
+    block_start, block_end = span
+    return _wrap_html_span_with_excerpt_macro(body_html, block_start, block_end)
 
 
 def _replace_legacy_weekly_table_macros_with_excerpt(body_html: str) -> str:
@@ -9110,9 +9177,18 @@ def put_test_step_result(
     return request_json(base_url, endpoint, headers, method="PUT", body=body)
 
 
+def _emit_startup_heartbeat() -> None:
+    print(
+        f"zephyr_weekly_report starting pid={os.getpid()} "
+        f"at {datetime.now().isoformat(timespec='seconds')}",
+        flush=True,
+    )
+
+
 def main() -> int:
     _load_repo_dotenv_if_absent()
     args = parse_args()
+    _emit_startup_heartbeat()
 
     lock_acquired = False
     try:
@@ -10146,6 +10222,7 @@ class _TeeIO:
     def write(self, data: str) -> int:
         for stream in self._streams:
             stream.write(data)
+            stream.flush()
         return len(data)
 
     def flush(self) -> None:
@@ -10209,9 +10286,22 @@ def _maybe_setup_run_log_file() -> None:
     log_path = log_dir / f"zephyr_{stamp}.log"
     orig_out, orig_err = sys.__stdout__, sys.__stderr__
     try:
-        log_f = log_path.open("w", encoding="utf-8", errors="replace", newline="")
+        log_f = log_path.open(
+            "w",
+            encoding="utf-8",
+            errors="replace",
+            newline="",
+            buffering=1,
+        )
     except OSError:
         return
+    for stream in (orig_out, orig_err):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            try:
+                reconfigure(line_buffering=True)
+            except (OSError, ValueError):
+                pass
     sys.stdout = _TeeIO(orig_out, log_f)
     sys.stderr = _TeeIO(orig_err, log_f)
     atexit.register(_restore_stdio_and_close_log, orig_out, orig_err, log_f)

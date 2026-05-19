@@ -38,6 +38,20 @@ chmod +x run_zephyr.sh run_zephyr_weekly_report.sh run_navio_folder_report.sh
 
 Python is resolved via `PYTHON_BIN`, then `python3`, then `python`.
 
+### Windows: Task Scheduler (every 30 minutes)
+
+```powershell
+.\install_zephyr_scheduled_task.ps1
+# test: Start-ScheduledTask -TaskName ZephyrParserEvery30Min
+```
+
+- Wrapper: `run_zephyr_scheduled.ps1` → `run_zephyr.ps1` → `zephyr_weekly_report.py`
+- **Wrapper log** (START/END, timeout): `reports/logs/scheduled_YYYY-MM-DD.log`
+- **Python log** (full stdout): `logs/zephyr_YYYY-MM-DD_HH-MM-SS.log`
+- `run_zephyr.ps1` sets `PYTHONUNBUFFERED=1` and `python -u` so scheduled runs are not silent until exit
+- Overlap guard: `ZEPHYR_RUN_LOCK_FILE` (default `reports/.zephyr_weekly_report.lock`)
+- Hung run cap: `ZEPHYR_RUN_TIMEOUT_MINUTES` (default 90) in the scheduled wrapper
+
 Run Google Sheets pipeline launcher:
 
 ```bash
@@ -80,6 +94,7 @@ The launcher runs in tree-first mode by default:
   - output files:
     - `<folder_name>_<folder_id>.html` (copy/paste into Confluence editor)
     - `<folder_name>_<folder_id>.confluence.txt` (wiki-markup format)
+  - REST publish (`ZEPHYR_CONFLUENCE_PUBLISH_DAILY=true`): wraps report body (sections 1–4) in the Confluence excerpt macro (выборка); table of contents stays outside. Disable with `ZEPHYR_CONFLUENCE_DAILY_EXCERPT=false`.
 - readable weekly reports:
   - `ZEPHYR_EXPORT_WEEKLY_READABLE=true`
   - `ZEPHYR_WEEKLY_READABLE_DIR=reports/weekly_readable`

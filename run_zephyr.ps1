@@ -44,6 +44,12 @@ function Test-EnvEnabled {
 }
 
 $env:ZEPHYR_CONFLUENCE_AUTH_SCHEME = "bearer"
+# Task Scheduler pipes stdout; without this, logs stay empty until the buffer fills or the process exits.
+$env:PYTHONUNBUFFERED = "1"
+
+if (-not $env:ZEPHYR_RUN_LOCK_FILE) {
+  $env:ZEPHYR_RUN_LOCK_FILE = Join-Path $RepoRoot "reports\.zephyr_weekly_report.lock"
+}
 
 $extraArgs = @($args)
 
@@ -131,18 +137,24 @@ if ($extraArgs.Count -gt 0) {
   $cmdArgs += $extraArgs
 }
 
+if ($env:ZEPHYR_RUN_LOCK_FILE) {
+  $cmdArgs += @("--run-lock-file", $env:ZEPHYR_RUN_LOCK_FILE)
+}
+
+$pythonArgs = @("-u") + $cmdArgs
+
 if ($env:PYTHON_BIN) {
-  & $env:PYTHON_BIN @cmdArgs
+  & $env:PYTHON_BIN @pythonArgs
   exit $LASTEXITCODE
 }
 
 if (Get-Command py -ErrorAction SilentlyContinue) {
-  & py -3 @cmdArgs
+  & py -3 @pythonArgs
   exit $LASTEXITCODE
 }
 
 if (Get-Command python -ErrorAction SilentlyContinue) {
-  & python @cmdArgs
+  & python @pythonArgs
   exit $LASTEXITCODE
 }
 
