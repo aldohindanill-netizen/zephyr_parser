@@ -98,10 +98,40 @@ Python: `PYTHON_BIN`, затем `python3`, затем `python` (Windows: `py -3
 Включить в `.env`:
 
 - `ZEPHYR_CONFLUENCE_PUBLISH_DAILY=true` и/или `ZEPHYR_CONFLUENCE_PUBLISH_WEEKLY=true`
+- `ZEPHYR_CONFLUENCE_PUBLISH_BUGS=true` — build-log по Jira issue (по умолчанию как weekly, если не задано)
 - `ZEPHYR_CONFLUENCE_BASE_URL`, `ZEPHYR_CONFLUENCE_API_TOKEN`, `ZEPHYR_CONFLUENCE_SPACE_KEY`
+- `ZEPHYR_CONFLUENCE_PARENT_PAGE_ID` — корневая страница в Confluence
 - Для basic auth: `ZEPHYR_CONFLUENCE_USER`
 
+Под корневой страницей (`ZEPHYR_CONFLUENCE_PARENT_PAGE_ID`):
+
+| Уровень | Содержимое |
+|---------|------------|
+| **Week YYYY-wNN** (по умолчанию `Week {year}-w{week:02d}`, шаблон `ZEPHYR_CONFLUENCE_WEEK_FOLDER_TITLE_TEMPLATE`) | Daily-отчёты за дни этой ISO-недели + weekly matrix за ту же неделю |
+| **Баги** (`ZEPHYR_CONFLUENCE_BUGS_PARENT_TITLE`) | Папка-контейнер; внутри страница **Сводка багов** (заголовок h1 «Баги», два раздела weekly + Summary) и build-log по Jira issue |
+
+Неделя для daily берётся из даты в имени файла; для weekly — из `weekly_cycle_matrix_YYYY-MM-DD` в имени файла.
+
 `run_zephyr.ps1` выставляет `ZEPHYR_CONFLUENCE_AUTH_SCHEME=bearer` для процесса Python.
+
+### Очистка дерева под корневой страницей
+
+Скрипт [`scripts/confluence_delete_children.py`](scripts/confluence_delete_children.py) рекурсивно удаляет **все дочерние** страницы под `ZEPHYR_CONFLUENCE_PARENT_PAGE_ID` (сама корневая страница не удаляется). Страницы попадают в корзину Confluence. Флаги `ZEPHYR_CONFLUENCE_PUBLISH_*` могут быть `false` — нужны только URL, токен, space и parent id (и `USER` для basic auth).
+
+```powershell
+# План удаления (по умолчанию)
+python scripts/confluence_delete_children.py
+
+# Реальное удаление
+python scripts/confluence_delete_children.py --execute
+
+# Другой родитель
+python scripts/confluence_delete_children.py --parent-page-id 123456 --execute -v
+```
+
+Папка «Баги» этим скриптом не затрагивается (удаляются только прямые дети корневой страницы).
+
+Сводка багов: одна страница `reports/bugs_rollup/bugs_index.html`, `ZEPHYR_BUGS_ROLLUP_LAST_WEEKS=2` — глубина раздела «последние N недель».
 
 ---
 

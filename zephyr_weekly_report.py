@@ -96,12 +96,51 @@ class ConfluencePublishConfig:
     api_token: str
     space_key: str
     parent_page_id: str | None = None
+    bugs_parent_page_id: str | None = None
+    bugs_parent_title: str = "Баги"
+    week_folder_title_template: str = "Week {year}-w{week:02d}"
     title_prefix: str = ""
     api_prefix: str = "rest/api"
     auth_scheme: str = "basic"
     update_existing: bool = False
     publish_daily: bool = False
     publish_weekly: bool = False
+    publish_bugs: bool = False
+
+
+@dataclass
+class ConfluencePublishRoots:
+    root_parent: str | None = None
+    bugs_parent: str | None = None
+
+
+class ConfluenceWeekParentCache:
+    """Lazy-create Confluence week folder pages (Week wNN) under the root parent."""
+
+    def __init__(self, cfg: ConfluencePublishConfig, root_parent_id: str | None) -> None:
+        self.cfg = cfg
+        self.root_parent_id = root_parent_id
+        self._by_week: dict[date, str] = {}
+
+    def ensure(self, week_start: date) -> str:
+        cached = self._by_week.get(week_start)
+        if cached:
+            return cached
+        if not self.root_parent_id:
+            raise RuntimeError(
+                "Confluence week folder requires ZEPHYR_CONFLUENCE_PARENT_PAGE_ID."
+            )
+        title = _confluence_week_folder_title(self.cfg, week_start)
+        page_id = _confluence_ensure_section_page(
+            self.cfg,
+            root_parent_page_id=self.root_parent_id,
+            explicit_page_id=None,
+            section_title=title,
+        )
+        if not page_id:
+            raise RuntimeError(f"Confluence week folder create failed for '{title}'")
+        self._by_week[week_start] = page_id
+        return page_id
 
 
 @dataclass
@@ -1259,8 +1298,22 @@ def _load_confluence_publish_config() -> ConfluencePublishConfig | None:
     auth_scheme = (os.getenv("ZEPHYR_CONFLUENCE_AUTH_SCHEME") or "basic").strip().lower()
     publish_daily = _parse_bool_env(os.getenv("ZEPHYR_CONFLUENCE_PUBLISH_DAILY"))
     publish_weekly = _parse_bool_env(os.getenv("ZEPHYR_CONFLUENCE_PUBLISH_WEEKLY"))
+    publish_bugs_raw = os.getenv("ZEPHYR_CONFLUENCE_PUBLISH_BUGS")
+    if publish_bugs_raw is None or not str(publish_bugs_raw).strip():
+        publish_bugs = publish_weekly
+    else:
+        publish_bugs = _parse_bool_env(publish_bugs_raw)
     update_existing = _parse_bool_env(os.getenv("ZEPHYR_CONFLUENCE_UPDATE_EXISTING"))
-    if not (publish_daily or publish_weekly):
+    bugs_parent_page_id = (
+        (os.getenv("ZEPHYR_CONFLUENCE_BUGS_PARENT_PAGE_ID") or "").strip() or None
+    )
+    bugs_parent_title = (
+        (os.getenv("ZEPHYR_CONFLUENCE_BUGS_PARENT_TITLE") or "Баги").strip() or "Баги"
+    )
+    week_folder_title_template = (
+        os.getenv("ZEPHYR_CONFLUENCE_WEEK_FOLDER_TITLE_TEMPLATE") or "Week {year}-w{week:02d}"
+    ).strip() or "Week {year}-w{week:02d}"
+    if not (publish_daily or publish_weekly or publish_bugs):
         return None
     if auth_scheme not in {"basic", "bearer"}:
         raise ValueError(
@@ -1284,12 +1337,16 @@ def _load_confluence_publish_config() -> ConfluencePublishConfig | None:
         api_token=api_token,
         space_key=space_key,
         parent_page_id=parent_page_id,
+        bugs_parent_page_id=bugs_parent_page_id,
+        bugs_parent_title=bugs_parent_title,
+        week_folder_title_template=week_folder_title_template,
         title_prefix=title_prefix,
         api_prefix=api_prefix,
         auth_scheme=auth_scheme,
         update_existing=update_existing,
         publish_daily=publish_daily,
         publish_weekly=publish_weekly,
+        publish_bugs=publish_bugs,
     )
 
 
@@ -1537,7 +1594,12 @@ def _confluence_find_page_by_title(
     payload = _confluence_request_json(
         cfg,
         f"{cfg.api_prefix}/content",
-        params={"spaceKey": cfg.space_key, "title": title, "expand": "version"},
+        params={
+            "spaceKey": cfg.space_key,
+            "title": title,
+            "status": "current",
+            "expand": "version",
+        },
     )
     results = payload.get("results") if isinstance(payload, dict) else None
     if not isinstance(results, list) or not results:
@@ -1550,24 +1612,245 @@ def _confluence_find_page_by_title(
     return (page_id, version)
 
 
+def _confluence_find_child_page_by_title(
+    cfg: ConfluencePublishConfig, parent_page_id: str, title: str
+) -> tuple[str, int] | None:
+    start = 0
+    limit = 50
+    while True:
+        payload = _confluence_request_json(
+            cfg,
+            f"{cfg.api_prefix}/content/{parent_page_id}/child/page",
+            params={"limit": str(limit), "start": str(start), "expand": "version"},
+        )
+        results = payload.get("results") if isinstance(payload, dict) else None
+        if not isinstance(results, list):
+            return None
+        for item in results:
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("title") or "").strip() != title:
+                continue
+            page_id = str(item.get("id") or "").strip()
+            version = int(item.get("version", {}).get("number") or 1)
+            if page_id:
+                return (page_id, version)
+        size = int(payload.get("size") or 0) if isinstance(payload, dict) else 0
+        if size < limit:
+            break
+        start += limit
+    return None
+
+
+def _confluence_create_child_page(
+    cfg: ConfluencePublishConfig,
+    parent_page_id: str,
+    title: str,
+    *,
+    storage_html: str = "<p></p>",
+) -> str:
+    create_body: dict[str, Any] = {
+        "type": "page",
+        "title": title,
+        "space": {"key": cfg.space_key},
+        "ancestors": [{"id": parent_page_id}],
+        "body": {"storage": {"value": storage_html, "representation": "storage"}},
+    }
+    created = _confluence_request_json(
+        cfg, f"{cfg.api_prefix}/content", method="POST", body=create_body
+    )
+    page_id = str(created.get("id") or "").strip()
+    if not page_id:
+        raise RuntimeError(
+            f"Confluence section page create returned no id for title '{title}'"
+        )
+    return page_id
+
+
+def _confluence_ensure_section_page(
+    cfg: ConfluencePublishConfig,
+    *,
+    root_parent_page_id: str | None,
+    explicit_page_id: str | None,
+    section_title: str,
+) -> str | None:
+    if explicit_page_id:
+        return explicit_page_id
+    if not root_parent_page_id:
+        return None
+    existing = _confluence_find_child_page_by_title(
+        cfg, root_parent_page_id, section_title
+    )
+    if existing:
+        return existing[0]
+    return _confluence_create_child_page(cfg, root_parent_page_id, section_title)
+
+
+def _confluence_week_folder_title(cfg: ConfluencePublishConfig, week_start: date) -> str:
+    iso = week_start.isocalendar()
+    try:
+        return cfg.week_folder_title_template.format(
+            week=int(iso[1]),
+            year=int(iso[0]),
+            week_start=week_start.isoformat(),
+        )
+    except (KeyError, ValueError) as exc:
+        raise ValueError(
+            "Invalid ZEPHYR_CONFLUENCE_WEEK_FOLDER_TITLE_TEMPLATE. "
+            "Use placeholders: {week}, {year}, {week_start}."
+        ) from exc
+
+
+def _confluence_week_start_from_publish_path(path: str) -> date | None:
+    base = os.path.basename(path)
+    if base.startswith("weekly_cycle_matrix_"):
+        match = re.match(r"weekly_cycle_matrix_(\d{4}-\d{2}-\d{2})", base)
+        if match:
+            return datetime.strptime(match.group(1), "%Y-%m-%d").date()
+        return None
+    if _is_build_log_html_path(path):
+        return None
+    match = re.search(r"_(\d{4}-\d{2}-\d{2})_", base)
+    if not match:
+        return None
+    try:
+        report_day = datetime.strptime(match.group(1), "%Y-%m-%d").date()
+    except ValueError:
+        return None
+    return _release_week_start(report_day)
+
+
+def resolve_confluence_publish_roots(cfg: ConfluencePublishConfig) -> ConfluencePublishRoots:
+    """Ensure the bugs folder under root; week folders (Week wNN) are created per publish batch."""
+    root = cfg.parent_page_id
+    bugs = _confluence_ensure_section_page(
+        cfg,
+        root_parent_page_id=root,
+        explicit_page_id=cfg.bugs_parent_page_id,
+        section_title=cfg.bugs_parent_title,
+    )
+    return ConfluencePublishRoots(
+        root_parent=root,
+        bugs_parent=bugs or root,
+    )
+
+
+def publish_reports_to_confluence_by_week(
+    html_paths: list[str],
+    cfg: ConfluencePublishConfig,
+    *,
+    week_parents: ConfluenceWeekParentCache,
+    fallback_parent: str | None = None,
+) -> list[str]:
+    by_week: dict[date, list[str]] = {}
+    ungrouped: list[str] = []
+    for path in html_paths:
+        if _is_build_log_html_path(path):
+            continue
+        week_start = _confluence_week_start_from_publish_path(path)
+        if week_start is None:
+            ungrouped.append(path)
+            continue
+        by_week.setdefault(week_start, []).append(path)
+    outcomes: list[str] = []
+    for week_start in sorted(by_week):
+        parent_id = week_parents.ensure(week_start)
+        folder_title = _confluence_week_folder_title(cfg, week_start)
+        batch_outcomes = publish_reports_to_confluence(
+            by_week[week_start], cfg, parent_page_id=parent_id
+        )
+        for line in batch_outcomes:
+            outcomes.append(f"[{folder_title}] {line}")
+    if ungrouped:
+        batch_outcomes = publish_reports_to_confluence(
+            ungrouped, cfg, parent_page_id=fallback_parent
+        )
+        outcomes.extend(batch_outcomes)
+    return outcomes
+
+
+def _is_build_log_html_path(path: str) -> bool:
+    return os.path.basename(path).endswith("_build_log.html")
+
+
+def _is_bugs_rollup_html_path(path: str) -> bool:
+    return os.path.basename(path) == "bugs_index.html"
+
+
+def _confluence_get_page_parent_id(cfg: ConfluencePublishConfig, page_id: str) -> str | None:
+    payload = _confluence_request_json(
+        cfg,
+        f"{cfg.api_prefix}/content/{page_id}",
+        params={"expand": "ancestors"},
+    )
+    if not isinstance(payload, dict):
+        return None
+    ancestors = payload.get("ancestors")
+    if not isinstance(ancestors, list) or not ancestors:
+        return None
+    last = ancestors[-1]
+    if not isinstance(last, dict):
+        return None
+    parent_id = str(last.get("id") or "").strip()
+    return parent_id or None
+
+
+def _confluence_lookup_page_for_upsert(
+    cfg: ConfluencePublishConfig,
+    title: str,
+    *,
+    parent_page_id: str | None,
+    legacy_title: str | None = None,
+) -> tuple[str, int, str | None] | None:
+    """Return (page_id, version, current_parent_id) for update/move decisions."""
+    if parent_page_id:
+        hit = _confluence_find_child_page_by_title(cfg, parent_page_id, title)
+        if hit:
+            return (hit[0], hit[1], parent_page_id)
+        if cfg.update_existing and legacy_title and legacy_title != title:
+            hit = _confluence_find_child_page_by_title(cfg, parent_page_id, legacy_title)
+            if hit:
+                return (hit[0], hit[1], parent_page_id)
+    if not cfg.update_existing:
+        return None
+    hit = _confluence_find_page_by_title(cfg, title)
+    if hit:
+        page_id, version = hit
+        if parent_page_id and page_id == parent_page_id:
+            return None
+        return (page_id, version, _confluence_get_page_parent_id(cfg, page_id))
+    if legacy_title and legacy_title != title:
+        hit = _confluence_find_page_by_title(cfg, legacy_title)
+        if hit:
+            page_id, version = hit
+            if parent_page_id and page_id == parent_page_id:
+                return None
+            return (page_id, version, _confluence_get_page_parent_id(cfg, page_id))
+    return None
+
+
 def _confluence_upsert_storage_page(
     cfg: ConfluencePublishConfig,
     title: str,
     storage_html: str,
     *,
     legacy_title: str | None = None,
+    parent_page_id: str | None = None,
 ) -> tuple[str, str]:
-    existing = _confluence_find_page_by_title(cfg, title)
-    if (
-        existing is None
-        and cfg.update_existing
-        and legacy_title
-        and legacy_title != title
-    ):
-        existing = _confluence_find_page_by_title(cfg, legacy_title)
+    effective_parent = parent_page_id if parent_page_id is not None else cfg.parent_page_id
+    existing = _confluence_lookup_page_for_upsert(
+        cfg,
+        title,
+        parent_page_id=effective_parent,
+        legacy_title=legacy_title,
+    )
     if existing:
-        page_id, current_version = existing
-        body = {
+        page_id, current_version, current_parent = existing
+        need_reparent = bool(
+            effective_parent
+            and (not current_parent or current_parent != effective_parent)
+        )
+        body: dict[str, Any] = {
             "id": page_id,
             "type": "page",
             "title": title,
@@ -1575,16 +1858,28 @@ def _confluence_upsert_storage_page(
             "version": {"number": current_version + 1},
             "body": {"storage": {"value": storage_html, "representation": "storage"}},
         }
-        _confluence_request_json(cfg, f"{cfg.api_prefix}/content/{page_id}", method="PUT", body=body)
-        return page_id, "updated"
+        if need_reparent:
+            body["ancestors"] = [{"id": effective_parent}]
+        try:
+            _confluence_request_json(
+                cfg, f"{cfg.api_prefix}/content/{page_id}", method="PUT", body=body
+            )
+        except RuntimeError as exc:
+            if "HTTP 404" not in str(exc):
+                raise
+            # Stale id (deleted/trashed page): create a fresh page under the target parent.
+            existing = None
+        else:
+            action = "moved+updated" if need_reparent else "updated"
+            return page_id, action
     create_body: dict[str, Any] = {
         "type": "page",
         "title": title,
         "space": {"key": cfg.space_key},
         "body": {"storage": {"value": storage_html, "representation": "storage"}},
     }
-    if cfg.parent_page_id:
-        create_body["ancestors"] = [{"id": cfg.parent_page_id}]
+    if effective_parent:
+        create_body["ancestors"] = [{"id": effective_parent}]
     created = _confluence_request_json(
         cfg, f"{cfg.api_prefix}/content", method="POST", body=create_body
     )
@@ -1834,13 +2129,60 @@ def _replace_scenario_result_cells_with_zephyr_macro(storage_html: str) -> str:
 
 
 def publish_reports_to_confluence(
-    html_paths: list[str], cfg: ConfluencePublishConfig
+    html_paths: list[str],
+    cfg: ConfluencePublishConfig,
+    *,
+    parent_page_id: str | None = None,
 ) -> list[str]:
     outcomes: list[str] = []
     for html_path in html_paths:
         with open(html_path, encoding="utf-8") as source:
             raw_html = source.read()
+        is_build_log = _is_build_log_html_path(html_path)
+        is_bugs_rollup = _is_bugs_rollup_html_path(html_path)
         is_weekly = os.path.basename(html_path).startswith("weekly_cycle_matrix")
+        if is_bugs_rollup:
+            body_html = _normalize_html_for_confluence_storage(raw_html)
+            body_html = _inject_confluence_anchor_macros(body_html)
+            body_html = _convert_fragment_links_to_confluence(body_html)
+            title_from_html = _extract_html_title(raw_html).strip()
+            title_from_file = _confluence_page_title_for_file(html_path, cfg)
+            primary_title = title_from_html or title_from_file or BUGS_ROLLUP_CONFLUENCE_TITLE
+            legacy_title = None
+            if primary_title == BUGS_ROLLUP_CONFLUENCE_TITLE:
+                legacy_title = BUGS_ROLLUP_DISPLAY_TITLE
+            elif title_from_html and title_from_file and title_from_html != title_from_file:
+                legacy_title = title_from_file
+            page_id, action = _confluence_upsert_storage_page(
+                cfg,
+                primary_title,
+                body_html,
+                legacy_title=legacy_title,
+                parent_page_id=parent_page_id,
+            )
+            outcomes.append(f"{action}: {primary_title} (page id {page_id})")
+            continue
+        if is_build_log:
+            body_html = _normalize_html_for_confluence_storage(raw_html)
+            body_html = _inject_confluence_anchor_macros(body_html)
+            body_html = _convert_fragment_links_to_confluence(body_html)
+            title_from_html = _extract_html_title(raw_html).strip()
+            title_from_file = _confluence_page_title_for_file(html_path, cfg)
+            primary_title = title_from_html or title_from_file
+            legacy_title = (
+                title_from_file
+                if title_from_html and title_from_html != title_from_file
+                else None
+            )
+            page_id, action = _confluence_upsert_storage_page(
+                cfg,
+                primary_title,
+                body_html,
+                legacy_title=legacy_title,
+                parent_page_id=parent_page_id,
+            )
+            outcomes.append(f"{action}: {primary_title} (page id {page_id})")
+            continue
         if is_weekly:
             body_html = _normalize_html_for_confluence_storage(raw_html)
             body_html = _inject_confluence_anchor_macros(body_html)
@@ -1862,6 +2204,7 @@ def publish_reports_to_confluence(
                 primary_title,
                 body_html,
                 legacy_title=legacy_title,
+                parent_page_id=parent_page_id,
             )
             outcomes.append(f"{action}: {primary_title} (page id {page_id})")
             continue
@@ -1907,6 +2250,7 @@ def publish_reports_to_confluence(
             primary_title,
             body_html,
             legacy_title=legacy_title,
+            parent_page_id=parent_page_id,
         )
         attachment_note = ""
         if os.path.exists(chart_path) and not use_native_chart and not use_zephyr_macro:
@@ -4565,7 +4909,7 @@ def _fetch_jira_bug_metadata(
 ) -> dict[str, dict[str, str]]:
     """Batch-fetch Jira issue metadata for the given keys.
 
-    Returns {key: {summary: '', status, priority, issuetype}} (summary unused).
+    Returns {key: {summary, status, priority, issuetype}}.
     Errors and missing keys are silently skipped — the caller falls back to plain key links.
     """
     out: dict[str, dict[str, str]] = {}
@@ -4586,7 +4930,7 @@ def _fetch_jira_bug_metadata(
     if not pending:
         return out
 
-    field_keys = ["status", "priority", "issuetype"]
+    field_keys = ["summary", "status", "priority", "issuetype"]
     fields_csv = ",".join(field_keys)
 
     def _issue_to_entry(issue: dict[str, Any]) -> tuple[str, dict[str, str]] | None:
@@ -4600,7 +4944,7 @@ def _fetch_jira_bug_metadata(
         priority_obj = fields.get("priority") or {}
         issuetype_obj = fields.get("issuetype") or {}
         entry = {
-            "summary": "",
+            "summary": str(fields.get("summary") or "").strip(),
             "status": str(
                 (status_obj.get("name") if isinstance(status_obj, dict) else "") or ""
             ).strip(),
@@ -6765,6 +7109,20 @@ def _weekly_best_branch_column_context_for_week(
     )
 
 
+def _defect_summary_text(entry: dict[str, str] | None) -> str:
+    return str((entry or {}).get("summary") or "").strip()
+
+
+def _defect_summary_html(entry: dict[str, str] | None) -> str:
+    text = _defect_summary_text(entry)
+    return html.escape(text) if text else "—"
+
+
+def _defect_summary_wiki(entry: dict[str, str] | None) -> str:
+    text = _defect_summary_text(entry)
+    return _wiki_escape(text) if text else "—"
+
+
 def _weekly_defects_html_block(defect_keys: list[str]) -> str:
     if not defect_keys:
         return "<p><em>В процессе написания</em></p>"
@@ -7129,7 +7487,7 @@ def _weekly_defect_analytics_html(
         parts.append("<table class='weekly-defects-table weekly-defects-top'>")
         parts.append(
             "<thead><tr>"
-            "<th>Ключ</th><th>Priority</th><th>Status</th>"
+            "<th>Ключ</th><th>Summary</th><th>Priority</th><th>Status</th>"
             "<th>Кейсов</th><th>Билдов</th>"
             "</tr></thead><tbody>"
         )
@@ -7138,6 +7496,7 @@ def _weekly_defect_analytics_html(
             parts.append(
                 "<tr>"
                 f"<td class='weekly-jira-key-cell'>{_weekly_jira_key_span_html(key)}</td>"
+                f"<td>{_defect_summary_html(entry)}</td>"
                 f"<td>{_jira_priority_lozenge_html(entry.get('priority', ''))}</td>"
                 f"<td>{_jira_status_lozenge_html(entry.get('status', ''))}</td>"
                 f"<td style='text-align:center;'>{int(bug_total_cases.get(key, 0))}</td>"
@@ -7152,12 +7511,14 @@ def _weekly_defect_analytics_html(
         # <colgroup>: «Ключ» ~12%, «Priority» ~12%, build-колонки делят остаток поровну.
         n_builds_matrix = len(column_labels)
         if n_builds_matrix > 0:
-            key_pct = 12.0
-            priority_pct = 12.0
-            builds_total_pct = 100.0 - key_pct - priority_pct
+            key_pct = 10.0
+            summary_pct = 20.0
+            priority_pct = 10.0
+            builds_total_pct = 100.0 - key_pct - summary_pct - priority_pct
             build_pct = builds_total_pct / n_builds_matrix
             col_tags = [
                 f"<col style='width:{key_pct:.2f}%'>",
+                f"<col style='width:{summary_pct:.2f}%'>",
                 f"<col style='width:{priority_pct:.2f}%'>",
             ]
             col_tags.extend(
@@ -7165,7 +7526,7 @@ def _weekly_defect_analytics_html(
             )
             parts.append("<colgroup>" + "".join(col_tags) + "</colgroup>")
         matrix_header = (
-            "<thead><tr><th>Ключ</th><th>Priority</th>"
+            "<thead><tr><th>Ключ</th><th>Summary</th><th>Priority</th>"
             + "".join(f"<th>{html.escape(label)}</th>" for label in column_labels)
             + "</tr></thead><tbody>"
         )
@@ -7174,6 +7535,7 @@ def _weekly_defect_analytics_html(
             entry = meta.get(key, {}) or {}
             cells = [
                 f"<td class='weekly-jira-key-cell'>{_weekly_jira_key_span_html(key)}</td>",
+                f"<td>{_defect_summary_html(entry)}</td>",
                 f"<td>{_jira_priority_lozenge_html(entry.get('priority', ''))}</td>",
             ]
             row_map = matrix.get(key, {}) or {}
@@ -7200,7 +7562,7 @@ def _weekly_defect_analytics_html(
     parts.append("<table class='weekly-defects-table weekly-defects-all'>")
     parts.append(
         "<thead><tr>"
-        "<th>Ключ</th><th>Priority</th><th>Status</th>"
+        "<th>Ключ</th><th>Summary</th><th>Priority</th><th>Status</th>"
         "<th>Кейсов</th><th>Билдов</th>"
         "</tr></thead><tbody>"
     )
@@ -7209,6 +7571,7 @@ def _weekly_defect_analytics_html(
         parts.append(
             "<tr>"
             f"<td class='weekly-jira-key-cell'>{_weekly_jira_key_span_html(key)}</td>"
+            f"<td>{_defect_summary_html(entry)}</td>"
             f"<td>{_jira_priority_lozenge_html(entry.get('priority', ''))}</td>"
             f"<td>{_jira_status_lozenge_html(entry.get('status', ''))}</td>"
             f"<td style='text-align:center;'>{int(bug_total_cases.get(key, 0))}</td>"
@@ -7266,12 +7629,13 @@ def _weekly_defect_analytics_wiki(
         # 2. Топ
         parts.append(f"h4. Топ багов (до {_DEFECT_TOP_LIMIT})")
         parts.append(
-            "|| Ключ || Priority || Status || Кейсов || Билдов ||"
+            "|| Ключ || Summary || Priority || Status || Кейсов || Билдов ||"
         )
         for key in keys_ordered[:_DEFECT_TOP_LIMIT]:
             entry = meta.get(key, {}) or {}
             cells = [
                 _weekly_jira_key_wiki(key),
+                _defect_summary_wiki(entry),
                 _wiki_escape(entry.get("priority", "")) or " ",
                 _wiki_escape(entry.get("status", "")) or " ",
                 str(int(bug_total_cases.get(key, 0))),
@@ -7282,13 +7646,14 @@ def _weekly_defect_analytics_wiki(
 
         # 3. Матрица
         parts.append("h4. Матрица «баг × билд»")
-        matrix_header = ["Ключ", "Priority"] + list(column_labels)
+        matrix_header = ["Ключ", "Summary", "Priority"] + list(column_labels)
         parts.append("|| " + " || ".join(_wiki_escape(c) for c in matrix_header) + " ||")
         for key in keys_ordered:
             entry = meta.get(key, {}) or {}
             row_map = matrix.get(key, {}) or {}
             cells = [
                 _weekly_jira_key_wiki(key),
+                _defect_summary_wiki(entry),
                 _wiki_escape(entry.get("priority", "")) or " ",
             ]
             for col in column_labels:
@@ -7309,11 +7674,12 @@ def _weekly_defect_analytics_wiki(
     if parts:
         parts.append("")
     parts.append("h4. Все баги")
-    parts.append("|| Ключ || Priority || Status || Кейсов || Билдов ||")
+    parts.append("|| Ключ || Summary || Priority || Status || Кейсов || Билдов ||")
     for key in keys_ordered:
         entry = meta.get(key, {}) or {}
         cells = [
             _weekly_jira_key_wiki(key),
+            _defect_summary_wiki(entry),
             _wiki_escape(entry.get("priority", "")) or " ",
             _wiki_escape(entry.get("status", "")) or " ",
             str(int(bug_total_cases.get(key, 0))),
@@ -7322,6 +7688,299 @@ def _weekly_defect_analytics_wiki(
         parts.append("| " + " | ".join(cells) + " |")
 
     return "\n".join(parts)
+
+
+# Confluence page title must differ from ZEPHYR_CONFLUENCE_BUGS_PARENT_TITLE («Баги» folder).
+BUGS_ROLLUP_CONFLUENCE_TITLE = "Сводка багов"
+BUGS_ROLLUP_DISPLAY_TITLE = "Баги"
+BUGS_ROLLUP_SECTION_LAST_WEEKS = "Баги за последние 2 недели"
+BUGS_ROLLUP_SECTION_ALL = "Все заведённые баги"
+
+_WEEKLY_HTML_DEFECT_STYLES = (
+    "body{font-family:Arial,sans-serif;margin:24px;}"
+    "h1{margin-bottom:8px;}h2{margin-top:20px;margin-bottom:8px;font-weight:700;}"
+    "h3{margin-top:16px;margin-bottom:8px;font-weight:700;}"
+    "h4{margin-top:14px;margin-bottom:6px;font-weight:600;}"
+    "table{border-collapse:collapse;width:100%;margin-bottom:16px;table-layout:fixed;}"
+    "th,td{border:1px solid #d6d6d6;padding:6px 8px;text-align:left;vertical-align:top;"
+    "overflow-wrap:anywhere;word-wrap:break-word;}"
+    "th{background:#f0f2f5;font-weight:600;}"
+    ".weekly-defects-table{font-size:14px;}"
+    ".weekly-defects-table th{background:#f4f5f7;color:#42526e;font-weight:600;}"
+    ".weekly-defects-matrix{table-layout:fixed;width:100%;}"
+    ".weekly-defects-matrix td,.weekly-defects-matrix th{padding:4px 6px;}"
+    ".weekly-defects-matrix .matrix-num{text-align:center;font-weight:700;}"
+    ".weekly-defects-all{table-layout:fixed;width:100%;}"
+    ".weekly-jira-key-cell{white-space:nowrap;vertical-align:middle;width:1%;}"
+    ".weekly-jira-key-link{font-family:ui-monospace,Consolas,monospace;font-size:13px;"
+    "font-weight:600;color:#0052cc;text-decoration:none;background:#e9f2ff;"
+    "padding:2px 6px;border-radius:3px;border:1px solid #b3d4ff;}"
+    ".weekly-jira-key-link:hover{text-decoration:underline;}"
+    ".weekly-defects-hot .weekly-jira-key-link{margin-right:4px;}"
+    ".jira-lozenge{vertical-align:middle;}"
+    ".bugs-rollup-subtitle{color:#5e6c84;margin:0 0 16px;}"
+)
+
+
+def _bugs_rollup_last_weeks_count() -> int:
+    raw = (os.getenv("ZEPHYR_BUGS_ROLLUP_LAST_WEEKS") or "2").strip()
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return 2
+
+
+def _defect_rollup_from_report_data(
+    report_data: dict[tuple[str, str], dict[str, Any]],
+    *,
+    last_n_weeks: int | None,
+) -> tuple[list[str], dict[str, Any], list[date]]:
+    """Aggregate defect analytics across one or more ISO weeks (weekly report format)."""
+    weekly_groups: dict[date, list[dict[str, Any]]] = defaultdict(list)
+    for (folder_id, folder_name), payload in report_data.items():
+        cycles = payload.get("cycles", {})
+        if not isinstance(cycles, dict):
+            continue
+        report_day = _resolve_folder_report_day(folder_name, cycles)
+        if report_day is None:
+            report_day = _resolve_daily_title_day(cycles)
+        if report_day is None:
+            continue
+        progress_rows = _build_cycle_progress_rows(cycles)
+        if not progress_rows:
+            continue
+        test_day = _test_day_from_folder_day(report_day)
+        week_start = _release_week_start(test_day)
+        weekly_groups[week_start].append(
+            {
+                "folder_id": str(folder_id),
+                "report_day": report_day,
+                "test_day": test_day,
+                "column_label": _parse_weekly_column_label_from_folder_name(folder_name),
+                "cycles": cycles,
+            }
+        )
+    if not weekly_groups:
+        return [], _empty_defect_analytics(), []
+
+    week_keys = sorted(weekly_groups.keys())
+    if last_n_weeks is not None:
+        week_keys = week_keys[-last_n_weeks:]
+
+    cycles_by_day: dict[date, list[dict[str, Any]]] = defaultdict(list)
+    column_labels_by_day: dict[date, list[str]] = defaultdict(list)
+    for week_start in week_keys:
+        week_daily_summaries = sorted(
+            weekly_groups[week_start],
+            key=lambda item: (item["report_day"], item["folder_id"]),
+        )
+        for summary in week_daily_summaries:
+            day_cycles = summary.get("cycles")
+            if isinstance(day_cycles, dict):
+                cycles_by_day[summary["report_day"]].append(day_cycles)
+            column_label = str(summary.get("column_label") or "").strip()
+            if column_label:
+                column_labels_by_day[summary["report_day"]].append(column_label)
+
+    ordered_days = sorted(cycles_by_day.keys())
+    column_labels: list[str] = []
+    for day in ordered_days:
+        day_labels = column_labels_by_day.get(day, [])
+        if day_labels:
+            column_labels.append(Counter(day_labels).most_common(1)[0][0])
+        else:
+            column_labels.append(f"nightly-dev-{day.strftime('%Y.%m.%d')}")
+
+    analytics = _compute_weekly_defect_analytics(
+        cycles_by_day, ordered_days, column_labels
+    )
+    return column_labels, analytics, week_keys
+
+
+def _bugs_rollup_section_subtitle(
+    week_keys: list[date], column_labels: list[str]
+) -> str:
+    parts: list[str] = []
+    if week_keys:
+        parts.append(
+            f"Недели: {week_keys[0].isoformat()}"
+            + (f" — {week_keys[-1].isoformat()}" if len(week_keys) > 1 else "")
+        )
+    if column_labels:
+        parts.append(f"Билдов: {len(column_labels)}")
+    return " · ".join(parts)
+
+
+def _bugs_rollup_html_section(
+    section_title: str,
+    *,
+    defect_analytics: dict[str, Any],
+    defect_meta: dict[str, dict[str, str]] | None,
+    column_labels: list[str],
+    week_keys: list[date],
+) -> list[str]:
+    blocks = [f"<h2><strong>{html.escape(section_title)}</strong></h2>"]
+    subtitle = _bugs_rollup_section_subtitle(week_keys, column_labels)
+    if subtitle:
+        blocks.append(f"<p class='bugs-rollup-subtitle'>{html.escape(subtitle)}</p>")
+    keys = list((defect_analytics or {}).get("keys_ordered") or [])
+    if keys:
+        blocks.append(
+            _weekly_defect_analytics_html(defect_analytics, defect_meta, column_labels)
+        )
+    else:
+        blocks.append("<p><em>Баги не найдены в данных Zephyr за выбранный период.</em></p>")
+    return blocks
+
+
+def render_bugs_rollup_html_report(
+    *,
+    last_weeks_analytics: dict[str, Any],
+    all_analytics: dict[str, Any],
+    defect_meta: dict[str, dict[str, str]] | None,
+    last_weeks_labels: list[str],
+    all_labels: list[str],
+    last_weeks_keys: list[date],
+    all_week_keys: list[date],
+) -> str:
+    sections = [
+        "<!doctype html>",
+        "<html><head><meta charset='utf-8'>",
+        f"<title>{html.escape(BUGS_ROLLUP_CONFLUENCE_TITLE)}</title>",
+        f"<style>{_WEEKLY_HTML_DEFECT_STYLES}</style>",
+        "</head><body>",
+        f"<h1>{html.escape(BUGS_ROLLUP_DISPLAY_TITLE)}</h1>",
+    ]
+    sections.extend(
+        _bugs_rollup_html_section(
+            BUGS_ROLLUP_SECTION_LAST_WEEKS,
+            defect_analytics=last_weeks_analytics,
+            defect_meta=defect_meta,
+            column_labels=last_weeks_labels,
+            week_keys=last_weeks_keys,
+        )
+    )
+    sections.extend(
+        _bugs_rollup_html_section(
+            BUGS_ROLLUP_SECTION_ALL,
+            defect_analytics=all_analytics,
+            defect_meta=defect_meta,
+            column_labels=all_labels,
+            week_keys=all_week_keys,
+        )
+    )
+    sections.append("</body></html>")
+    return "\n".join(sections)
+
+
+def _bugs_rollup_wiki_section(
+    section_title: str,
+    *,
+    defect_analytics: dict[str, Any],
+    defect_meta: dict[str, dict[str, str]] | None,
+    column_labels: list[str],
+    week_keys: list[date],
+) -> list[str]:
+    lines = [f"h2. {section_title}", ""]
+    subtitle = _bugs_rollup_section_subtitle(week_keys, column_labels)
+    if subtitle:
+        lines.append(f"_{subtitle}_")
+    lines.append("")
+    keys = list((defect_analytics or {}).get("keys_ordered") or [])
+    if keys:
+        lines.append(
+            _weekly_defect_analytics_wiki(defect_analytics, defect_meta, column_labels)
+        )
+    else:
+        lines.append("_Баги не найдены в данных Zephyr за выбранный период._")
+    lines.append("")
+    return lines
+
+
+def render_bugs_rollup_wiki_report(
+    *,
+    last_weeks_analytics: dict[str, Any],
+    all_analytics: dict[str, Any],
+    defect_meta: dict[str, dict[str, str]] | None,
+    last_weeks_labels: list[str],
+    all_labels: list[str],
+    last_weeks_keys: list[date],
+    all_week_keys: list[date],
+) -> str:
+    lines = [f"h1. {BUGS_ROLLUP_DISPLAY_TITLE}", ""]
+    lines.extend(
+        _bugs_rollup_wiki_section(
+            BUGS_ROLLUP_SECTION_LAST_WEEKS,
+            defect_analytics=last_weeks_analytics,
+            defect_meta=defect_meta,
+            column_labels=last_weeks_labels,
+            week_keys=last_weeks_keys,
+        )
+    )
+    lines.extend(
+        _bugs_rollup_wiki_section(
+            BUGS_ROLLUP_SECTION_ALL,
+            defect_analytics=all_analytics,
+            defect_meta=defect_meta,
+            column_labels=all_labels,
+            week_keys=all_week_keys,
+        )
+    )
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def write_bugs_rollup_reports(
+    output_dir: str,
+    report_data: dict[tuple[str, str], dict[str, Any]],
+    formats: set[str],
+    *,
+    defect_meta: dict[str, dict[str, str]] | None,
+    last_weeks: int | None = None,
+) -> list[str]:
+    """Write a single bugs index page (last N weeks + all time) in weekly defect format."""
+    os.makedirs(output_dir, exist_ok=True)
+    n_weeks = last_weeks if last_weeks is not None else _bugs_rollup_last_weeks_count()
+    last_labels, last_analytics, last_week_keys = _defect_rollup_from_report_data(
+        report_data, last_n_weeks=n_weeks
+    )
+    all_labels, all_analytics, all_week_keys = _defect_rollup_from_report_data(
+        report_data, last_n_weeks=None
+    )
+    written: list[str] = []
+    if "html" in formats:
+        html_path = os.path.join(output_dir, "bugs_index.html")
+        body = render_bugs_rollup_html_report(
+            last_weeks_analytics=last_analytics,
+            all_analytics=all_analytics,
+            defect_meta=defect_meta,
+            last_weeks_labels=last_labels,
+            all_labels=all_labels,
+            last_weeks_keys=last_week_keys,
+            all_week_keys=all_week_keys,
+        )
+        _write_text_always(html_path, body)
+        written.append(html_path)
+    if "wiki" in formats:
+        wiki_path = os.path.join(output_dir, "bugs_index.confluence.txt")
+        body = render_bugs_rollup_wiki_report(
+            last_weeks_analytics=last_analytics,
+            all_analytics=all_analytics,
+            defect_meta=defect_meta,
+            last_weeks_labels=last_labels,
+            all_labels=all_labels,
+            last_weeks_keys=last_week_keys,
+            all_week_keys=all_week_keys,
+        )
+        _write_text_always(wiki_path, body)
+        written.append(wiki_path)
+    return written
+
+
+def _list_bugs_rollup_html_paths(output_dir: str) -> list[str]:
+    if not os.path.isdir(output_dir):
+        return []
+    path = os.path.join(output_dir, "bugs_index.html")
+    return [path] if os.path.isfile(path) else []
 
 
 def render_weekly_html_report(
@@ -8970,7 +9629,7 @@ def write_build_log_reports(
 
 
 def _list_build_log_html_publish_paths(output_dir: str) -> list[str]:
-    """All per-issue build log HTML files on disk (for Confluence weekly publish)."""
+    """All per-issue build log HTML files on disk (for Confluence bugs publish)."""
     if not os.path.isdir(output_dir):
         return []
     return sorted(
@@ -8978,6 +9637,39 @@ def _list_build_log_html_publish_paths(output_dir: str) -> list[str]:
         for name in os.listdir(output_dir)
         if name.endswith("_build_log.html")
     )
+
+
+def _list_daily_readable_html_paths(output_dir: str) -> list[str]:
+    if not os.path.isdir(output_dir):
+        return []
+    return sorted(
+        os.path.join(output_dir, name)
+        for name in os.listdir(output_dir)
+        if name.endswith(".html") and not name.startswith("weekly_cycle_matrix")
+    )
+
+
+def _list_weekly_readable_html_paths(output_dir: str) -> list[str]:
+    if not os.path.isdir(output_dir):
+        return []
+    return sorted(
+        os.path.join(output_dir, name)
+        for name in os.listdir(output_dir)
+        if name.endswith(".html") and name.startswith("weekly_cycle_matrix")
+    )
+
+
+def _merge_confluence_publish_paths(
+    expected_paths: list[str], output_dir: str, *, list_on_disk
+) -> list[str]:
+    on_disk = list_on_disk(output_dir)
+    merged = sorted({p for p in expected_paths if p} | {p for p in on_disk if p})
+    if on_disk and not expected_paths:
+        print(
+            f"Confluence publish: using {len(on_disk)} HTML file(s) already on disk "
+            f"under {output_dir}."
+        )
+    return merged
 
 
 def _expected_daily_readable_html_paths(
@@ -9344,6 +10036,7 @@ def run_once(args: argparse.Namespace) -> int:
             daily_readable_paths: list[str] = []
             build_log_report_paths: list[str] = []
             build_log_html_publish_paths: list[str] = []
+            bugs_rollup_html_publish_paths: list[str] = []
             daily_html_publish_paths: list[str] = []
             weekly_html_publish_paths: list[str] = []
             readable_template_dir = args.readable_template_dir or os.getenv(
@@ -9354,6 +10047,9 @@ def run_once(args: argparse.Namespace) -> int:
             confluence_cfg = _load_confluence_publish_config()
             publish_confluence_daily = bool(confluence_cfg and confluence_cfg.publish_daily)
             publish_confluence_weekly = bool(confluence_cfg and confluence_cfg.publish_weekly)
+            publish_confluence_bugs = bool(confluence_cfg and confluence_cfg.publish_bugs)
+            confluence_publish_roots: ConfluencePublishRoots | None = None
+            confluence_week_parents: ConfluenceWeekParentCache | None = None
             need_cycles_cases_data = (
                 args.export_cycles_cases
                 or args.export_daily_readable
@@ -9616,6 +10312,8 @@ def run_once(args: argparse.Namespace) -> int:
                         roadmap_parts.append("Confluence daily publish")
                     if publish_confluence_weekly:
                         roadmap_parts.append("Confluence weekly publish")
+                    if publish_confluence_bugs:
+                        roadmap_parts.append("Confluence bugs publish")
                     print("Next: " + ", then ".join(roadmap_parts) + ".")
 
                 folder_worker_count = _bounded_worker_count(args.folder_workers, n_selected)
@@ -9857,6 +10555,51 @@ def run_once(args: argparse.Namespace) -> int:
                                 f"{len(stale_on_disk)} additional HTML file(s) on disk "
                                 "(no logviewer+Jira link in this run; republishing previous content)."
                             )
+            bugs_rollup_report_paths: list[str] = []
+            if report_data and (
+                args.export_build_log_report
+                or publish_confluence_bugs
+                or args.export_weekly_readable
+            ):
+                bugs_rollup_dir = (
+                    os.getenv("ZEPHYR_BUGS_ROLLUP_DIR", "reports/bugs_rollup").strip()
+                    or "reports/bugs_rollup"
+                )
+                rollup_formats = set(
+                    args.build_log_report_format
+                    or _env_csv_values("ZEPHYR_BUILD_LOG_REPORT_FORMATS", ["html", "wiki"])
+                )
+                rollup_keys: list[str] = []
+                seen_rollup_keys: set[str] = set()
+                for last_n in (
+                    _bugs_rollup_last_weeks_count(),
+                    None,
+                ):
+                    _labels, analytics, _weeks = _defect_rollup_from_report_data(
+                        report_data, last_n_weeks=last_n
+                    )
+                    for key in analytics.get("keys_ordered") or []:
+                        k = str(key).strip()
+                        if k and k not in seen_rollup_keys:
+                            seen_rollup_keys.add(k)
+                            rollup_keys.append(k)
+                jira_meta_base = _resolve_weekly_jira_metadata_base(args.base_url)
+                jira_meta_headers = _jira_bug_metadata_auth_headers(headers) or headers
+                rollup_defect_meta = _fetch_jira_bug_metadata(
+                    rollup_keys,
+                    base_url=jira_meta_base,
+                    auth_headers=jira_meta_headers,
+                )
+                with timed_step(timings, "write bugs rollup index reports"):
+                    bugs_rollup_report_paths = write_bugs_rollup_reports(
+                        output_dir=bugs_rollup_dir,
+                        report_data=report_data,
+                        formats=rollup_formats,
+                        defect_meta=rollup_defect_meta,
+                    )
+                bugs_rollup_html_publish_paths = [
+                    p for p in bugs_rollup_report_paths if p.endswith(".html")
+                ]
             cycle_progress_csv_updated: bool | None = None
             weekly_matrix_csv_updates: list[tuple[str, bool]] = []
             report_data_for_matrix = report_data or {}
@@ -10085,16 +10828,60 @@ def run_once(args: argparse.Namespace) -> int:
                         report_data_for_matrix,
                         per_folder=args.weekly_readable_per_folder,
                     )
-                for path in build_log_html_publish_paths:
-                    if path not in weekly_html_publish_paths:
-                        weekly_html_publish_paths.append(path)
                 timings.record(
                     "write weekly readable reports",
                     time.perf_counter() - weekly_readable_started_at,
                     f"files={len(weekly_readable_paths)}",
                 )
-            if build_log_html_publish_paths and not args.export_weekly_readable:
-                weekly_html_publish_paths.extend(build_log_html_publish_paths)
+            if confluence_cfg and (
+                publish_confluence_daily
+                or publish_confluence_weekly
+                or publish_confluence_bugs
+            ):
+                with timed_step(timings, "resolve Confluence publish roots"):
+                    confluence_publish_roots = resolve_confluence_publish_roots(
+                        confluence_cfg
+                    )
+                    confluence_week_parents = ConfluenceWeekParentCache(
+                        confluence_cfg, confluence_publish_roots.root_parent
+                    )
+                print("Confluence publish layout:")
+                print(
+                    f"- Root parent: {confluence_publish_roots.root_parent} "
+                    f"(week folders: {confluence_cfg.week_folder_title_template})"
+                )
+                print(
+                    f"- Bugs folder: {confluence_publish_roots.bugs_parent} "
+                    f"({confluence_cfg.bugs_parent_title})"
+                )
+            if confluence_cfg and publish_confluence_daily and args.export_daily_readable:
+                daily_html_publish_paths = _merge_confluence_publish_paths(
+                    daily_html_publish_paths,
+                    args.daily_readable_dir,
+                    list_on_disk=_list_daily_readable_html_paths,
+                )
+            if confluence_cfg and publish_confluence_weekly and args.export_weekly_readable:
+                weekly_html_publish_paths = _merge_confluence_publish_paths(
+                    weekly_html_publish_paths,
+                    args.weekly_readable_dir,
+                    list_on_disk=_list_weekly_readable_html_paths,
+                )
+            if confluence_cfg and publish_confluence_bugs and args.export_build_log_report:
+                build_log_html_publish_paths = _merge_confluence_publish_paths(
+                    build_log_html_publish_paths,
+                    args.build_log_report_dir,
+                    list_on_disk=_list_build_log_html_publish_paths,
+                )
+            if confluence_cfg and publish_confluence_bugs:
+                bugs_rollup_dir = (
+                    os.getenv("ZEPHYR_BUGS_ROLLUP_DIR", "reports/bugs_rollup").strip()
+                    or "reports/bugs_rollup"
+                )
+                bugs_rollup_html_publish_paths = _merge_confluence_publish_paths(
+                    bugs_rollup_html_publish_paths,
+                    bugs_rollup_dir,
+                    list_on_disk=_list_bugs_rollup_html_paths,
+                )
             if confluence_cfg and publish_confluence_daily:
                 if not args.export_daily_readable:
                     print(
@@ -10109,7 +10896,8 @@ def run_once(args: argparse.Namespace) -> int:
                         )
                     else:
                         print(
-                            "Confluence daily publish skipped: no folder payloads (empty report_data)."
+                            "Confluence daily publish skipped: no daily HTML files "
+                            f"under {args.daily_readable_dir}."
                         )
                 else:
                     existing_daily_html = [p for p in daily_html_publish_paths if os.path.isfile(p)]
@@ -10120,40 +10908,51 @@ def run_once(args: argparse.Namespace) -> int:
                             f"{len(missing_daily)} expected daily HTML file(s) missing on disk."
                         )
                     if existing_daily_html:
-                        with timed_step(
-                            timings,
-                            "publish daily reports to Confluence",
-                            f"files={len(existing_daily_html)}",
-                        ):
-                            outcomes = publish_reports_to_confluence(
-                                existing_daily_html, confluence_cfg
+                        if not confluence_week_parents:
+                            print(
+                                "Confluence daily publish skipped: week folder cache not "
+                                "initialized (set ZEPHYR_CONFLUENCE_PARENT_PAGE_ID)."
                             )
-                        print("Confluence daily publish:")
-                        for line in outcomes:
-                            print(f"- {line}")
+                        else:
+                            with timed_step(
+                                timings,
+                                "publish daily reports to Confluence",
+                                f"files={len(existing_daily_html)}",
+                            ):
+                                outcomes = publish_reports_to_confluence_by_week(
+                                    existing_daily_html,
+                                    confluence_cfg,
+                                    week_parents=confluence_week_parents,
+                                    fallback_parent=(
+                                        confluence_publish_roots.root_parent
+                                        if confluence_publish_roots
+                                        else None
+                                    ),
+                                )
+                            print("Confluence daily publish (under Week wNN):")
+                            for line in outcomes:
+                                print(f"- {line}")
                     else:
                         print(
                             "Confluence daily publish skipped: no HTML files found on disk at "
                             "expected paths."
                         )
             if confluence_cfg and publish_confluence_weekly:
-                if not args.export_weekly_readable and not build_log_html_publish_paths:
+                if not args.export_weekly_readable:
                     print(
-                        'Confluence weekly publish skipped: neither weekly readable nor '
-                        'build log HTML export produced pages.'
+                        "Confluence weekly publish skipped: --export-weekly-readable not enabled."
                     )
                 elif not weekly_html_publish_paths:
-                    weekly_fmt = set(args.weekly_readable_format or ['html', 'wiki'])
-                    build_log_fmt = set(args.build_log_report_format or _env_csv_values('ZEPHYR_BUILD_LOG_REPORT_FORMATS', ['html', 'wiki']))
-                    if args.export_weekly_readable and 'html' not in weekly_fmt and 'html' not in build_log_fmt:
+                    weekly_fmt = set(args.weekly_readable_format or ["html", "wiki"])
+                    if "html" not in weekly_fmt:
                         print(
-                            'Confluence weekly publish skipped: neither weekly readable nor '
-                            'build log formats include html.'
+                            "Confluence weekly publish skipped: weekly readable format does "
+                            "not include html."
                         )
                     else:
                         print(
-                            'Confluence weekly publish skipped: no weekly/build-log HTML pages '
-                            'for report_data.'
+                            "Confluence weekly publish skipped: no weekly HTML pages for "
+                            "report_data."
                         )
                 else:
                     existing_weekly_html = [
@@ -10168,21 +10967,89 @@ def run_once(args: argparse.Namespace) -> int:
                             f"{len(missing_weekly)} expected weekly HTML file(s) missing on disk."
                         )
                     if existing_weekly_html:
-                        with timed_step(
-                            timings,
-                            "publish weekly reports to Confluence",
-                            f"files={len(existing_weekly_html)}",
-                        ):
-                            outcomes = publish_reports_to_confluence(
-                                existing_weekly_html, confluence_cfg
+                        if not confluence_week_parents:
+                            print(
+                                "Confluence weekly publish skipped: week folder cache not "
+                                "initialized (set ZEPHYR_CONFLUENCE_PARENT_PAGE_ID)."
                             )
-                        print("Confluence weekly publish:")
-                        for line in outcomes:
-                            print(f"- {line}")
+                        else:
+                            with timed_step(
+                                timings,
+                                "publish weekly reports to Confluence",
+                                f"files={len(existing_weekly_html)}",
+                            ):
+                                outcomes = publish_reports_to_confluence_by_week(
+                                    existing_weekly_html,
+                                    confluence_cfg,
+                                    week_parents=confluence_week_parents,
+                                    fallback_parent=(
+                                        confluence_publish_roots.root_parent
+                                        if confluence_publish_roots
+                                        else None
+                                    ),
+                                )
+                            print("Confluence weekly publish (under Week wNN):")
+                            for line in outcomes:
+                                print(f"- {line}")
                     else:
                         print(
                             "Confluence weekly publish skipped: no HTML files found on disk at "
                             "expected paths."
+                        )
+            if confluence_cfg and publish_confluence_bugs:
+                build_log_fmt = set(
+                    args.build_log_report_format
+                    or _env_csv_values(
+                        "ZEPHYR_BUILD_LOG_REPORT_FORMATS", ["html", "wiki"]
+                    )
+                )
+                if "html" not in build_log_fmt:
+                    print(
+                        "Confluence bugs publish skipped: build log format does not "
+                        "include html."
+                    )
+                else:
+                    existing_bug_html = (
+                        [p for p in build_log_html_publish_paths if os.path.isfile(p)]
+                        if args.export_build_log_report
+                        else []
+                    )
+                    missing_bugs = (
+                        [p for p in build_log_html_publish_paths if not os.path.isfile(p)]
+                        if args.export_build_log_report
+                        else []
+                    )
+                    if missing_bugs:
+                        print(
+                            "Confluence publish warning: "
+                            f"{len(missing_bugs)} expected build-log HTML file(s) missing on disk."
+                        )
+                    existing_rollup_html = [
+                        p for p in bugs_rollup_html_publish_paths if os.path.isfile(p)
+                    ]
+                    publish_bug_html = existing_bug_html + existing_rollup_html
+                    if publish_bug_html:
+                        with timed_step(
+                            timings,
+                            "publish bug reports to Confluence",
+                            f"files={len(publish_bug_html)}",
+                        ):
+                            outcomes = publish_reports_to_confluence(
+                                publish_bug_html,
+                                confluence_cfg,
+                                parent_page_id=(
+                                    confluence_publish_roots.bugs_parent
+                                    if confluence_publish_roots
+                                    else None
+                                ),
+                            )
+                        print("Confluence bugs publish:")
+                        for line in outcomes:
+                            print(f"- {line}")
+                    else:
+                        print(
+                            "Confluence bugs publish skipped: no build-log or bugs rollup "
+                            "HTML files found on disk."
                         )
             print(f"Saved summary CSV: {args.output}")
             print(f"Saved per-folder CSV directory: {args.per_folder_dir}")
@@ -10196,6 +11063,13 @@ def run_once(args: argparse.Namespace) -> int:
             if args.export_build_log_report:
                 print(f"Saved build log reports: {args.build_log_report_dir}")
                 print(f"Build log report files written: {len(build_log_report_paths)}")
+            if bugs_rollup_report_paths:
+                bugs_rollup_dir = (
+                    os.getenv("ZEPHYR_BUGS_ROLLUP_DIR", "reports/bugs_rollup").strip()
+                    or "reports/bugs_rollup"
+                )
+                print(f"Saved bugs rollup index reports: {bugs_rollup_dir}")
+                print(f"Bugs rollup files written: {len(bugs_rollup_report_paths)}")
             if args.cycle_progress_output:
                 status = (
                     "content changed"

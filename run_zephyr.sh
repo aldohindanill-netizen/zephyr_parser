@@ -125,7 +125,7 @@ if env_enabled "${ZEPHYR_EXPORT_DAILY_READABLE:-}" true; then
     esac
   done
 fi
-if env_enabled "${ZEPHYR_EXPORT_WEEKLY_READABLE:-}" false; then
+if env_enabled "${ZEPHYR_EXPORT_WEEKLY_READABLE:-}" true; then
   cmd+=(--export-weekly-readable)
   if [[ -n "${ZEPHYR_WEEKLY_READABLE_DIR:-}" ]]; then
     cmd+=(--weekly-readable-dir "${ZEPHYR_WEEKLY_READABLE_DIR}")

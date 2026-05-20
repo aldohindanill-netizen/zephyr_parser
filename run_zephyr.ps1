@@ -119,7 +119,7 @@ if (Test-EnvEnabled $env:ZEPHYR_EXPORT_DAILY_READABLE $true) {
   }
 }
 
-if (Test-EnvEnabled $env:ZEPHYR_EXPORT_WEEKLY_READABLE $false) {
+if (Test-EnvEnabled $env:ZEPHYR_EXPORT_WEEKLY_READABLE $true) {
   $cmdArgs += @("--export-weekly-readable")
   if ($env:ZEPHYR_WEEKLY_READABLE_DIR) {
     $cmdArgs += @("--weekly-readable-dir", "$env:ZEPHYR_WEEKLY_READABLE_DIR")
