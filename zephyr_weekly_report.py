@@ -34,7 +34,7 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
-from typing import Any, Callable, TextIO
+from typing import Any, Callable, TextIO, cast
 
 
 DEFAULT_DATE_FIELDS = [
@@ -1463,11 +1463,12 @@ def _zephyr_status_counts_data_attr(counts: dict[str, int]) -> str:
 def _replace_weekly_overall_cells_with_zephyr_macro(body_html: str) -> str:
     """For Confluence publish: rewrite the per-build pie grid into a single
     one-row table where each cell contains the Zephyr Reporting storage macro
-    (built from data-zephyr-cycle-keys). The build label sits in the table
-    header so all builds line up horizontally side by side.
+    when `data-zephyr-cycle-keys` is present, otherwise a Chart macro from
+    `data-zephyr-status-counts`. Cycle keys take precedence when both exist.
 
-    If a cell has no cycle keys it falls back to a placeholder text. The
-    surrounding <div class='weekly-overall-grid'> is replaced entirely.
+    The build label sits in the table header so all builds line up horizontally
+    side by side. If a cell has neither attribute it falls back to placeholder
+    text. The surrounding <div class='weekly-overall-grid'> is replaced entirely.
     """
     if not body_html or "weekly-overall-grid" not in body_html:
         return body_html
@@ -1511,27 +1512,27 @@ def _replace_weekly_overall_cells_with_zephyr_macro(body_html: str) -> str:
             headers.append(html.escape(label_text))
 
             macro = ""
-            counts_attr = _WEEKLY_STATUS_COUNTS_ATTR_RE.search(attrs_text)
-            if counts_attr:
-                raw_counts_json = counts_attr.group(1) or counts_attr.group(2) or ""
+            keys_attr = _WEEKLY_CYCLE_KEYS_ATTR_RE.search(attrs_text)
+            if keys_attr:
+                raw_json = keys_attr.group(1) or keys_attr.group(2) or ""
                 try:
-                    decoded_counts = json.loads(html.unescape(raw_counts_json))
+                    decoded = json.loads(html.unescape(raw_json))
                 except json.JSONDecodeError:
-                    decoded_counts = None
-                if isinstance(decoded_counts, dict) and decoded_counts:
-                    macro = _daily_status_chart_storage_macro(
-                        {str(k): int(v) for k, v in decoded_counts.items()}
-                    )
+                    decoded = None
+                if isinstance(decoded, list) and decoded:
+                    macro = _daily_zephyr_test_results_summary_storage_macro(decoded)
             if not macro:
-                keys_attr = _WEEKLY_CYCLE_KEYS_ATTR_RE.search(attrs_text)
-                if keys_attr:
-                    raw_json = keys_attr.group(1) or keys_attr.group(2) or ""
+                counts_attr = _WEEKLY_STATUS_COUNTS_ATTR_RE.search(attrs_text)
+                if counts_attr:
+                    raw_counts_json = counts_attr.group(1) or counts_attr.group(2) or ""
                     try:
-                        decoded = json.loads(html.unescape(raw_json))
+                        decoded_counts = json.loads(html.unescape(raw_counts_json))
                     except json.JSONDecodeError:
-                        decoded = None
-                    if isinstance(decoded, list) and decoded:
-                        macro = _daily_zephyr_test_results_summary_storage_macro(decoded)
+                        decoded_counts = None
+                    if isinstance(decoded_counts, dict) and decoded_counts:
+                        macro = _daily_status_chart_storage_macro(
+                            {str(k): int(v) for k, v in decoded_counts.items()}
+                        )
             if not macro:
                 macro = "<p><em>Нет данных</em></p>"
             cells.append(macro)
@@ -6644,6 +6645,32 @@ def _analytics_trend_metric() -> str:
     return "rate" if raw == "rate" else "passed"
 
 
+def _merge_unique_zephyr_cycle_objects_from_label_map(
+    cycle_keys_by_label: dict[str, Any] | None,
+) -> list[dict[str, str]]:
+    """Union Zephyr test-run objects across all folder columns (dedupe by cycle id)."""
+    if not cycle_keys_by_label or not isinstance(cycle_keys_by_label, dict):
+        return []
+    seen: set[str] = set()
+    merged: list[dict[str, str]] = []
+    for objs in cycle_keys_by_label.values():
+        if not isinstance(objs, list):
+            continue
+        for raw in objs:
+            if not isinstance(raw, dict):
+                continue
+            cid = str(raw.get("id") or "").strip()
+            if not cid or cid in seen:
+                continue
+            seen.add(cid)
+            name = str(raw.get("name") or "").strip()
+            if name:
+                merged.append({"id": cid, "name": name})
+            else:
+                merged.append({"id": cid})
+    return merged
+
+
 def _weekly_analytics_trend_data(
     matrices: list[
         tuple[
@@ -6671,6 +6698,13 @@ def _weekly_analytics_trend_data(
             for status_key, value in build_counts.items():
                 merged[str(status_key)] += int(value)
         overall_by_week[col] = dict(merged)
+
+    cycle_keys_by_week: dict[str, list[dict[str, str]]] = {}
+    for col, matrix in zip(week_columns, matrices):
+        ckb = matrix[7] if len(matrix) > 7 else None
+        cycle_keys_by_week[col] = _merge_unique_zephyr_cycle_objects_from_label_map(
+            ckb if isinstance(ckb, dict) else None
+        )
 
     scenario_by_week: dict[str, dict[str, Any]] = {}
     metric = _analytics_trend_metric()
@@ -6706,6 +6740,7 @@ def _weekly_analytics_trend_data(
     return {
         "week_columns": week_columns,
         "overall_by_week": overall_by_week,
+        "cycle_keys_by_week": cycle_keys_by_week,
         "scenario_by_week": scenario_by_week,
         "defect_matrix": defect_matrix,
         "keys_ordered": keys_ordered,
@@ -7512,6 +7547,7 @@ def _weekly_defect_analytics_html(
     if extended:
         # 1. Сводка
         parts.append("<h4>Сводка</h4>")
+        parts.append("<div class='table-scroll-wrap'>")
         parts.append("<table class='weekly-defects-table weekly-defects-summary'>")
         header_cells = ["<th>Метрика</th>"] + [
             f"<th>{html.escape(label)}</th>" for label in column_labels
@@ -7530,11 +7566,12 @@ def _weekly_defect_analytics_html(
         parts.append(_row("Кейсов без бага", lambda c: cases_without.get(c, 0)))
         parts.append(_row("Fail-кейсов с багом", lambda c: failed_with.get(c, 0)))
         parts.append(_row("Fail-кейсов без бага", lambda c: failed_without.get(c, 0)))
-        parts.append("</tbody></table>")
+        parts.append("</tbody></table></div>")
 
         # 2. Топ-N
         parts.append(f"<h4>Топ багов (до {_DEFECT_TOP_LIMIT})</h4>")
         top_keys = keys_ordered[:_DEFECT_TOP_LIMIT]
+        parts.append("<div class='table-scroll-wrap'>")
         parts.append("<table class='weekly-defects-table weekly-defects-top'>")
         parts.append(
             "<thead><tr>"
@@ -7553,10 +7590,11 @@ def _weekly_defect_analytics_html(
                 f"<td style='text-align:center;'>{int(bug_builds_count.get(key, 0))}</td>"
                 "</tr>"
             )
-        parts.append("</tbody></table>")
+        parts.append("</tbody></table></div>")
 
         # 3. Матрица «баг x билд»
         parts.append("<h4>Матрица «баг × билд»</h4>")
+        parts.append("<div class='table-scroll-wrap'>")
         parts.append("<table class='weekly-defects-table weekly-defects-matrix'>")
         # <colgroup>: «Ключ» ~12%, «Priority» ~12%, build-колонки делят остаток поровну.
         n_builds_matrix = len(column_labels)
@@ -7592,7 +7630,7 @@ def _weekly_defect_analytics_html(
                     f"<td class='matrix-num'>{value if value > 0 else '—'}</td>"
                 )
             parts.append("<tr>" + "".join(cells) + "</tr>")
-        parts.append("</tbody></table>")
+        parts.append("</tbody></table></div>")
 
         # 4. Hot bugs
         if hot_bugs:
@@ -7606,6 +7644,7 @@ def _weekly_defect_analytics_html(
 
     # Full list (always when keys non-empty)
     parts.append("<h4>Все баги</h4>")
+    parts.append("<div class='table-scroll-wrap'>")
     parts.append("<table class='weekly-defects-table weekly-defects-all'>")
     parts.append(
         "<thead><tr>"
@@ -7624,7 +7663,7 @@ def _weekly_defect_analytics_html(
             f"<td style='text-align:center;'>{int(bug_builds_count.get(key, 0))}</td>"
             "</tr>"
         )
-    parts.append("</tbody></table>")
+    parts.append("</tbody></table></div>")
 
     parts.append("</div>")
     return "\n".join(parts)
@@ -7806,7 +7845,8 @@ def render_weekly_html_report(
             ".weekly-jira-key-link:hover{text-decoration:underline;}"
             ".weekly-defects-hot .weekly-jira-key-link{margin-right:4px;}"
             ".jira-lozenge{vertical-align:middle;}"
-            "</style>"
+            + _ANALYTICS_WIDE_TABLE_CSS
+            + "</style>"
         ),
         "</head><body>",
         f"<h1>{html.escape(title_text)}</h1>",
@@ -7846,6 +7886,7 @@ def render_weekly_wiki_report(
     rows: list[list[str]],
     *,
     column_status_counts: dict[str, dict[str, int]] | None = None,
+    cycle_keys_by_label: dict[str, list[dict[str, Any]]] | None = None,
     defect_keys: list[str] | None = None,
     defect_analytics: dict[str, Any] | None = None,
     defect_meta: dict[str, dict[str, str]] | None = None,
@@ -7898,6 +7939,7 @@ def render_weekly_wiki_report(
                 labels,
                 rows,
                 column_status_counts=column_status_counts,
+                cycle_keys_by_label=cycle_keys_by_label,
                 defect_keys=defect_keys,
                 defect_analytics=defect_analytics,
                 defect_meta=defect_meta,
@@ -7966,6 +8008,7 @@ def write_weekly_readable_reports(
             weekday_labels,
             rows,
             column_status_counts=column_status_counts,
+            cycle_keys_by_label=cycle_keys_by_label,
             defect_keys=defect_keys,
             defect_analytics=defect_analytics,
             defect_meta=defect_meta,
@@ -8553,7 +8596,8 @@ def _render_analytics_build_rates_html(bundle: dict[str, Any]) -> str:
     if not metrics:
         return "<p class='pie-empty'>Нет данных по билдам</p>"
     lines = [
-        "<table class='analytics-rates-table'><thead><tr>"
+        "<div class='table-scroll-wrap'>",
+        "<table class='analytics-rates-table analytics-wide-table analytics-sticky-first'><thead><tr>"
         "<th>Билд</th><th>Pass rate</th><th>Охват</th><th>Passed</th><th>Failed</th><th>NE</th>"
         "</tr></thead><tbody>",
     ]
@@ -8571,7 +8615,7 @@ def _render_analytics_build_rates_html(bundle: dict[str, Any]) -> str:
             f"<td style='text-align:center;'>{int(item.get('not_executed', 0))}</td>"
             "</tr>"
         )
-    lines.append("</tbody></table>")
+    lines.append("</tbody></table></div>")
     return "\n".join(lines)
 
 
@@ -8580,7 +8624,8 @@ def _render_analytics_trend_week_rates_html(bundle: dict[str, Any]) -> str:
     if not rates:
         return "<p class='pie-empty'>Нет данных</p>"
     lines = [
-        "<table class='analytics-rates-table'><thead><tr>"
+        "<div class='table-scroll-wrap'>",
+        "<table class='analytics-rates-table analytics-wide-table analytics-sticky-first'><thead><tr>"
         "<th>Неделя</th><th>Pass rate</th><th>Охват</th></tr></thead><tbody>",
     ]
     for item in rates:
@@ -8593,7 +8638,7 @@ def _render_analytics_trend_week_rates_html(bundle: dict[str, Any]) -> str:
             f"<td>{cov:.1f}% {_rate_bar_html(cov)}</td>"
             "</tr>"
         )
-    lines.append("</tbody></table>")
+    lines.append("</tbody></table></div>")
     return "\n".join(lines)
 
 
@@ -8617,8 +8662,12 @@ def _render_analytics_delta_html(bundle: dict[str, Any]) -> str:
     def _table(title: str, rows: list[dict[str, Any]]) -> str:
         if not rows:
             return f"<h4>{html.escape(title)}</h4><p><em>Нет изменений</em></p>"
-        out = [f"<h4>{html.escape(title)}</h4>", "<table><thead><tr>"
-               "<th>Сценарий</th><th>Было</th><th>Стало</th><th>Δ</th></tr></thead><tbody>"]
+        out = [
+            f"<h4>{html.escape(title)}</h4>",
+            "<div class='table-scroll-wrap'>",
+            "<table class='analytics-wide-table analytics-sticky-first'><thead><tr>"
+            "<th>Сценарий</th><th>Было</th><th>Стало</th><th>Δ</th></tr></thead><tbody>",
+        ]
         for row in rows:
             d = int(row.get("delta", 0))
             sign = f"+{d}" if d > 0 else str(d)
@@ -8630,7 +8679,7 @@ def _render_analytics_delta_html(bundle: dict[str, Any]) -> str:
                 f"<td style='text-align:center;'>{html.escape(sign)}</td>"
                 "</tr>"
             )
-        out.append("</tbody></table>")
+        out.append("</tbody></table></div>")
         return "\n".join(out)
 
     parts.append(_table("Топ улучшений", list(delta.get("improvements") or [])))
@@ -8650,15 +8699,93 @@ def _heatmap_cell_style(rate: float) -> str:
     return "background:#c9c9c2;color:#2f2f2f;"
 
 
+def _short_build_column_label(label: str) -> str:
+    """Короткая подпись колонки билда (для вертикальных заголовков heatmap)."""
+    s = str(label or "").strip()
+    if not s:
+        return ""
+    m = re.search(r"(\d{4})\.(\d{2})\.(\d{2})\s*$", s)
+    if m:
+        return f"{m.group(2)}.{m.group(3)}"
+    if len(s) <= 14:
+        return s
+    return s[:12] + "…"
+
+
+_ANALYTICS_WIDE_TABLE_CSS = (
+    ".table-scroll-wrap{overflow-x:auto;-webkit-overflow-scrolling:touch;margin:8px 0 20px;"
+    "max-width:100%;border:1px solid #dfe1e6;border-radius:8px;background:#fcfcfd;"
+    "box-shadow:0 1px 2px rgba(9,30,66,.08);}"
+    "table.analytics-wide-table{width:max-content;min-width:min(100%,42rem);table-layout:auto;"
+    "border-collapse:separate;border-spacing:0;margin-bottom:0;}"
+    "table.analytics-wide-table th,table.analytics-wide-table td{font-size:13px;padding:6px 8px;}"
+    "table.analytics-wide-table td:first-child,table.analytics-wide-table th:first-child{"
+    "white-space:normal;min-width:11rem;max-width:26rem;}"
+    "table.analytics-sticky-first td:first-child,table.analytics-sticky-first th:first-child{"
+    "position:sticky;left:0;z-index:2;background:#fff;"
+    "box-shadow:4px 0 8px -4px rgba(9,30,66,.18);}"
+    "table.analytics-sticky-first thead th:first-child{z-index:4;background:#f0f2f5;}"
+    "table.analytics-sticky-2cols td:first-child,table.analytics-sticky-2cols th:first-child{"
+    "position:sticky;left:0;z-index:2;background:#fff;"
+    "box-shadow:4px 0 8px -4px rgba(9,30,66,.15);min-width:11rem;max-width:22rem;}"
+    "table.analytics-sticky-2cols td:nth-child(2),table.analytics-sticky-2cols th:nth-child(2){"
+    "position:sticky;left:14rem;z-index:2;background:#fff;"
+    "box-shadow:4px 0 8px -4px rgba(9,30,66,.12);white-space:nowrap;text-align:center;}"
+    "table.analytics-sticky-2cols thead th:nth-child(1),"
+    "table.analytics-sticky-2cols thead th:nth-child(2){z-index:4;background:#f0f2f5;}"
+    "table.analytics-sticky-2cols .group-total-row td:nth-child(1),"
+    "table.analytics-sticky-2cols .group-total-row td:nth-child(2){background:#ffffff;}"
+    "table.analytics-sticky-2cols .grand-total-row td:nth-child(1),"
+    "table.analytics-sticky-2cols .grand-total-row td:nth-child(2){background:#eef1f5;}"
+    ".analytics-heatmap thead th.heatmap-row-label{min-width:8.5rem;max-width:16rem;white-space:normal;"
+    "font-weight:700;background:#f0f2f5;}"
+    ".analytics-heatmap tbody td.heatmap-row-label{min-width:8.5rem;max-width:16rem;white-space:normal;"
+    "font-weight:600;background:#fff;}"
+    ".analytics-heatmap th.heatmap-build-head{vertical-align:bottom;height:7rem;padding:2px 4px;"
+    "font-size:9px;line-height:1.05;font-weight:700;background:#f0f2f5;max-width:2.1rem;}"
+    ".analytics-heatmap th.heatmap-build-head span{display:block;writing-mode:vertical-rl;"
+    "transform:rotate(180deg);max-height:6.4rem;margin:0 auto;text-align:left;overflow:hidden;"
+    "text-overflow:ellipsis;white-space:normal;}"
+    ".analytics-heatmap td{font-size:12px;padding:4px 5px;}"
+    ".weekly-defects-jira .table-scroll-wrap table{margin-bottom:0;width:max-content;"
+    "min-width:100%;table-layout:auto;border-collapse:separate;border-spacing:0;}"
+    ".weekly-defects-jira .table-scroll-wrap .weekly-defects-summary td:first-child,"
+    ".weekly-defects-jira .table-scroll-wrap .weekly-defects-summary th:first-child{"
+    "position:sticky;left:0;z-index:2;background:#fff;"
+    "box-shadow:3px 0 6px -3px rgba(9,30,66,.12);}"
+    ".weekly-defects-jira .table-scroll-wrap .weekly-defects-summary thead th:first-child{"
+    "z-index:4;background:#f4f5f7;}"
+    ".weekly-defects-jira .table-scroll-wrap .weekly-defects-matrix td:first-child,"
+    ".weekly-defects-jira .table-scroll-wrap .weekly-defects-matrix th:first-child{"
+    "position:sticky;left:0;z-index:2;background:#fff;"
+    "box-shadow:3px 0 6px -3px rgba(9,30,66,.12);}"
+    ".weekly-defects-jira .table-scroll-wrap .weekly-defects-matrix thead th:first-child{"
+    "z-index:4;background:#f4f5f7;}"
+)
+
+
 def _render_analytics_group_heatmap_html(bundle: dict[str, Any]) -> str:
     groups = bundle.get("group_heatmap") or []
     labels = bundle.get("labels") or []
     if not groups or not labels:
         return "<p class='pie-empty'>Нет групп сценариев</p>"
-    header = ["<th>Группа</th>"] + [f"<th>{html.escape(l)}</th>" for l in labels]
-    lines = ["<table class='analytics-heatmap'><thead><tr>" + "".join(header) + "</tr></thead><tbody>"]
+    header = ["<th class='heatmap-row-label'>Группа</th>"]
+    for l in labels:
+        full = html.escape(str(l))
+        short = html.escape(_short_build_column_label(str(l)))
+        header.append(
+            "<th class='heatmap-build-head' "
+            f"title='{full}'><span>{short}</span></th>"
+        )
+    body: list[str] = [
+        "<div class='table-scroll-wrap'>",
+        "<table class='analytics-heatmap analytics-wide-table analytics-sticky-first'>",
+        "<thead><tr>" + "".join(header) + "</tr></thead><tbody>",
+    ]
     for group in groups:
-        cells = [f"<td>{html.escape(str(group.get('group') or ''))}</td>"]
+        cells = [
+            f"<td class='heatmap-row-label'>{html.escape(str(group.get('group') or ''))}</td>"
+        ]
         rates = group.get("rates") or {}
         for label in labels:
             rate = float(rates.get(label, 0))
@@ -8666,9 +8793,9 @@ def _render_analytics_group_heatmap_html(bundle: dict[str, Any]) -> str:
                 f"<td style='text-align:center;{_heatmap_cell_style(rate)}'>"
                 f"{rate:.0f}%</td>"
             )
-        lines.append("<tr>" + "".join(cells) + "</tr>")
-    lines.append("</tbody></table>")
-    return "\n".join(lines)
+        body.append("<tr>" + "".join(cells) + "</tr>")
+    body.append("</tbody></table></div>")
+    return "\n".join(body)
 
 
 def _render_analytics_quality_html(
@@ -8706,7 +8833,11 @@ def _render_analytics_quality_html(
     flaky = bundle.get("flaky") or []
     parts.append("<h4>Нестабильные сценарии</h4>")
     if flaky:
-        parts.append("<table><thead><tr><th>Сценарий</th><th>Min</th><th>Max</th><th>Из total</th></tr></thead><tbody>")
+        parts.append("<div class='table-scroll-wrap'>")
+        parts.append(
+            "<table class='analytics-wide-table analytics-sticky-first'>"
+            "<thead><tr><th>Сценарий</th><th>Min</th><th>Max</th><th>Из total</th></tr></thead><tbody>"
+        )
         for row in flaky:
             parts.append(
                 "<tr>"
@@ -8716,7 +8847,7 @@ def _render_analytics_quality_html(
                 f"<td style='text-align:center;'>{int(row.get('total', 0))}</td>"
                 "</tr>"
             )
-        parts.append("</tbody></table>")
+        parts.append("</tbody></table></div>")
     else:
         parts.append("<p><em>Нет нестабильных сценариев за период</em></p>")
 
@@ -8745,7 +8876,11 @@ def _render_analytics_failure_text_html(bundle: dict[str, Any]) -> str:
     comments = bundle.get("top_comments") or []
     parts.append("<h4>Топ комментариев при Fail</h4>")
     if comments:
-        parts.append("<table><thead><tr><th>Комментарий</th><th>Кол-во</th><th>Сценарии</th></tr></thead><tbody>")
+        parts.append("<div class='table-scroll-wrap'>")
+        parts.append(
+            "<table class='analytics-wide-table analytics-sticky-first'>"
+            "<thead><tr><th>Комментарий</th><th>Кол-во</th><th>Сценарии</th></tr></thead><tbody>"
+        )
         for row in comments:
             scenarios = ", ".join(row.get("scenarios") or [])
             parts.append(
@@ -8755,14 +8890,18 @@ def _render_analytics_failure_text_html(bundle: dict[str, Any]) -> str:
                 f"<td>{html.escape(scenarios)}</td>"
                 "</tr>"
             )
-        parts.append("</tbody></table>")
+        parts.append("</tbody></table></div>")
     else:
         parts.append("<p><em>Нет данных (case_steps.csv пуст или не собран)</em></p>")
 
     index = bundle.get("build_log_index") or []
     parts.append("<h4>Build-log по Jira</h4>")
     if index:
-        parts.append("<table><thead><tr><th>Билд</th><th>Jira</th><th>Логи</th></tr></thead><tbody>")
+        parts.append("<div class='table-scroll-wrap'>")
+        parts.append(
+            "<table class='analytics-wide-table analytics-sticky-first'>"
+            "<thead><tr><th>Билд</th><th>Jira</th><th>Логи</th></tr></thead><tbody>"
+        )
         for row in index[:40]:
             key = str(row.get("issue_key") or "")
             href = str(row.get("href") or "")
@@ -8778,7 +8917,7 @@ def _render_analytics_failure_text_html(bundle: dict[str, Any]) -> str:
                 f"<td style='text-align:center;'>{int(row.get('url_count', 0))}</td>"
                 "</tr>"
             )
-        parts.append("</tbody></table>")
+        parts.append("</tbody></table></div>")
     else:
         parts.append("<p><em>Нет build-log страниц</em></p>")
     return "\n".join(parts)
@@ -8961,8 +9100,11 @@ _ANALYTICS_PAGE_CSS = (
     "th{background:#f0f2f5;}"
     ".weekly-overall-grid{display:flex;flex-wrap:wrap;gap:24px;margin:12px 0;}"
     ".weekly-overall-cell{flex:1 1 200px;min-width:200px;}.daily-pie-wrap{display:flex;flex-wrap:wrap;align-items:flex-start;gap:16px;margin:8px 0;}.pie-legend{display:flex;flex-wrap:wrap;gap:12px;align-items:center;font-size:13px;max-width:520px;}.pie-swatch{display:inline-block;width:12px;height:12px;border-radius:2px;margin-right:6px;vertical-align:middle;}.pie-empty{color:#666;margin:8px 0;}"
-    ".analytics-rates-table td{vertical-align:middle;}.analytics-heatmap td{font-weight:600;}"
-    "</style>"
+    ".analytics-rates-table td{vertical-align:middle;}"
+    ".analytics-scroll-hint{margin:-4px 0 20px;padding:10px 14px;background:#e9f2ff;border-radius:6px;"
+    "font-size:13px;color:#172b4d;border:1px solid #b3d4ff;line-height:1.45;}"
+    + _ANALYTICS_WIDE_TABLE_CSS
+    + "</style>"
 )
 
 
@@ -9099,8 +9241,13 @@ def _render_analytics_sections_html(
         colgroup_html = "<colgroup>" + "".join(col_tags) + "</colgroup>"
     else:
         colgroup_html = ""
+    sections.append("<div class='table-scroll-wrap'>")
     sections.extend(
-        ["<table>", colgroup_html, "<thead><tr>" + "".join(header_cells) + "</tr></thead><tbody>"]
+        [
+            "<table class='analytics-wide-table analytics-sticky-2cols'>",
+            colgroup_html,
+            "<thead><tr>" + "".join(header_cells) + "</tr></thead><tbody>",
+        ]
     )
     for row_idx, row in enumerate(rows):
         if str(row[0]).startswith("Итого:"):
@@ -9192,7 +9339,7 @@ def _render_analytics_sections_html(
             for value in passed_grand
         )
         sections.append("<tr class='grand-total-row'>" + "".join(grand_cells) + "</tr>")
-    sections.append("</tbody></table>")
+    sections.append("</tbody></table></div>")
 
     sections.append(f"<{section_tag} id='defects'><strong>Заведённые дефекты</strong></{section_tag}>")
     merged_analytics = _coalesce_weekly_defect_analytics(defect_analytics, defect_keys)
@@ -9209,6 +9356,7 @@ def _render_analytics_sections_wiki(
     rows: list[list[str]],
     *,
     column_status_counts: dict[str, dict[str, int]] | None = None,
+    cycle_keys_by_label: dict[str, list[dict[str, Any]]] | None = None,
     defect_keys: list[str] | None = None,
     defect_analytics: dict[str, Any] | None = None,
     defect_meta: dict[str, dict[str, str]] | None = None,
@@ -9230,21 +9378,34 @@ def _render_analytics_sections_wiki(
         if isinstance(best_column.get("overall_counts"), dict)
         else {}
     )
+    best_cycle_keys = best_column.get("cycle_keys")
+    if not isinstance(best_cycle_keys, list):
+        best_cycle_keys = []
     lines: list[str] = []
     lines.append("{anchor:overall_score}")
     lines.append("h3. *Общий score*")
     lines.append("")
     counts_by_label = column_status_counts or {}
+    cycle_keys_map = cycle_keys_by_label or {}
     if data_labels:
         if has_best_column:
             lines.append(f"h4. {_wiki_escape(best_title)}")
-            best_chart = _daily_status_chart_wiki_block(best_overall_counts)
-            lines.extend((best_chart or "_Нет данных по статусам_").splitlines())
+            best_block = _weekly_overall_zephyr_or_chart_wiki(
+                cast(list[dict[str, Any]], best_cycle_keys),
+                best_overall_counts,
+            )
+            lines.extend((best_block or "_Нет данных по статусам_").splitlines())
             lines.append("")
         for label in labels:
             counts = counts_by_label.get(label, {}) or {}
             lines.append(f"h4. {_wiki_escape(str(label))}")
-            chart_block = _daily_status_chart_wiki_block(counts)
+            c_objs = cycle_keys_map.get(label)
+            if not isinstance(c_objs, list):
+                c_objs = []
+            chart_block = _weekly_overall_zephyr_or_chart_wiki(
+                cast(list[dict[str, Any]], c_objs),
+                counts,
+            )
             lines.extend((chart_block or "_Нет данных по статусам_").splitlines())
             lines.append("")
     else:
@@ -9312,7 +9473,8 @@ def _render_trend_scenario_table_html(trend: dict[str, Any]) -> str:
         return "<p>Нет данных</p>"
     header = ["<th>Тестовый цикл</th>"] + [f"<th>{html.escape(c)}</th>" for c in week_columns]
     rows_html = [
-        "<table><thead><tr>" + "".join(header) + "</tr></thead><tbody>",
+        "<div class='table-scroll-wrap'>",
+        "<table class='analytics-wide-table analytics-sticky-first'><thead><tr>" + "".join(header) + "</tr></thead><tbody>",
     ]
     for cycle in sorted(scenario_by_week.keys(), key=str.lower):
         cells = [f"<td>{html.escape(cycle)}</td>"]
@@ -9321,7 +9483,7 @@ def _render_trend_scenario_table_html(trend: dict[str, Any]) -> str:
             val = week_map.get(col, 0)
             cells.append(f"<td style='text-align:center;'>{html.escape(str(val))}</td>")
         rows_html.append("<tr>" + "".join(cells) + "</tr>")
-    rows_html.append("</tbody></table>")
+    rows_html.append("</tbody></table></div>")
     return "\n".join(rows_html)
 
 
@@ -9372,6 +9534,8 @@ def render_weekly_analytics_html(
         "<li><a href='#analytics_failure_text'>Тексты падений и build-log</a></li>",
         "<li><a href='#analytics_by_week'>По неделям</a></li>",
         "</ul></div>",
+        "<p class='analytics-scroll-hint'>Широкие таблицы в серой рамке: прокрутка по горизонтали внутри блока. "
+        "Первая колонка закреплена слева; в таблице «Score по сценариям» также закреплена колонка «Всего кейсов».</p>",
     ]
 
     parts.append("<h2 id='analytics_build_rates'>Тренд pass rate / охват по билдам</h2>")
@@ -9387,15 +9551,26 @@ def render_weekly_analytics_html(
     parts.append("<h3>Общий score (по неделям)</h3>")
     week_cols = list(trend.get("week_columns") or [])
     overall = trend.get("overall_by_week") or {}
+    cycle_keys_by_week = trend.get("cycle_keys_by_week") or {}
     if week_cols:
         parts.append("<div class='weekly-overall-grid'>")
         for col in week_cols:
             week_counts = overall.get(col, {}) or {}
             counts_attr = _zephyr_status_counts_data_attr(week_counts)
+            ckw = cycle_keys_by_week.get(col)
+            if not isinstance(ckw, list):
+                ckw = []
+            cycle_attr = ""
+            if ckw:
+                cycle_attr = (
+                    " data-zephyr-cycle-keys=\""
+                    + html.escape(json.dumps(ckw, ensure_ascii=True), quote=True)
+                    + "\""
+                )
             parts.append(
-                f"<div class='weekly-overall-cell'{counts_attr}>"
+                f"<div class='weekly-overall-cell'{counts_attr}{cycle_attr}>"
                 f"<h4>{html.escape(col)}</h4>"
-                f"{_daily_status_pie_svg(week_counts)}</div>"
+                f"{_daily_status_chart_html_block(week_counts)}</div>"
             )
         parts.append("</div>")
     else:
@@ -9533,10 +9708,17 @@ def render_weekly_analytics_wiki(
     lines.extend(["", "h3. Общий score (по неделям)", ""])
     week_cols = list(trend.get("week_columns") or [])
     overall = trend.get("overall_by_week") or {}
+    cycle_keys_by_week = trend.get("cycle_keys_by_week") or {}
     for col in week_cols:
         lines.append(f"h4. {_wiki_escape(col)}")
-        chart = _daily_status_chart_wiki_block(overall.get(col, {}) or {})
-        lines.extend((chart or "_Нет данных_").splitlines())
+        ckw = cycle_keys_by_week.get(col)
+        if not isinstance(ckw, list):
+            ckw = []
+        block = _weekly_overall_zephyr_or_chart_wiki(
+            cast(list[dict[str, Any]], ckw),
+            overall.get(col, {}) or {},
+        )
+        lines.extend((block or "_Нет данных_").splitlines())
         lines.append("")
     lines.extend(
         [
@@ -9560,6 +9742,7 @@ def render_weekly_analytics_wiki(
                 rolling_matrix[1],
                 rolling_matrix[2],
                 column_status_counts=rolling_matrix[5],
+                cycle_keys_by_label=rolling_matrix[7],
                 defect_keys=rolling_matrix[6],
                 defect_analytics=rolling_matrix[8],
                 defect_meta=defect_meta,
@@ -9596,6 +9779,7 @@ def render_weekly_analytics_wiki(
                 matrix[1],
                 matrix[2],
                 column_status_counts=matrix[5],
+                cycle_keys_by_label=matrix[7],
                 defect_keys=matrix[6],
                 defect_analytics=matrix[8],
                 defect_meta=defect_meta,
@@ -9921,6 +10105,38 @@ def _daily_status_summary_lines(counts: dict[str, int]) -> list[str]:
     return lines
 
 
+def _daily_status_chart_html_block(counts: dict[str, int]) -> str:
+    """HTML: data table for Confluence Chart macro (replaces inline SVG pies)."""
+    ordered: list[tuple[str, str]] = [
+        ("passed", "Пройден"),
+        ("failed", "Не пройден"),
+        ("not_executed", "Не выполнен"),
+        ("blocked", "Заблокирован"),
+        ("other", "Прочее"),
+    ]
+    row_cells: list[str] = []
+    for key, label in ordered:
+        value = int(counts.get(key, 0))
+        if value <= 0:
+            continue
+        row_cells.append(
+            "<tr>"
+            f"<td>{html.escape(label)}</td>"
+            f"<td style='text-align:center;'>{value}</td>"
+            "</tr>"
+        )
+    if not row_cells:
+        return "<p class='pie-empty'>Нет данных по статусам</p>"
+    return (
+        "<div class='daily-chart-macro-block'>"
+        "<table class='weekly-chart-data'>"
+        "<thead><tr><th>Категория</th><th>Количество</th></tr></thead>"
+        "<tbody>"
+        + "".join(row_cells)
+        + "</tbody></table></div>"
+    )
+
+
 def _daily_status_chart_wiki_block(counts: dict[str, int]) -> str:
     """Confluence wiki: table + native Chart macro (pie)."""
     ordered: list[tuple[str, str]] = [
@@ -10131,6 +10347,17 @@ def _daily_zephyr_test_results_summary_storage_macro(
         '<ac:parameter ac:name="reportKey">TEST_RESULTS_SUMMARY_BY_STATUS</ac:parameter>'
         "</ac:structured-macro>"
     )
+
+
+def _weekly_overall_zephyr_or_chart_wiki(
+    cycle_objects: list[dict[str, Any]] | None,
+    counts: dict[str, int] | None,
+) -> str:
+    """Wiki fragment: live Zephyr Reporting macro when test runs are known, else Chart pie."""
+    z = _daily_zephyr_test_results_summary_storage_macro(list(cycle_objects or []))
+    if z:
+        return z
+    return _daily_status_chart_wiki_block(counts or {}) or ""
 
 
 def _daily_status_chart_storage_macro(counts: dict[str, int]) -> str:
