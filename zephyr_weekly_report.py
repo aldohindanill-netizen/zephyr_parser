@@ -5384,6 +5384,15 @@ def _write_text_if_changed(path: str, text: str) -> bool:
     return True
 
 
+def _write_text_always(path: str, text: str) -> None:
+    """Write ``text`` to ``path``, creating parent dirs; always overwrites."""
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text)
+
+
 def write_cycle_progress_csv(path: str, rows: list[list[str]]) -> bool:
     header = [
         "folder_id",
@@ -8925,7 +8934,11 @@ def write_build_log_reports(
     jira_base_url: str,
     jira_auth_headers: dict[str, str] | None,
 ) -> list[str]:
-    """One HTML/wiki file per Jira issue: reproduction lines per build, newest build first."""
+    """One HTML/wiki file per Jira issue: reproduction lines per build, newest build first.
+
+    Files are always rewritten on each run (even when content is unchanged) so timestamps
+    refresh and Confluence weekly publish receives every HTML path.
+    """
     pages = _gather_jira_issue_build_log_pages(report_data)
     if not pages:
         return []
@@ -8944,14 +8957,27 @@ def write_build_log_reports(
         if "html" in formats:
             html_path = os.path.join(output_dir, f"{stem}.html")
             body = render_jira_issue_build_log_html(issue_key, summary, blocks)
-            if body and _write_text_if_changed(html_path, body):
+            if body:
+                _write_text_always(html_path, body)
                 written_paths.append(html_path)
         if "wiki" in formats:
             wiki_path = os.path.join(output_dir, f"{stem}.confluence.txt")
             body = render_jira_issue_build_log_wiki(issue_key, summary, blocks)
-            if body and _write_text_if_changed(wiki_path, body):
+            if body:
+                _write_text_always(wiki_path, body)
                 written_paths.append(wiki_path)
     return written_paths
+
+
+def _list_build_log_html_publish_paths(output_dir: str) -> list[str]:
+    """All per-issue build log HTML files on disk (for Confluence weekly publish)."""
+    if not os.path.isdir(output_dir):
+        return []
+    return sorted(
+        os.path.join(output_dir, name)
+        for name in os.listdir(output_dir)
+        if name.endswith("_build_log.html")
+    )
 
 
 def _expected_daily_readable_html_paths(
@@ -9814,10 +9840,23 @@ def run_once(args: argparse.Namespace) -> int:
                         jira_base_url=jira_meta_base,
                         jira_auth_headers=jira_meta_headers,
                     )
-                    if 'html' in bl_formats:
-                        build_log_html_publish_paths = [
-                            p for p in build_log_report_paths if p.endswith('.html')
+                    if "html" in bl_formats:
+                        regenerated_html = {
+                            p for p in build_log_report_paths if p.endswith(".html")
+                        }
+                        build_log_html_publish_paths = _list_build_log_html_publish_paths(
+                            args.build_log_report_dir
+                        )
+                        stale_on_disk = [
+                            p for p in build_log_html_publish_paths if p not in regenerated_html
                         ]
+                        if stale_on_disk:
+                            print(
+                                "Build log Confluence publish: "
+                                f"{len(regenerated_html)} page(s) from current Zephyr data, "
+                                f"{len(stale_on_disk)} additional HTML file(s) on disk "
+                                "(no logviewer+Jira link in this run; republishing previous content)."
+                            )
             cycle_progress_csv_updated: bool | None = None
             weekly_matrix_csv_updates: list[tuple[str, bool]] = []
             report_data_for_matrix = report_data or {}
@@ -10156,7 +10195,7 @@ def run_once(args: argparse.Namespace) -> int:
                 print(f"Daily readable files updated: {len(daily_readable_paths)}")
             if args.export_build_log_report:
                 print(f"Saved build log reports: {args.build_log_report_dir}")
-                print(f"Build log report files updated: {len(build_log_report_paths)}")
+                print(f"Build log report files written: {len(build_log_report_paths)}")
             if args.cycle_progress_output:
                 status = (
                     "content changed"
