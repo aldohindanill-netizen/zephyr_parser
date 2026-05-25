@@ -11,19 +11,9 @@ from pathlib import Path
 _REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO))
 
-env_path = _REPO / ".env"
-if env_path.is_file():
-    for line in env_path.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        name, value = line.split("=", 1)
-        value = value.strip()
-        if (value.startswith("'") and value.endswith("'")) or (
-            value.startswith('"') and value.endswith('"')
-        ):
-            value = value[1:-1]
-        os.environ[name.strip()] = value
+import argparse
+
+from repo_env import load_repo_env_for_scripts  # noqa: E402
 
 from bug_duplicate_detection import parse_jira_description_fields  # noqa: E402
 from zephyr_weekly_report import (  # noqa: E402
@@ -33,7 +23,17 @@ from zephyr_weekly_report import (  # noqa: E402
     request_json,
 )
 
-key = (sys.argv[1] if len(sys.argv) > 1 else "CSD-47279").strip()
+_argp = argparse.ArgumentParser(description=__doc__)
+_argp.add_argument("issue_key", nargs="?", default="CSD-47279")
+_argp.add_argument(
+    "--use-local-env",
+    action="store_true",
+    help="Load .env.local overrides",
+)
+_cli = _argp.parse_args()
+load_repo_env_for_scripts(use_local_env=_cli.use_local_env)
+
+key = _cli.issue_key.strip()
 base = (os.getenv("ZEPHYR_JIRA_BASE_URL") or os.getenv("ZEPHYR_BASE_URL") or "").rstrip("/")
 token = (os.getenv("ZEPHYR_JIRA_API_TOKEN") or os.getenv("ZEPHYR_API_TOKEN") or "").strip()
 headers = _jira_bug_metadata_auth_headers(

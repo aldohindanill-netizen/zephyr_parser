@@ -17,10 +17,10 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+from repo_env import load_repo_env_for_scripts  # noqa: E402
 from zephyr_weekly_report import (  # noqa: E402
     ConfluencePublishConfig,
     _confluence_request_json,
-    _load_repo_dotenv_if_absent,
 )
 
 
@@ -157,6 +157,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Print each page in deletion order",
     )
+    parser.add_argument(
+        "--use-local-env",
+        action="store_true",
+        help="Load .env.local overrides (sandbox Confluence parent id)",
+    )
     return parser.parse_args()
 
 
@@ -165,7 +170,7 @@ def main() -> int:
     dry_run = not args.execute
 
     try:
-        _load_repo_dotenv_if_absent()
+        load_repo_env_for_scripts(use_local_env=args.use_local_env)
         cfg = _load_confluence_connection_config()
         parent_page_id = _resolve_parent_page_id(args.parent_page_id)
     except ValueError as exc:

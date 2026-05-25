@@ -11,19 +11,9 @@ from pathlib import Path
 _REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO))
 
-env_path = _REPO / ".env"
-if env_path.is_file():
-    for line in env_path.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        name, value = line.split("=", 1)
-        value = value.strip()
-        if (value.startswith("'") and value.endswith("'")) or (
-            value.startswith('"') and value.endswith('"')
-        ):
-            value = value[1:-1]
-        os.environ[name.strip()] = value
+import argparse
+
+from repo_env import load_repo_env_for_scripts  # noqa: E402
 
 from bug_duplicate_detection import (  # noqa: E402
     find_duplicate_candidates,
@@ -41,6 +31,15 @@ from zephyr_weekly_report import (  # noqa: E402
 
 
 def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--use-local-env",
+        action="store_true",
+        help="Load .env.local overrides (reports_local paths)",
+    )
+    args = parser.parse_args()
+    load_repo_env_for_scripts(use_local_env=args.use_local_env)
+
     rollup_dir = (
         os.getenv("ZEPHYR_BUGS_ROLLUP_DIR", "reports/bugs_rollup").strip()
         or "reports/bugs_rollup"

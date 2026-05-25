@@ -27,6 +27,7 @@ from bug_duplicate_detection import (  # noqa: E402
     resolve_paths_for_rollup_dir,
     results_hash,
 )
+from repo_env import load_repo_env_for_scripts  # noqa: E402
 
 DEFAULT_MODEL = "paraphrase-multilingual-MiniLM-L12-v2"
 
@@ -134,7 +135,13 @@ def main() -> int:
         default=DEFAULT_MODEL,
         help=f"sentence-transformers model (default: {DEFAULT_MODEL})",
     )
+    parser.add_argument(
+        "--use-local-env",
+        action="store_true",
+        help="Load .env.local overrides (reports_local paths)",
+    )
     args = parser.parse_args()
+    load_repo_env_for_scripts(use_local_env=args.use_local_env)
 
     keys: list[str] = []
     expected_by_key: dict[str, str] = {}

@@ -1,6 +1,6 @@
 # zephyr_parser
 
-**Версия:** 1.3.0 (`PIPELINE_VERSION`)
+**Версия:** 1.4.0 (`PIPELINE_VERSION`)
 
 CLI для генерации отчётов по тест-экзекьюшенам Zephyr (Jira-hosted API): CSV, HTML/wiki для Confluence, weekly matrix.
 
@@ -48,7 +48,7 @@ chmod +x run_zephyr.sh
 ./run_zephyr.sh
 ```
 
-Python: `PYTHON_BIN`, затем `python3`, затем `python` (Windows: `py -3`).
+Python: `PYTHON_BIN`, затем `python3`, затем `python` (Windows: `py -3`). Для ручных команд и тестов на Windows используйте **`py -3`**, не `python` (в PATH может быть Python 3.6).
 
 ### Task Scheduler (каждые 30 минут)
 
@@ -128,14 +128,22 @@ cd ..\zephyr_parser_dev
 
 Проверка HTML: открыть `reports_local/daily_readable/*.html` в браузере.
 
-Скрипты в `scripts/` по умолчанию читают только `.env`. Для local-путей экспортируйте нужные переменные в сессию, например:
+Скрипты в `scripts/` читают `.env`; для dev-клона добавьте **`--use-local-env`** (подхватит `.env.local` / `reports_local/`):
 
 ```powershell
-$env:ZEPHYR_BUGS_ROLLUP_DIR = 'reports_local/bugs_rollup'
-python scripts/refresh_bugs_rollup_duplicates.py
+py -3 scripts/refresh_bugs_rollup_duplicates.py --use-local-env
+py -3 scripts/compute_bug_embeddings.py --from-rollup-dir reports_local/bugs_rollup --use-local-env
 ```
 
-Частичная отладка без полного пайплайна: `scripts/debug_jira_description.py`, `python -m unittest discover -s tests`.
+Частичная отладка: `py -3 scripts/debug_jira_description.py CSD-12345 --use-local-env`, `py -3 -m unittest discover -s tests`.
+
+### Разработка (feature-ветка)
+
+```powershell
+git checkout -b feature/v1.4-full-roadmap
+# ... коммиты ...
+# PR → main, затем git pull в production zephyr_parser
+```
 
 ---
 
@@ -219,8 +227,16 @@ python scripts/confluence_delete_children.py --parent-page-id 123456 --execute -
 - Fallback: если Expected/Actual не распарсились — сравнение по summary (старое поведение).
 - Ручные правила: `reports/bugs_rollup/duplicate_overrides.json` (`merge` / `split` пары ключей).
 - Семантика (opt-in): `pip install sentence-transformers`, затем  
-  `python scripts/compute_bug_embeddings.py --from-rollup-dir reports/bugs_rollup`  
+  `py -3 scripts/compute_bug_embeddings.py --from-rollup-dir reports/bugs_rollup`  
   (векторы по Expected+Actual, не по summary) и `ZEPHYR_BUGS_DUPLICATE_EMBEDDINGS=true` (порог **0.85**).
+
+**Runbook (порядок):**
+
+1. `py -3 scripts/calibrate_bug_duplicates.py` — сверка порога на эталонных парах  
+2. Полный прогон `run_zephyr` (rollup + `duplicate_rollup_keys.json`)  
+3. `py -3 scripts/refresh_bugs_rollup_duplicates.py` (`--use-local-env` в dev-клоне)  
+4. Опционально: embeddings (шаг выше) → снова refresh → включить `ZEPHYR_BUGS_DUPLICATE_EMBEDDINGS=true`  
+5. Ручные пары: `duplicate_overrides.json` (`merge` / `split`)
 
 Отладка: `reports/bugs_rollup/duplicate_candidates.json` (поля `expected_sim`, `actual_sim`), `duplicate_rollup_keys.json`.
 

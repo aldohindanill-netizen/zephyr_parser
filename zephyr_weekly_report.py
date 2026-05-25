@@ -45,6 +45,9 @@ from bug_duplicate_detection import (
     resolve_paths_for_rollup_dir,
     write_duplicate_candidates_debug,
 )
+import zephyr_audit as za
+import zephyr_security as zs
+from repo_env import get_repo_dotenv_parsed, load_repo_env
 
 
 DEFAULT_DATE_FIELDS = [
@@ -1224,7 +1227,7 @@ def request_json(
     retries = _env_int("ZEPHYR_GET_RETRIES", 2) if method_upper == "GET" else 0
     for attempt in range(retries + 1):
         try:
-            with urllib.request.urlopen(request, timeout=30) as response:
+            with zs.urlopen(request, timeout=30) as response:
                 raw = response.read()
                 if not raw:
                     return None
@@ -1245,7 +1248,9 @@ def request_json(
                 continue
             body = exc.read().decode("utf-8", errors="replace")
             raise RuntimeError(
-                f"HTTP {exc.code} while requesting '{url}' [{method_upper}]. Response: {body}"
+                zs.format_http_error(
+                    code=exc.code, url=url, method=method_upper, body=body
+                )
             ) from exc
         except json.JSONDecodeError as exc:
             preview = raw.decode("utf-8", errors="replace")[:300]
@@ -1271,56 +1276,14 @@ def _parse_bool_env(value: str | None) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
-# Parsed ``.env`` next to this script (lazy). Empty dict = file missing or no assignments.
-_repo_dotenv_cache: dict[str, str] | None = None
-
-
 def _get_repo_dotenv_parsed() -> dict[str, str]:
     """Return key/value pairs from repo ``.env`` (last assignment per key wins)."""
-    global _repo_dotenv_cache
-    if _repo_dotenv_cache is not None:
-        return _repo_dotenv_cache
-    from_file: dict[str, str] = {}
-    env_path = Path(__file__).resolve().parent / ".env"
-    if env_path.is_file():
-        try:
-            text = env_path.read_text(encoding="utf-8-sig")
-        except OSError:
-            _repo_dotenv_cache = from_file
-            return from_file
-        for raw_line in text.splitlines():
-            line = raw_line.strip().replace("\r", "")
-            if not line or line.startswith("#"):
-                continue
-            if line.lower().startswith("export "):
-                line = line[7:].strip()
-                if not line:
-                    continue
-            if "=" not in line:
-                continue
-            name, _, value = line.partition("=")
-            name = name.strip()
-            if not name:
-                continue
-            value = value.strip()
-            if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
-                value = value[1:-1]
-            from_file[name] = value
-    _repo_dotenv_cache = from_file
-    return from_file
+    return get_repo_dotenv_parsed()
 
 
 def _load_repo_dotenv_if_absent() -> None:
-    """Fill os.environ from ``.env`` next to this script for keys not already set.
-
-    Launchers (PowerShell/bash) often load ``.env`` before Python; IDE / ``python``
-    runs do not. Keys already present in the process environment are left unchanged;
-    use :func:`_weekly_defect_extended_analytics_enabled` for flags where the repo
-    ``.env`` must override a stale user/system variable.
-    """
-    for name, value in _get_repo_dotenv_parsed().items():
-        if name not in os.environ:
-            os.environ[name] = value
+    """Fill os.environ from ``.env`` for keys not already set (see ``repo_env``)."""
+    load_repo_env(overlay_local=False)
 
 
 def _load_confluence_publish_config() -> ConfluencePublishConfig | None:
@@ -1431,7 +1394,7 @@ def _confluence_request_json(
     request = urllib.request.Request(url, headers=headers, method=method_upper, data=payload)
     for attempt in range(retries + 1):
         try:
-            with urllib.request.urlopen(request, timeout=timeout) as response:
+            with zs.urlopen(request, timeout=timeout) as response:
                 raw = response.read().decode("utf-8")
                 if not raw:
                     return {}
@@ -1458,7 +1421,9 @@ def _confluence_request_json(
                 continue
             err_body = exc.read().decode("utf-8", errors="replace")
             raise RuntimeError(
-                f"Confluence HTTP {exc.code} for '{url}' [{method_upper}]. Response: {err_body}"
+                zs.format_http_error(
+                    code=exc.code, url=url, method=method_upper, body=err_body
+                )
             ) from exc
         except urllib.error.URLError as exc:
             if attempt < retries:
@@ -2048,7 +2013,7 @@ def _confluence_upload_attachment(
     url = f"{cfg.base_url}/{endpoint}"
     req = urllib.request.Request(url, headers=headers, method="POST", data=body)
     try:
-        with urllib.request.urlopen(req, timeout=30):
+        with zs.urlopen(req, timeout=30):
             return file_name
     except urllib.error.HTTPError as exc:
         # 409/400 can mean attachment already exists depending on instance settings; ignore as non-fatal.
@@ -2263,6 +2228,17 @@ def _replace_scenario_result_cells_with_zephyr_macro(storage_html: str) -> str:
     return pattern.sub(_repl, storage_html)
 
 
+def _audit_confluence_publish(
+    html_path: str, title: str, page_id: str, action: str
+) -> None:
+    za.audit_publish_confluence(
+        title=title,
+        page_id=str(page_id),
+        action=action,
+        path=html_path,
+    )
+
+
 def publish_reports_to_confluence(
     html_paths: list[str],
     cfg: ConfluencePublishConfig,
@@ -2298,6 +2274,7 @@ def publish_reports_to_confluence(
                 parent_page_id=parent_page_id,
             )
             outcomes.append(f"{action}: {primary_title} (page id {page_id})")
+            _audit_confluence_publish(html_path, primary_title, page_id, action)
             continue
         if is_build_log:
             body_html = _normalize_html_for_confluence_storage(raw_html)
@@ -2319,6 +2296,7 @@ def publish_reports_to_confluence(
                 parent_page_id=parent_page_id,
             )
             outcomes.append(f"{action}: {primary_title} (page id {page_id})")
+            _audit_confluence_publish(html_path, primary_title, page_id, action)
             continue
         if is_weekly_analytics:
             body_html = _normalize_html_for_confluence_storage(raw_html)
@@ -2334,6 +2312,7 @@ def publish_reports_to_confluence(
                 cfg, analytics_title, body_html
             )
             outcomes.append(f"{action}: {analytics_title} (page id {page_id})")
+            _audit_confluence_publish(html_path, analytics_title, page_id, action)
             continue
         if is_weekly:
             body_html = _normalize_html_for_confluence_storage(raw_html)
@@ -2359,6 +2338,7 @@ def publish_reports_to_confluence(
                 parent_page_id=parent_page_id,
             )
             outcomes.append(f"{action}: {primary_title} (page id {page_id})")
+            _audit_confluence_publish(html_path, primary_title, page_id, action)
             continue
         cycle_objects_raw = _extract_zephyr_cycle_key_objects_from_html(raw_html)
         cycle_objects: list[dict[str, Any]] = (
@@ -2413,6 +2393,7 @@ def publish_reports_to_confluence(
         elif use_native_chart:
             attachment_note = ", chart: native macro"
         outcomes.append(f"{action}: {primary_title} (page id {page_id}{attachment_note})")
+        _audit_confluence_publish(html_path, primary_title, page_id, action)
     return outcomes
 
 
@@ -4646,7 +4627,7 @@ def extract_logviewer_urls(text: str) -> list[str]:
             continue
         seen_lower.add(low)
         out.append(url)
-    return out
+    return zs.filter_logviewer_urls(out)
 
 
 def _build_log_folder_nightly_display_and_date(
@@ -12210,6 +12191,30 @@ def _emit_startup_heartbeat() -> None:
     )
 
 
+def _audit_exports_after_run(args: argparse.Namespace, *, folder_rows: int = 0) -> None:
+    za.audit_export_file(args.output, kind="weekly_csv")
+    za.audit_export_file(args.per_folder_dir, record_count=folder_rows, kind="per_folder_dir")
+    if args.export_cycles_cases:
+        za.audit_export_file(args.cycles_cases_output, kind="cycles_cases_csv")
+    if args.export_case_steps:
+        za.audit_export_file(args.case_steps_output, kind="case_steps_csv")
+    if args.cycle_progress_output:
+        za.audit_export_file(args.cycle_progress_output, kind="cycle_progress_csv")
+    if args.weekly_cycle_matrix_output:
+        za.audit_export_file(args.weekly_cycle_matrix_output, kind="weekly_matrix_csv")
+    if args.export_daily_readable:
+        za.audit_export_file(args.daily_readable_dir, kind="daily_readable")
+    if args.export_weekly_readable:
+        za.audit_export_file(args.weekly_readable_dir, kind="weekly_readable")
+    if _export_weekly_analytics_enabled(args):
+        za.audit_export_file(args.weekly_analytics_dir, kind="weekly_analytics")
+    if args.export_build_log_report:
+        za.audit_export_file(args.build_log_report_dir, kind="build_log_reports")
+    rollup_dir = (os.getenv("ZEPHYR_BUGS_ROLLUP_DIR") or "").strip()
+    if rollup_dir:
+        za.audit_export_file(rollup_dir, kind="bugs_rollup")
+
+
 def main() -> int:
     _load_repo_dotenv_if_absent()
     args = parse_args()
@@ -12237,6 +12242,9 @@ def main() -> int:
 
 
 def run_once(args: argparse.Namespace) -> int:
+    exit_code = 1
+    run_mode = "folder_discovery" if args.discover_folders else "executions"
+    za.audit_run_start(mode=run_mode)
     try:
         effective_rolling_days = args.rolling_days
         if args.regenerate_last_7_days and args.regenerate_last_n_days > 0:
@@ -12267,6 +12275,7 @@ def run_once(args: argparse.Namespace) -> int:
                 td = (os.getenv("ZEPHYR_TO_DATE") or "").strip()
                 if td:
                     args.to_date = td
+        zs.enforce_token_from_env_only(args.token)
         token = args.token or os.getenv("ZEPHYR_API_TOKEN")
         if not args.base_url:
             raise ValueError(
@@ -13537,6 +13546,8 @@ def run_once(args: argparse.Namespace) -> int:
                 for item in errors:
                     print(f"- {item}")
             timings.summarize()
+            _audit_exports_after_run(args, folder_rows=len(folder_rows))
+            exit_code = 0
             return 0
 
         executions = fetch_executions(
@@ -13561,10 +13572,15 @@ def run_once(args: argparse.Namespace) -> int:
         print(f"Fetched executions: {len(executions)}")
         if skipped:
             print(f"Skipped records: {dict(skipped)}")
+        _audit_exports_after_run(args)
+        exit_code = 0
         return 0
     except Exception as exc:  # pylint: disable=broad-except
         print(f"Error: {exc}", file=sys.stderr)
+        exit_code = 1
         return 1
+    finally:
+        za.audit_run_finish(exit_code)
 
 
 class _TeeIO:
@@ -13613,6 +13629,43 @@ def _prune_old_zephyr_logs(log_dir: Path, retention_days: int) -> None:
             pass
 
 
+def _reports_retention_days() -> int:
+    raw = (os.getenv("ZEPHYR_REPORTS_RETENTION_DAYS") or "").strip()
+    if not raw.isdigit():
+        return 0
+    return int(raw)
+
+
+def _prune_old_report_artifacts(repo_root: Path) -> None:
+    days = _reports_retention_days()
+    if days <= 0:
+        return
+    cutoff = datetime.now().timestamp() - days * 86400
+
+    def _env_dir(name: str, default: str) -> Path:
+        raw = (os.getenv(name) or default).strip() or default
+        path = Path(raw)
+        return path if path.is_absolute() else repo_root / path
+
+    targets = [
+        _env_dir("ZEPHYR_PER_FOLDER_DIR", "reports/by_folder"),
+        _env_dir("ZEPHYR_DAILY_READABLE_DIR", "reports/daily_readable"),
+        _env_dir("ZEPHYR_WEEKLY_READABLE_DIR", "reports/weekly_readable"),
+        _env_dir("ZEPHYR_BUILD_LOG_REPORT_DIR", "reports/build_log_reports"),
+    ]
+    for base in targets:
+        if not base.is_dir():
+            continue
+        for path in base.rglob("*"):
+            if not path.is_file():
+                continue
+            try:
+                if path.stat().st_mtime < cutoff:
+                    path.unlink()
+            except OSError:
+                pass
+
+
 def _restore_stdio_and_close_log(
     orig_stdout: TextIO, orig_stderr: TextIO, log_f: TextIO
 ) -> None:
@@ -13636,6 +13689,7 @@ def _maybe_setup_run_log_file() -> None:
     except OSError:
         return
     _prune_old_zephyr_logs(log_dir, _log_retention_days())
+    _prune_old_report_artifacts(script_dir)
     stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     log_path = log_dir / f"zephyr_{stamp}.log"
     orig_out, orig_err = sys.__stdout__, sys.__stderr__
