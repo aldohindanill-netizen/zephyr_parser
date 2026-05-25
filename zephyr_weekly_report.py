@@ -34,7 +34,7 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
-from typing import Any, Callable, TextIO
+from typing import Any, Callable, TextIO, cast
 
 from bug_duplicate_detection import (
     DuplicateCandidate,
@@ -116,6 +116,7 @@ class ConfluencePublishConfig:
     publish_daily: bool = False
     publish_weekly: bool = False
     publish_bugs: bool = False
+    publish_weekly_analytics: bool = False
 
 
 @dataclass
@@ -580,6 +581,26 @@ def parse_args() -> argparse.Namespace:
             "Also emit weekly readable reports per folder (separate files; "
             "does not replace merged all-folders output)."
         ),
+    )
+    parser.add_argument(
+        "--export-weekly-analytics",
+        action="store_true",
+        help=(
+            "Export weekly analytics to a separate HTML/wiki page (folder discovery mode). "
+            "Default: ZEPHYR_EXPORT_WEEKLY_ANALYTICS when set in env."
+        ),
+    )
+    parser.add_argument(
+        "--weekly-analytics-dir",
+        default=os.getenv("ZEPHYR_WEEKLY_ANALYTICS_DIR", "reports/weekly_analytics"),
+        help="Directory for weekly analytics reports (default: reports/weekly_analytics).",
+    )
+    parser.add_argument(
+        "--weekly-analytics-format",
+        action="append",
+        choices=("html", "wiki"),
+        default=[],
+        help="Weekly analytics format. Can repeat; default is both html and wiki.",
     )
     parser.add_argument(
         "--regenerate-last-7-days",
@@ -1313,6 +1334,11 @@ def _load_confluence_publish_config() -> ConfluencePublishConfig | None:
         publish_bugs = publish_weekly
     else:
         publish_bugs = _parse_bool_env(publish_bugs_raw)
+    analytics_publish_env = os.getenv("ZEPHYR_CONFLUENCE_PUBLISH_WEEKLY_ANALYTICS")
+    if analytics_publish_env is None:
+        publish_weekly_analytics = publish_weekly
+    else:
+        publish_weekly_analytics = _parse_bool_env(analytics_publish_env)
     update_existing = _parse_bool_env(os.getenv("ZEPHYR_CONFLUENCE_UPDATE_EXISTING"))
     bugs_parent_page_id = (
         (os.getenv("ZEPHYR_CONFLUENCE_BUGS_PARENT_PAGE_ID") or "").strip() or None
@@ -1323,7 +1349,7 @@ def _load_confluence_publish_config() -> ConfluencePublishConfig | None:
     week_folder_title_template = (
         os.getenv("ZEPHYR_CONFLUENCE_WEEK_FOLDER_TITLE_TEMPLATE") or "Week {year}-w{week:02d}"
     ).strip() or "Week {year}-w{week:02d}"
-    if not (publish_daily or publish_weekly or publish_bugs):
+    if not (publish_daily or publish_weekly or publish_bugs or publish_weekly_analytics):
         return None
     if auth_scheme not in {"basic", "bearer"}:
         raise ValueError(
@@ -1357,6 +1383,7 @@ def _load_confluence_publish_config() -> ConfluencePublishConfig | None:
         publish_daily=publish_daily,
         publish_weekly=publish_weekly,
         publish_bugs=publish_bugs,
+        publish_weekly_analytics=publish_weekly_analytics,
     )
 
 
@@ -1464,6 +1491,10 @@ _WEEKLY_CYCLE_KEYS_ATTR_RE = re.compile(
     r'data-zephyr-cycle-keys=(?:"([^"]*)"|\'([^\']*)\')',
     flags=re.IGNORECASE,
 )
+_WEEKLY_STATUS_COUNTS_ATTR_RE = re.compile(
+    r'data-zephyr-status-counts=(?:"([^"]*)"|\'([^\']*)\')',
+    flags=re.IGNORECASE,
+)
 _WEEKLY_CELL_H4_RE = re.compile(
     r"<h4[^>]*>(?P<text>.*?)</h4>", flags=re.DOTALL | re.IGNORECASE
 )
@@ -1487,14 +1518,24 @@ def _strip_inner_tags(html_fragment: str) -> str:
     return re.sub(r"<[^>]+>", "", html_fragment).strip()
 
 
+def _zephyr_status_counts_data_attr(counts: dict[str, int]) -> str:
+    """Embed case status totals for Confluence chart macro conversion on publish."""
+    merged = {str(k): int(v) for k, v in (counts or {}).items() if int(v) > 0}
+    if not merged:
+        return ""
+    payload = json.dumps(merged, ensure_ascii=True, separators=(",", ":"))
+    return f' data-zephyr-status-counts="{html.escape(payload, quote=True)}"'
+
+
 def _replace_weekly_overall_cells_with_zephyr_macro(body_html: str) -> str:
     """For Confluence publish: rewrite the per-build pie grid into a single
     one-row table where each cell contains the Zephyr Reporting storage macro
-    (built from data-zephyr-cycle-keys). The build label sits in the table
-    header so all builds line up horizontally side by side.
+    when `data-zephyr-cycle-keys` is present, otherwise a Chart macro from
+    `data-zephyr-status-counts`. Cycle keys take precedence when both exist.
 
-    If a cell has no cycle keys it falls back to a placeholder text. The
-    surrounding <div class='weekly-overall-grid'> is replaced entirely.
+    The build label sits in the table header so all builds line up horizontally
+    side by side. If a cell has neither attribute it falls back to placeholder
+    text. The surrounding <div class='weekly-overall-grid'> is replaced entirely.
     """
     if not body_html or "weekly-overall-grid" not in body_html:
         return body_html
@@ -1547,6 +1588,18 @@ def _replace_weekly_overall_cells_with_zephyr_macro(body_html: str) -> str:
                     decoded = None
                 if isinstance(decoded, list) and decoded:
                     macro = _daily_zephyr_test_results_summary_storage_macro(decoded)
+            if not macro:
+                counts_attr = _WEEKLY_STATUS_COUNTS_ATTR_RE.search(attrs_text)
+                if counts_attr:
+                    raw_counts_json = counts_attr.group(1) or counts_attr.group(2) or ""
+                    try:
+                        decoded_counts = json.loads(html.unescape(raw_counts_json))
+                    except json.JSONDecodeError:
+                        decoded_counts = None
+                    if isinstance(decoded_counts, dict) and decoded_counts:
+                        macro = _daily_status_chart_storage_macro(
+                            {str(k): int(v) for k, v in decoded_counts.items()}
+                        )
             if not macro:
                 macro = "<p><em>Нет данных</em></p>"
             cells.append(macro)
@@ -2148,9 +2201,11 @@ def publish_reports_to_confluence(
     for html_path in html_paths:
         with open(html_path, encoding="utf-8") as source:
             raw_html = source.read()
+        base_name = os.path.basename(html_path)
         is_build_log = _is_build_log_html_path(html_path)
         is_bugs_rollup = _is_bugs_rollup_html_path(html_path)
-        is_weekly = os.path.basename(html_path).startswith("weekly_cycle_matrix")
+        is_weekly_analytics = base_name == "weekly_analytics.html"
+        is_weekly = base_name.startswith("weekly_cycle_matrix")
         if is_bugs_rollup:
             body_html = _normalize_html_for_confluence_storage(raw_html)
             body_html = _inject_confluence_anchor_macros(body_html)
@@ -2192,6 +2247,21 @@ def publish_reports_to_confluence(
                 parent_page_id=parent_page_id,
             )
             outcomes.append(f"{action}: {primary_title} (page id {page_id})")
+            continue
+        if is_weekly_analytics:
+            body_html = _normalize_html_for_confluence_storage(raw_html)
+            body_html = _inject_confluence_anchor_macros(body_html)
+            body_html = _convert_fragment_links_to_confluence(body_html)
+            body_html = _replace_weekly_overall_cells_with_zephyr_macro(body_html)
+            body_html = _replace_weekly_jira_key_spans_with_confluence_macro(body_html)
+            body_html = _replace_legacy_weekly_table_macros_with_excerpt(body_html)
+            analytics_title = (
+                os.getenv("ZEPHYR_CONFLUENCE_WEEKLY_ANALYTICS_TITLE") or "Zephyr Weekly Analytics"
+            ).strip()
+            page_id, action = _confluence_upsert_storage_page(
+                cfg, analytics_title, body_html
+            )
+            outcomes.append(f"{action}: {analytics_title} (page id {page_id})")
             continue
         if is_weekly:
             body_html = _normalize_html_for_confluence_storage(raw_html)
@@ -5530,6 +5600,17 @@ def _summary_scenario_group(row: dict[str, Any]) -> str:
     return ""
 
 
+def _is_weekly_scenario_cycle_label(cycle_label: str) -> bool:
+    """True for Zephyr test cycles (X.Y …), false for bare test-case keys (QA-C…)."""
+    label = str(cycle_label or "").strip()
+    if not label or label.startswith("Итого:"):
+        return False
+    if re.fullmatch(r"QA-[A-Z]\d+", label, re.IGNORECASE):
+        return False
+    cycle_index = _extract_cycle_index({"cycle_name": label})
+    return bool(re.match(r"^\d+\.\d+$", cycle_index))
+
+
 def _summary_group_title_from_labels(labels: list[str], fallback_group: str) -> str:
     meaningful_rows: list[list[tuple[str, str]]] = []
     for label in labels:
@@ -5710,6 +5791,15 @@ def _cycle_progress_csv_rows(
         for cycle in sorted(cycles.values(), key=_cycle_sort_key):
             cycle_key = str(cycle.get("cycle_key") or "")
             cycle_name = str(cycle.get("cycle_name") or "")
+            cycle_label = _build_summary_cycle_label(
+                {
+                    "cycle_index": _extract_cycle_index(cycle),
+                    "cycle_title": cycle_name,
+                    "cycle_key": cycle_key,
+                }
+            )
+            if not _is_weekly_scenario_cycle_label(cycle_label):
+                continue
             total_cases = len(cycle.get("cases", {}))
             passed_cases = 0
             for case in cycle.get("cases", {}).values():
@@ -6351,7 +6441,7 @@ def _weekly_aggregate_progress_map(
     for progress_row in progress_rows:
         label = _build_summary_cycle_label(progress_row)
         normalized_label, is_cloned = _normalize_weekly_cycle_label(label)
-        if not normalized_label:
+        if not normalized_label or not _is_weekly_scenario_cycle_label(normalized_label):
             continue
         cycle_sort_key = _summary_sort_key(progress_row)
         total_cases = int(progress_row.get("total_cases", 0))
@@ -6681,6 +6771,369 @@ def _weekly_cycle_matrix_data_all(
     for week_start in sorted(by_week.keys()):
         matrices.append(_weekly_cycle_matrix_data(by_week[week_start]))
     return matrices
+
+
+def _weekly_cycle_matrix_data_rolling(
+    report_data: dict[tuple[str, str], dict[str, Any]],
+) -> tuple[
+    date | None,
+    list[str],
+    list[list[str]],
+    list[list[bool]],
+    list[list[bool]],
+    dict[str, dict[str, int]],
+    list[str],
+    dict[str, list[dict[str, str]]],
+    dict[str, Any],
+]:
+    """Aggregate matrix across all release weeks in report_data (columns = builds)."""
+    daily_summaries: list[dict[str, Any]] = []
+    for (folder_id, folder_name), payload in report_data.items():
+        cycles = payload.get("cycles", {})
+        if not isinstance(cycles, dict):
+            continue
+        report_day = _resolve_folder_report_day(folder_name, cycles)
+        if report_day is None:
+            report_day = _resolve_daily_title_day(cycles)
+        if report_day is None:
+            continue
+        progress_rows = _build_cycle_progress_rows(cycles)
+        if not progress_rows:
+            continue
+        test_day = _test_day_from_folder_day(report_day)
+        daily_summaries.append(
+            {
+                "folder_id": str(folder_id),
+                "report_day": report_day,
+                "test_day": test_day,
+                "column_label": _parse_weekly_column_label_from_folder_name(folder_name),
+                "progress_rows": progress_rows,
+                "cycles": cycles,
+            }
+        )
+    if not daily_summaries:
+        return None, [], [], [], [], {}, [], {}, _empty_defect_analytics()
+
+    daily_summaries.sort(key=lambda item: (item["report_day"], item["folder_id"]))
+    progress_rows_by_day: dict[date, list[dict[str, Any]]] = defaultdict(list)
+    column_labels_by_day: dict[date, list[str]] = defaultdict(list)
+    cycles_by_day: dict[date, list[dict[str, Any]]] = defaultdict(list)
+    for summary in daily_summaries:
+        progress_rows_by_day[summary["report_day"]].extend(summary["progress_rows"])
+        column_label = str(summary.get("column_label") or "").strip()
+        if column_label:
+            column_labels_by_day[summary["report_day"]].append(column_label)
+        day_cycles = summary.get("cycles")
+        if isinstance(day_cycles, dict):
+            cycles_by_day[summary["report_day"]].append(day_cycles)
+
+    ordered_days = sorted(progress_rows_by_day.keys())
+    column_labels: list[str] = []
+    label_seen: dict[str, int] = {}
+    for day in ordered_days:
+        day_labels = column_labels_by_day.get(day, [])
+        if day_labels:
+            base_label = Counter(day_labels).most_common(1)[0][0]
+        else:
+            base_label = f"nightly-dev-{day.strftime('%Y.%m.%d')}"
+        count = label_seen.get(base_label, 0) + 1
+        label_seen[base_label] = count
+        column_labels.append(base_label if count == 1 else f"{base_label}_{count}")
+
+    column_status_counts: dict[str, dict[str, int]] = {}
+    cycle_keys_by_label: dict[str, list[dict[str, str]]] = {}
+    defect_keys_seen: set[str] = set()
+    defect_keys_ordered: list[str] = []
+    for day_date, day_label in zip(ordered_days, column_labels):
+        merged_counts: dict[str, int] = defaultdict(int)
+        seen_cycle_keys: set[str] = set()
+        cycle_objs: list[dict[str, str]] = []
+        for cycles_dict in cycles_by_day.get(day_date, []):
+            day_counts = _daily_aggregate_case_status_counts(cycles_dict)
+            for status_key, value in day_counts.items():
+                merged_counts[status_key] += int(value)
+            for defect_key in _extract_defect_keys_from_cycles(cycles_dict):
+                if defect_key in defect_keys_seen:
+                    continue
+                defect_keys_seen.add(defect_key)
+                defect_keys_ordered.append(defect_key)
+            for entry in _extract_cycle_key_objects(cycles_dict):
+                cid = str(entry.get("id") or "").strip()
+                if not cid or cid in seen_cycle_keys:
+                    continue
+                seen_cycle_keys.add(cid)
+                cycle_objs.append(entry)
+        column_status_counts[day_label] = dict(merged_counts)
+        cycle_keys_by_label[day_label] = cycle_objs
+
+    defect_analytics = _compute_weekly_defect_analytics(
+        cycles_by_day, ordered_days, column_labels
+    )
+
+    day_maps: dict[date, dict[str, dict[str, Any]]] = {}
+    joined_passed_by_label: dict[str, dict[str, int]] = {}
+    joined_totals_by_label: dict[str, dict[str, int]] = {}
+    joined_all_not_executed_by_label: dict[str, dict[str, bool]] = {}
+    joined_all_blocked_by_label: dict[str, dict[str, bool]] = {}
+    for day_date, day_label in zip(ordered_days, column_labels):
+        day_map = _weekly_aggregate_progress_map(progress_rows_by_day[day_date])
+        day_maps[day_date] = day_map
+        joined_passed_by_label[day_label] = {
+            cycle_label: int(day_payload["passed_cases"])
+            for cycle_label, day_payload in day_map.items()
+        }
+        joined_totals_by_label[day_label] = {
+            cycle_label: int(day_payload["total_cases"])
+            for cycle_label, day_payload in day_map.items()
+        }
+        joined_all_not_executed_by_label[day_label] = {
+            cycle_label: bool(day_payload.get("all_not_executed", False))
+            for cycle_label, day_payload in day_map.items()
+        }
+        joined_all_blocked_by_label[day_label] = {
+            cycle_label: bool(day_payload.get("all_blocked", False))
+            for cycle_label, day_payload in day_map.items()
+        }
+
+    all_cycle_labels: set[str] = set()
+    for day_map in day_maps.values():
+        all_cycle_labels.update(day_map.keys())
+    rolling_week_start = _release_week_start(daily_summaries[-1]["test_day"])
+    if not all_cycle_labels:
+        return (
+            rolling_week_start,
+            column_labels,
+            [],
+            [],
+            [],
+            column_status_counts,
+            defect_keys_ordered,
+            cycle_keys_by_label,
+            defect_analytics,
+        )
+
+    sort_key_by_cycle: dict[str, tuple[Any, ...]] = {}
+    for cycle_label in all_cycle_labels:
+        sort_candidates: list[tuple[Any, ...]] = []
+        for day_map in day_maps.values():
+            payload = day_map.get(cycle_label)
+            if payload is None:
+                continue
+            sort_candidates.append(payload["sort_key"])
+        if sort_candidates:
+            sort_key_by_cycle[cycle_label] = min(sort_candidates)
+
+    rows: list[list[str]] = []
+    cell_all_not_executed: list[list[bool]] = []
+    cell_all_blocked: list[list[bool]] = []
+    for cycle_label in sorted(
+        all_cycle_labels,
+        key=lambda label: (sort_key_by_cycle.get(label, (9_999_999, label, "", "", "")), label.lower()),
+    ):
+        total_cases = 0
+        for totals_map in joined_totals_by_label.values():
+            total_cases = max(total_cases, int(totals_map.get(cycle_label, 0)))
+        row = [cycle_label, str(total_cases)]
+        ne_flags: list[bool] = []
+        blocked_flags: list[bool] = []
+        for day_label in column_labels:
+            row.append(str(joined_passed_by_label.get(day_label, {}).get(cycle_label, 0)))
+            ne_flags.append(
+                bool(joined_all_not_executed_by_label.get(day_label, {}).get(cycle_label, False))
+            )
+            blocked_flags.append(
+                bool(joined_all_blocked_by_label.get(day_label, {}).get(cycle_label, False))
+            )
+        rows.append(row)
+        cell_all_not_executed.append(ne_flags)
+        cell_all_blocked.append(blocked_flags)
+
+    grouped_rows: list[list[str]] = []
+    grouped_ne_flags: list[list[bool]] = []
+    grouped_blocked_flags: list[list[bool]] = []
+    index = 0
+    while index < len(rows):
+        group_start = index
+        row = rows[index]
+        group_id = _summary_scenario_group(
+            {"cycle_index": _extract_cycle_index({"cycle_name": row[0]}), "cycle_title": row[0], "cycle_key": ""}
+        ) or "Прочее"
+        group_labels: list[str] = []
+        group_total_cases = 0
+        group_day_sums = [0] * len(column_labels)
+        while index < len(rows):
+            current = rows[index]
+            current_group_id = _summary_scenario_group(
+                {
+                    "cycle_index": _extract_cycle_index({"cycle_name": current[0]}),
+                    "cycle_title": current[0],
+                    "cycle_key": "",
+                }
+            ) or "Прочее"
+            if current_group_id != group_id:
+                break
+            group_labels.append(str(current[0]))
+            group_total_cases += int(current[1]) if len(current) > 1 else 0
+            for day_idx in range(len(column_labels)):
+                group_day_sums[day_idx] += int(current[2 + day_idx]) if 2 + day_idx < len(current) else 0
+            index += 1
+        for copy_idx in range(group_start, index):
+            grouped_rows.append(rows[copy_idx])
+            grouped_ne_flags.append(cell_all_not_executed[copy_idx])
+            grouped_blocked_flags.append(cell_all_blocked[copy_idx])
+        group_title = _summary_group_title_from_labels(group_labels, fallback_group=group_id)
+        subtotal_row = [f"Итого: {group_title}", str(group_total_cases)]
+        subtotal_row.extend(str(value) for value in group_day_sums)
+        grouped_rows.append(subtotal_row)
+        grouped_ne_flags.append([False] * len(column_labels))
+        grouped_blocked_flags.append([False] * len(column_labels))
+
+    return (
+        rolling_week_start,
+        column_labels,
+        grouped_rows,
+        grouped_ne_flags,
+        grouped_blocked_flags,
+        column_status_counts,
+        defect_keys_ordered,
+        cycle_keys_by_label,
+        defect_analytics,
+    )
+
+
+def _week_short_label(week_start: date | None) -> str:
+    if isinstance(week_start, date):
+        return f"W{int(week_start.isocalendar()[1]):02d}"
+    return "?"
+
+
+def _analytics_trend_metric() -> str:
+    raw = (os.getenv("ZEPHYR_ANALYTICS_TREND_METRIC") or "passed").strip().lower()
+    return "rate" if raw == "rate" else "passed"
+
+
+def _merge_unique_zephyr_cycle_objects_from_label_map(
+    cycle_keys_by_label: dict[str, Any] | None,
+) -> list[dict[str, str]]:
+    """Union Zephyr test-run objects across all folder columns (dedupe by cycle id)."""
+    if not cycle_keys_by_label or not isinstance(cycle_keys_by_label, dict):
+        return []
+    seen: set[str] = set()
+    merged: list[dict[str, str]] = []
+    for objs in cycle_keys_by_label.values():
+        if not isinstance(objs, list):
+            continue
+        for raw in objs:
+            if not isinstance(raw, dict):
+                continue
+            cid = str(raw.get("id") or "").strip()
+            if not cid or cid in seen:
+                continue
+            seen.add(cid)
+            name = str(raw.get("name") or "").strip()
+            if name:
+                merged.append({"id": cid, "name": name})
+            else:
+                merged.append({"id": cid})
+    return merged
+
+
+def _weekly_analytics_trend_data(
+    matrices: list[
+        tuple[
+            date | None,
+            list[str],
+            list[list[str]],
+            list[list[bool]],
+            list[list[bool]],
+            dict[str, dict[str, int]],
+            list[str],
+            dict[str, list[dict[str, str]]],
+            dict[str, Any],
+        ]
+    ],
+) -> dict[str, Any]:
+    week_columns: list[str] = []
+    for matrix in matrices:
+        week_start = matrix[0]
+        week_columns.append(_week_short_label(week_start))
+
+    overall_by_week: dict[str, dict[str, int]] = {}
+    for col, matrix in zip(week_columns, matrices):
+        merged: dict[str, int] = defaultdict(int)
+        for build_counts in (matrix[5] or {}).values():
+            for status_key, value in build_counts.items():
+                merged[str(status_key)] += int(value)
+        overall_by_week[col] = dict(merged)
+
+    cycle_keys_by_week: dict[str, list[dict[str, str]]] = {}
+    for col, matrix in zip(week_columns, matrices):
+        ckb = matrix[7] if len(matrix) > 7 else None
+        cycle_keys_by_week[col] = _merge_unique_zephyr_cycle_objects_from_label_map(
+            ckb if isinstance(ckb, dict) else None
+        )
+
+    scenario_by_week: dict[str, dict[str, Any]] = {}
+    metric = _analytics_trend_metric()
+    for col, matrix in zip(week_columns, matrices):
+        rows = matrix[2]
+        labels = matrix[1]
+        detail_rows = [r for r in rows if not str(r[0]).startswith("Итого:")]
+        for row in detail_rows:
+            cycle = str(row[0])
+            passed_sum = sum(
+                int(row[2 + idx]) if 2 + idx < len(row) else 0 for idx in range(len(labels))
+            )
+            if metric == "rate":
+                total = int(row[1]) if len(row) > 1 else 0
+                value: Any = round(100.0 * passed_sum / total, 1) if total else 0
+            else:
+                value = passed_sum
+            scenario_by_week.setdefault(cycle, {})[col] = value
+
+    defect_matrix: dict[str, dict[str, int]] = {}
+    bug_totals: dict[str, int] = {}
+    for col, matrix in zip(week_columns, matrices):
+        analytics = matrix[8] or {}
+        bug_cases = analytics.get("bug_total_cases") or {}
+        for key in analytics.get("keys_ordered") or []:
+            defect_matrix.setdefault(str(key), {})[col] = int(bug_cases.get(key, 0))
+            bug_totals[str(key)] = bug_totals.get(str(key), 0) + int(bug_cases.get(key, 0))
+
+    keys_ordered = sorted(
+        bug_totals.keys(),
+        key=lambda k: (-bug_totals.get(k, 0), k),
+    )
+    return {
+        "week_columns": week_columns,
+        "overall_by_week": overall_by_week,
+        "cycle_keys_by_week": cycle_keys_by_week,
+        "scenario_by_week": scenario_by_week,
+        "defect_matrix": defect_matrix,
+        "keys_ordered": keys_ordered,
+        "metric": metric,
+    }
+
+
+def _weekly_report_include_analytics_enabled() -> bool:
+    name = "ZEPHYR_WEEKLY_REPORT_INCLUDE_ANALYTICS"
+    parsed = _get_repo_dotenv_parsed()
+    if name in parsed:
+        return _parse_bool_env(parsed[name])
+    return _parse_bool_env(os.getenv(name, "true"))
+
+
+def _export_weekly_analytics_enabled(args: argparse.Namespace) -> bool:
+    if getattr(args, "export_weekly_analytics", False):
+        return True
+    if getattr(args, "export_weekly_readable", False):
+        return True
+    parsed = _get_repo_dotenv_parsed()
+    name = "ZEPHYR_EXPORT_WEEKLY_ANALYTICS"
+    if name in parsed:
+        return _parse_bool_env(parsed[name])
+    return _parse_bool_env(os.getenv(name, "true"))
+
 
 
 def _weekly_output_path_for_week(base_path: str, week_start: date | None) -> str:
@@ -7507,6 +7960,7 @@ def _weekly_defect_analytics_html(
     if extended:
         # 1. Сводка
         parts.append("<h4>Сводка</h4>")
+        parts.append("<div class='table-scroll-wrap'>")
         parts.append("<table class='weekly-defects-table weekly-defects-summary'>")
         header_cells = ["<th>Метрика</th>"] + [
             f"<th>{html.escape(label)}</th>" for label in column_labels
@@ -7525,11 +7979,12 @@ def _weekly_defect_analytics_html(
         parts.append(_row("Кейсов без бага", lambda c: cases_without.get(c, 0)))
         parts.append(_row("Fail-кейсов с багом", lambda c: failed_with.get(c, 0)))
         parts.append(_row("Fail-кейсов без бага", lambda c: failed_without.get(c, 0)))
-        parts.append("</tbody></table>")
+        parts.append("</tbody></table></div>")
 
         # 2. Топ-N
         parts.append(f"<h4>Топ багов (до {_DEFECT_TOP_LIMIT})</h4>")
         top_keys = keys_ordered[:_DEFECT_TOP_LIMIT]
+        parts.append("<div class='table-scroll-wrap'>")
         parts.append("<table class='weekly-defects-table weekly-defects-top'>")
         parts.append(
             "<thead><tr>"
@@ -7551,10 +8006,11 @@ def _weekly_defect_analytics_html(
                 f"{_duplicate_candidate_cell_html(key, duplicate_candidates)}"
                 "</tr>"
             )
-        parts.append("</tbody></table>")
+        parts.append("</tbody></table></div>")
 
         # 3. Матрица «баг x билд»
         parts.append("<h4>Матрица «баг × билд»</h4>")
+        parts.append("<div class='table-scroll-wrap'>")
         parts.append("<table class='weekly-defects-table weekly-defects-matrix'>")
         # <colgroup>: «Ключ» ~12%, «Priority» ~12%, build-колонки делят остаток поровну.
         n_builds_matrix = len(column_labels)
@@ -7593,7 +8049,7 @@ def _weekly_defect_analytics_html(
                     f"<td class='matrix-num'>{value if value > 0 else '—'}</td>"
                 )
             parts.append("<tr>" + "".join(cells) + "</tr>")
-        parts.append("</tbody></table>")
+        parts.append("</tbody></table></div>")
 
         # 4. Hot bugs
         if hot_bugs:
@@ -7607,6 +8063,7 @@ def _weekly_defect_analytics_html(
 
     # Full list (always when keys non-empty)
     parts.append("<h4>Все баги</h4>")
+    parts.append("<div class='table-scroll-wrap'>")
     parts.append("<table class='weekly-defects-table weekly-defects-all'>")
     parts.append(
         "<thead><tr>"
@@ -7628,7 +8085,7 @@ def _weekly_defect_analytics_html(
             f"{_duplicate_candidate_cell_html(key, duplicate_candidates)}"
             "</tr>"
         )
-    parts.append("</tbody></table>")
+    parts.append("</tbody></table></div>")
 
     parts.append("</div>")
     return "\n".join(parts)
@@ -8169,26 +8626,7 @@ def render_weekly_html_report(
     best_branch_column: dict[str, Any] | None = None,
 ) -> str:
     labels = list(weekday_labels)
-    best_column = best_branch_column or {}
-    best_title = str(best_column.get("title") or "").strip()
-    has_best_column = bool(best_title)
-    data_labels = ([best_title] if has_best_column else []) + labels
-    best_scenario_map = (
-        best_column.get("scenario_passed_by_row")
-        if isinstance(best_column.get("scenario_passed_by_row"), dict)
-        else {}
-    )
-    best_overall_counts = (
-        best_column.get("overall_counts")
-        if isinstance(best_column.get("overall_counts"), dict)
-        else {}
-    )
-    best_cycle_keys = best_column.get("cycle_keys")
-    if not isinstance(best_cycle_keys, list):
-        best_cycle_keys = []
     title_text = _weekly_matrix_title_text(week_start, weekday_labels)
-    header_cells = ["<th>Тестовый цикл</th>", "<th>Всего кейсов</th>"]
-    header_cells.extend(f"<th>{html.escape(label)}</th>" for label in data_labels)
     builds_html = _weekly_builds_html_list(labels)
     builds_wiki = _weekly_builds_wiki_list(labels)
     preamble = _format_readable_html_preamble(
@@ -8241,7 +8679,8 @@ def render_weekly_html_report(
             ".weekly-jira-key-link:hover{text-decoration:underline;}"
             ".weekly-defects-hot .weekly-jira-key-link{margin-right:4px;}"
             ".jira-lozenge{vertical-align:middle;}"
-            "</style>"
+            + _ANALYTICS_WIDE_TABLE_CSS
+            + "</style>"
         ),
         "</head><body>",
         f"<h1>{html.escape(title_text)}</h1>",
@@ -8250,190 +8689,26 @@ def render_weekly_html_report(
         sections.append(preamble)
     sections.append("<h2 id='scenarios'><strong>3. Результаты тестирования</strong></h2>")
 
-    sections.append("<h3 id='overall-score'><strong>Общий score</strong></h3>")
-    counts_by_label = column_status_counts or {}
-    cycle_keys_map = cycle_keys_by_label or {}
-    if data_labels:
-        sections.append("<div class='weekly-overall-grid'>")
-        if has_best_column:
-            cycle_keys_attr = ""
-            if best_cycle_keys:
-                cycle_keys_attr = (
-                    " data-zephyr-cycle-keys=\""
-                    + html.escape(
-                        json.dumps(best_cycle_keys, ensure_ascii=True),
-                        quote=True,
-                    )
-                    + "\""
-                )
-            sections.append(
-                f"<div class='weekly-overall-cell'{cycle_keys_attr}>"
-                f"<h4>{html.escape(best_title)}</h4>"
-                f"{_daily_status_pie_svg(best_overall_counts)}"
-                "</div>"
-            )
-        for label in labels:
-            counts = counts_by_label.get(label, {}) or {}
-            cycle_keys = cycle_keys_map.get(label) or []
-            cycle_keys_attr = ""
-            if cycle_keys:
-                cycle_keys_attr = (
-                    " data-zephyr-cycle-keys=\""
-                    + html.escape(
-                        json.dumps(cycle_keys, ensure_ascii=True),
-                        quote=True,
-                    )
-                    + "\""
-                )
-            sections.append(
-                f"<div class='weekly-overall-cell'{cycle_keys_attr}>"
-                f"<h4>{html.escape(str(label))}</h4>"
-                f"{_daily_status_pie_svg(counts)}"
-                "</div>"
-            )
-        sections.append("</div>")
-    else:
-        sections.append("<p class='pie-empty'>Нет данных по статусам</p>")
-
-    sections.append("<h3 id='scenario-score'><strong>Score по сценариям</strong></h3>")
-    # Compact build columns by ~30%: redistribute the saved width to
-    # "Тестовый цикл" (long titles) and "Всего кейсов".
-    n_builds = len(data_labels)
-    if n_builds > 0:
-        equal_pct = 100.0 / (n_builds + 2)
-        build_pct = equal_pct * 0.7
-        remain_pct = 100.0 - build_pct * n_builds
-        cycle_pct = remain_pct * 0.78
-        total_pct = remain_pct - cycle_pct
-        col_tags = [
-            f"<col style='width:{cycle_pct:.2f}%'>",
-            f"<col style='width:{total_pct:.2f}%'>",
-        ]
-        col_tags.extend(
-            f"<col style='width:{build_pct:.2f}%'>" for _ in range(n_builds)
-        )
-        colgroup_html = "<colgroup>" + "".join(col_tags) + "</colgroup>"
-    else:
-        colgroup_html = ""
-    sections.extend(
-        [
-            "<table>",
-            colgroup_html,
-            "<thead><tr>" + "".join(header_cells) + "</tr></thead><tbody>",
-        ]
-    )
-    for row_idx, row in enumerate(rows):
-        if str(row[0]).startswith("Итого:"):
-            total_cells = [
-                f"<td style='font-weight:700;background:#ffffff;color:#1f2328;'>{html.escape(row[0])}</td>",
-                (
-                    "<td class='total-cases-cell' "
-                    "style='font-weight:700;background:#ffffff;color:#1f2328;text-align:center;'>"
-                    f"{html.escape(row[1])}</td>"
-                ),
-            ]
-            data_values: list[str] = []
-            if has_best_column:
-                data_values.append(str(best_scenario_map.get(str(row[0] or "").strip(), 0)))
-            data_values.extend(
-                str(row[2 + idx] if 2 + idx < len(row) else "0") for idx in range(len(labels))
-            )
-            total_cells.extend(
-                (
-                    "<td style='font-weight:700;background:#ffffff;color:#1f2328;text-align:center;'>"
-                    f"{html.escape(value)}</td>"
-                )
-                for value in data_values
-            )
-            sections.append(
-                (
-                    "<tr class='group-total-row'>"
-                    + "".join(total_cells)
-                    + "</tr>"
-                )
-            )
-            continue
-        passed_cells: list[str] = []
-        ne_row = (
-            cell_all_not_executed[row_idx]
-            if cell_all_not_executed and row_idx < len(cell_all_not_executed)
-            else []
-        )
-        blocked_row = (
-            cell_all_blocked[row_idx]
-            if cell_all_blocked and row_idx < len(cell_all_blocked)
-            else []
-        )
-        for idx in range(len(data_labels)):
-            if has_best_column and idx == 0:
-                passed_value = int(best_scenario_map.get(str(row[0] or "").strip(), 0))
-                all_ne = False
-                all_blocked = False
-            else:
-                regular_idx = idx - (1 if has_best_column else 0)
-                passed_value = int(row[2 + regular_idx]) if 2 + regular_idx < len(row) else 0
-                all_ne = bool(ne_row[regular_idx]) if regular_idx < len(ne_row) else False
-                all_blocked = (
-                    bool(blocked_row[regular_idx]) if regular_idx < len(blocked_row) else False
-                )
-            passed_cells.append(
-                "<td class='passed-count-cell' "
-                f"style='background:{_passed_count_color(passed_value, all_not_executed=all_ne, all_blocked=all_blocked)};"
-                f"color:{_passed_count_text_color(passed_value, all_not_executed=all_ne, all_blocked=all_blocked)};"
-                "text-align:center;'>"
-                f"{passed_value}</td>"
-            )
+    if _weekly_report_include_analytics_enabled():
         sections.append(
-            (
-                "<tr>"
-                f"<td>{html.escape(row[0])}</td>"
-                f"<td class='total-cases-cell' style='text-align:center;'>{html.escape(row[1])}</td>"
-                + "".join(passed_cells)
-                + "</tr>"
+            _render_analytics_sections_html(
+                labels,
+                rows,
+                cell_all_not_executed,
+                cell_all_blocked,
+                column_status_counts=column_status_counts,
+                defect_keys=defect_keys,
+                cycle_keys_by_label=cycle_keys_by_label,
+                defect_analytics=defect_analytics,
+                defect_meta=defect_meta,
+                best_branch_column=best_branch_column,
             )
-        )
-    # Grand total across detail rows (skip "Итого: <group>" subtotals to
-    # avoid double-counting).
-    if rows:
-        detail_rows = [r for r in rows if not str(r[0]).startswith("Итого:")]
-        total_cases_grand = sum(int(r[1]) for r in detail_rows if len(r) > 1)
-        passed_grand: list[int] = []
-        if has_best_column:
-            passed_grand.append(
-                sum(int(best_scenario_map.get(str(r[0] or "").strip(), 0)) for r in detail_rows)
-            )
-        passed_grand.extend(
-            sum(int(r[2 + idx]) for r in detail_rows if 2 + idx < len(r))
-            for idx in range(len(labels))
-        )
-        grand_cells = [
-            "<td style='font-weight:700;background:#eef1f5;color:#1f2328;'>Итого</td>",
-            (
-                "<td class='total-cases-cell' "
-                "style='font-weight:700;background:#eef1f5;color:#1f2328;text-align:center;'>"
-                f"{total_cases_grand}</td>"
-            ),
-        ]
-        grand_cells.extend(
-            (
-                "<td style='font-weight:700;background:#eef1f5;color:#1f2328;text-align:center;'>"
-                f"{value}</td>"
-            )
-            for value in passed_grand
-        )
-        sections.append(
-            "<tr class='grand-total-row'>" + "".join(grand_cells) + "</tr>"
-        )
-    sections.append("</tbody></table>")
-
-    sections.append("<h3 id='defects'><strong>Заведённые дефекты</strong></h3>")
-    merged_analytics = _coalesce_weekly_defect_analytics(defect_analytics, defect_keys)
-    if merged_analytics and (merged_analytics.get("keys_ordered") or []):
-        sections.append(
-            _weekly_defect_analytics_html(merged_analytics, defect_meta, labels)
         )
     else:
-        sections.append(_weekly_defects_html_block(defect_keys or []))
+        sections.append(
+            "<p><em>Подробная аналитика (общий score, сценарии, дефекты) — "
+            '<a href="weekly_analytics.html#analytics_trend">weekly analytics</a>.</em></p>'
+        )
 
     sections.append("</body></html>")
     return "\n".join(sections)
@@ -8445,6 +8720,7 @@ def render_weekly_wiki_report(
     rows: list[list[str]],
     *,
     column_status_counts: dict[str, dict[str, int]] | None = None,
+    cycle_keys_by_label: dict[str, list[dict[str, Any]]] | None = None,
     defect_keys: list[str] | None = None,
     defect_analytics: dict[str, Any] | None = None,
     defect_meta: dict[str, dict[str, str]] | None = None,
@@ -8491,93 +8767,25 @@ def render_weekly_wiki_report(
     lines.append("h2. *3. Результаты тестирования*")
     lines.append("")
 
-    lines.append("{anchor:overall_score}")
-    lines.append("h3. *Общий score*")
-    lines.append("")
-    counts_by_label = column_status_counts or {}
-    if data_labels:
-        # One {chart} macro per build, stacked vertically — same approach as
-        # the daily wiki report. Side-by-side layout requires PNG attachments
-        # and is handled by the Confluence publisher (HTML -> storage).
-        if has_best_column:
-            lines.append(f"h4. {_wiki_escape(best_title)}")
-            best_chart = _daily_status_chart_wiki_block(best_overall_counts)
-            if best_chart:
-                lines.extend(best_chart.splitlines())
-            else:
-                lines.append("_Нет данных по статусам_")
-            lines.append("")
-        for label in labels:
-            counts = counts_by_label.get(label, {}) or {}
-            lines.append(f"h4. {_wiki_escape(str(label))}")
-            chart_block = _daily_status_chart_wiki_block(counts)
-            if chart_block:
-                lines.extend(chart_block.splitlines())
-            else:
-                lines.append("_Нет данных по статусам_")
-            lines.append("")
+    if _weekly_report_include_analytics_enabled():
+        lines.append(
+            _render_analytics_sections_wiki(
+                labels,
+                rows,
+                column_status_counts=column_status_counts,
+                cycle_keys_by_label=cycle_keys_by_label,
+                defect_keys=defect_keys,
+                defect_analytics=defect_analytics,
+                defect_meta=defect_meta,
+                best_branch_column=best_branch_column,
+            )
+        )
     else:
-        lines.append("_Нет данных по статусам_")
+        lines.append(
+            "_Подробная аналитика — см. [weekly analytics|weekly_analytics.confluence.txt#analytics_trend]._"
+        )
         lines.append("")
 
-    lines.append("{anchor:scenario_score}")
-    lines.append("h3. *Score по сценариям*")
-    lines.append("")
-    header_cells = ["Тестовый цикл", "Всего кейсов"]
-    header_cells.extend(f"{_wiki_escape(label)}" for label in data_labels)
-    lines.append("|| " + " || ".join(header_cells) + " ||")
-    for row in rows:
-        if str(row[0]).startswith("Итого:"):
-            row_values = [f"*{row[0]}*", f"*{row[1]}*"]
-            if has_best_column:
-                row_values.append(f"*{best_scenario_map.get(str(row[0] or '').strip(), 0)}*")
-            for idx in range(len(labels)):
-                row_values.append(f"*{row[2 + idx] if 2 + idx < len(row) else '0'}*")
-            lines.append("| " + " | ".join(_wiki_escape(str(value)) for value in row_values) + " |")
-            continue
-        row_values = [row[0], row[1]]
-        if has_best_column:
-            row_values.append(str(best_scenario_map.get(str(row[0] or "").strip(), 0)))
-        for idx in range(len(labels)):
-            row_values.append(row[2 + idx] if 2 + idx < len(row) else "0")
-        lines.append(
-            "| "
-            + " | ".join(_wiki_escape(str(value)) for value in row_values)
-            + " |"
-        )
-    if rows:
-        detail_rows = [r for r in rows if not str(r[0]).startswith("Итого:")]
-        total_cases_grand = sum(int(r[1]) for r in detail_rows if len(r) > 1)
-        passed_grand: list[int] = []
-        if has_best_column:
-            passed_grand.append(
-                sum(int(best_scenario_map.get(str(r[0] or "").strip(), 0)) for r in detail_rows)
-            )
-        passed_grand.extend(
-            sum(int(r[2 + idx]) for r in detail_rows if 2 + idx < len(r))
-            for idx in range(len(labels))
-        )
-        grand_values = [f"*Итого*", f"*{total_cases_grand}*"]
-        for value in passed_grand:
-            grand_values.append(f"*{value}*")
-        lines.append(
-            "| " + " | ".join(_wiki_escape(str(v)) for v in grand_values) + " |"
-        )
-    lines.append("")
-
-    lines.append("{anchor:defects}")
-    lines.append("h3. *Заведённые дефекты*")
-    lines.append("")
-    merged_analytics = _coalesce_weekly_defect_analytics(defect_analytics, defect_keys)
-    if merged_analytics and (merged_analytics.get("keys_ordered") or []):
-        defects_block = _weekly_defect_analytics_wiki(
-            merged_analytics, defect_meta, labels
-        )
-    else:
-        defects_block = _weekly_defects_wiki_block(defect_keys or [])
-    if defects_block:
-        lines.extend(defects_block.splitlines())
-    lines.append("")
     return "\n".join(lines)
 
 
@@ -8634,6 +8842,7 @@ def write_weekly_readable_reports(
             weekday_labels,
             rows,
             column_status_counts=column_status_counts,
+            cycle_keys_by_label=cycle_keys_by_label,
             defect_keys=defect_keys,
             defect_analytics=defect_analytics,
             defect_meta=defect_meta,
@@ -8646,6 +8855,1826 @@ def write_weekly_readable_reports(
         if _write_text_if_changed(wiki_path, wiki_body):
             updated_paths.append(wiki_path)
     return updated_paths
+
+
+def _analytics_env_int(name: str, default: int) -> int:
+    raw = (os.getenv(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+def _status_counts_metrics(counts: dict[str, int] | None) -> dict[str, Any]:
+    data = counts or {}
+    passed = int(data.get("passed", 0))
+    failed = int(data.get("failed", 0))
+    blocked = int(data.get("blocked", 0))
+    not_executed = int(data.get("not_executed", 0))
+    total = passed + failed + blocked + not_executed
+    executed = total - not_executed
+    pass_rate = (100.0 * passed / total) if total else 0.0
+    coverage = (100.0 * executed / total) if total else 0.0
+    return {
+        "passed": passed,
+        "failed": failed,
+        "blocked": blocked,
+        "not_executed": not_executed,
+        "total": total,
+        "executed": executed,
+        "pass_rate": round(pass_rate, 1),
+        "coverage": round(coverage, 1),
+    }
+
+
+def _matrix_detail_rows(rows: list[list[str]]) -> list[list[str]]:
+    return [r for r in rows if r and not str(r[0]).startswith("Итого:")]
+
+
+def _matrix_group_rows(rows: list[list[str]]) -> list[list[str]]:
+    return [r for r in rows if r and str(r[0]).startswith("Итого:")]
+
+
+def _matrix_scenario_snapshot(
+    rows: list[list[str]],
+    labels: list[str],
+    cell_all_not_executed: list[list[bool]] | None,
+    cell_all_blocked: list[list[bool]] | None,
+) -> dict[str, Any]:
+    detail = _matrix_detail_rows(rows)
+    green_by_label: dict[str, int] = {label: 0 for label in labels}
+    gray_by_label: dict[str, int] = {label: 0 for label in labels}
+    for row_idx, row in enumerate(detail):
+        total_cases = int(row[1]) if len(row) > 1 else 0
+        ne_row = (
+            cell_all_not_executed[row_idx]
+            if cell_all_not_executed and row_idx < len(cell_all_not_executed)
+            else []
+        )
+        for col_idx, label in enumerate(labels):
+            passed = int(row[2 + col_idx]) if 2 + col_idx < len(row) else 0
+            all_ne = bool(ne_row[col_idx]) if col_idx < len(ne_row) else False
+            if total_cases > 0 and passed >= total_cases and not all_ne:
+                green_by_label[label] = green_by_label.get(label, 0) + 1
+            if all_ne:
+                gray_by_label[label] = gray_by_label.get(label, 0) + 1
+    return {
+        "scenario_count": len(detail),
+        "green_by_label": green_by_label,
+        "gray_by_label": gray_by_label,
+    }
+
+
+def _compute_fail_without_jira_by_build(
+    report_data: dict[tuple[str, str], dict[str, Any]],
+) -> dict[str, list[str]]:
+    by_build: dict[str, set[str]] = defaultdict(set)
+    for (_folder_id, folder_name), payload in report_data.items():
+        cycles = payload.get("cycles") or {}
+        if not isinstance(cycles, dict):
+            continue
+        build_label = _parse_weekly_column_label_from_folder_name(folder_name)
+        if not build_label:
+            build_display, _sort_d = _build_log_folder_nightly_display_and_date(
+                folder_name, cycles
+            )
+            build_label = build_display or str(folder_name)
+        for cycle in cycles.values():
+            if not isinstance(cycle, dict):
+                continue
+            scenario = str(cycle.get("cycle_name") or cycle.get("name") or "").strip()
+            if not scenario:
+                continue
+            has_fail_no_bug = False
+            for case in cycle.get("cases", {}).values():
+                if not isinstance(case, dict):
+                    continue
+                if not _is_failed_execution_status(
+                    case.get("result", case.get("test_case_status", ""))
+                ):
+                    continue
+                tasks_raw = str(case.get("tasks") or "")
+                if tasks_raw and _DEFECT_KEY_PATTERN.search(tasks_raw):
+                    continue
+                has_fail_no_bug = True
+                break
+            if has_fail_no_bug:
+                by_build[build_label].add(scenario)
+    return {label: sorted(names) for label, names in by_build.items()}
+
+
+def _aggregate_top_failure_comments(
+    case_steps_rows: list[list[str]] | None,
+    *,
+    top_n: int = 10,
+) -> list[dict[str, Any]]:
+    if not case_steps_rows:
+        return []
+    # folder_id, folder_name, cycle_id, cycle_key, cycle_name, ...
+    # step_comment index 13, step_status_name 15, cycle_name 4
+    buckets: dict[str, dict[str, Any]] = {}
+    for row in case_steps_rows:
+        if len(row) < 16:
+            continue
+        status_name = str(row[15] or "").strip().lower()
+        if status_name not in _FAILED_STATUS_TOKENS:
+            continue
+        comment = re.sub(r"\s+", " ", str(row[13] or "").strip())
+        if not comment:
+            comment = "(без комментария)"
+        if len(comment) > 160:
+            comment = comment[:157] + "..."
+        cycle_name = str(row[4] or "").strip()
+        entry = buckets.setdefault(comment, {"count": 0, "scenarios": set()})
+        entry["count"] += 1
+        if cycle_name:
+            entry["scenarios"].add(cycle_name)
+    ranked = sorted(buckets.items(), key=lambda item: (-item[1]["count"], item[0]))
+    out: list[dict[str, Any]] = []
+    for comment, payload in ranked[:top_n]:
+        out.append(
+            {
+                "comment": comment,
+                "count": int(payload["count"]),
+                "scenarios": sorted(payload["scenarios"])[:5],
+            }
+        )
+    return out
+
+
+def _build_log_index_for_analytics(
+    report_data: dict[tuple[str, str], dict[str, Any]],
+    build_log_dir: str,
+) -> list[dict[str, Any]]:
+    pages = _gather_jira_issue_build_log_pages(report_data)
+    if not pages:
+        return []
+    rows: list[dict[str, Any]] = []
+    for issue_key in sorted(pages.keys()):
+        blocks = pages[issue_key]
+        if not blocks:
+            continue
+        safe_name = re.sub(r"[^\w.-]+", "_", issue_key.strip()) or "issue"
+        rel_href = f"../build_log_reports/{safe_name}_build_log.html"
+        abs_path = os.path.join(build_log_dir, f"{safe_name}_build_log.html")
+        if not os.path.isfile(abs_path):
+            rel_href = ""
+        build_label = str(blocks[0][0] or "").strip()
+        rows.append(
+            {
+                "build": build_label,
+                "issue_key": issue_key,
+                "href": rel_href,
+                "url_count": sum(len(urls) for _b, _d, urls in blocks),
+            }
+        )
+    rows.sort(key=lambda item: (str(item.get("build") or ""), item.get("issue_key") or ""))
+    return rows
+
+
+def _build_extended_analytics_bundle(
+    *,
+    rolling_matrix: tuple[Any, ...],
+    trend: dict[str, Any],
+    rolling_best_branch: dict[str, Any] | None,
+    defect_meta: dict[str, dict[str, str]] | None,
+    report_data: dict[tuple[str, str], dict[str, Any]] | None = None,
+    case_steps_rows: list[list[str]] | None = None,
+    build_log_dir: str = "",
+) -> dict[str, Any]:
+    labels = list(rolling_matrix[1] or []) if rolling_matrix else []
+    rows = list(rolling_matrix[2] or []) if rolling_matrix else []
+    ne = rolling_matrix[3] if rolling_matrix else []
+    blocked = rolling_matrix[4] if rolling_matrix else []
+    counts_by_label = dict(rolling_matrix[5] or {}) if rolling_matrix else {}
+    defect_analytics = rolling_matrix[8] if rolling_matrix else {}
+
+    build_metrics = [
+        {"label": label, **_status_counts_metrics(counts_by_label.get(label, {}))}
+        for label in labels
+    ]
+    latest_label = labels[-1] if labels else ""
+
+    meta = defect_meta or {}
+    chronic_threshold = _analytics_env_int("ZEPHYR_ANALYTICS_CHRONIC_BUG_BUILDS", 3)
+    bug_builds_count = (defect_analytics or {}).get("bug_builds_count") or {}
+    keys_ordered = list((defect_analytics or {}).get("keys_ordered") or [])
+    matrix = (defect_analytics or {}).get("matrix") or {}
+    new_bugs: list[str] = []
+    chronic_bugs: list[str] = []
+    blockers: list[str] = []
+    for key in keys_ordered:
+        if int(bug_builds_count.get(key, 0)) >= chronic_threshold:
+            chronic_bugs.append(key)
+        if latest_label:
+            prev_hits = sum(
+                int((matrix.get(key) or {}).get(lbl, 0))
+                for lbl in labels[:-1]
+            )
+            if int((matrix.get(key) or {}).get(latest_label, 0)) > 0 and prev_hits == 0:
+                new_bugs.append(key)
+        priority = str((meta.get(key) or {}).get("priority") or "").lower()
+        status = str((meta.get(key) or {}).get("status") or "").lower()
+        if latest_label and int((matrix.get(key) or {}).get(latest_label, 0)) > 0:
+            if "blocker" in priority or priority in ("critical", "highest"):
+                if status not in ("closed", "done", "resolved", "закрыт", "готово"):
+                    blockers.append(key)
+
+    rolling_week_start = rolling_matrix[0] if rolling_matrix else None
+    delta_rows = _build_matrix_delta_rows(
+        rows, labels, ne, blocked, week_start=rolling_week_start
+    )
+    flaky = _compute_flaky_scenarios(rows, labels, ne)
+    best_cmp = _compute_best_branch_comparison(rows, labels, rolling_best_branch)
+    fail_no_jira = (
+        _compute_fail_without_jira_by_build(report_data) if report_data else {}
+    )
+    top_comments = _aggregate_top_failure_comments(case_steps_rows)
+    build_log_index = (
+        _build_log_index_for_analytics(report_data, build_log_dir)
+        if report_data and build_log_dir
+        else []
+    )
+
+    trend_week_rates: list[dict[str, Any]] = []
+    overall_by_week = trend.get("overall_by_week") or {}
+    for col in trend.get("week_columns") or []:
+        trend_week_rates.append(
+            {
+                "label": col,
+                **_status_counts_metrics(overall_by_week.get(col, {})),
+            }
+        )
+
+    return {
+        "labels": labels,
+        "build_metrics": build_metrics,
+        "latest_label": latest_label,
+        "delta_rows": delta_rows,
+        "flaky": flaky,
+        "best_cmp": best_cmp,
+        "fail_no_jira": fail_no_jira,
+        "new_bugs": new_bugs,
+        "chronic_bugs": chronic_bugs,
+        "blocker_bugs": blockers,
+        "top_comments": top_comments,
+        "build_log_index": build_log_index,
+        "trend_week_rates": trend_week_rates,
+        "group_heatmap": _build_group_heatmap_rows(rows, labels),
+    }
+
+
+def _parse_matrix_column_label_day(label: str) -> date | None:
+    raw = str(label or "").strip()
+    if not raw:
+        return None
+    base = re.sub(r"_\d+$", "", raw)
+    match = re.match(
+        r"^nightly-dev-(\d{4})[._-](\d{2})[._-](\d{2})\b",
+        base,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return None
+    year_s, month_s, day_s = match.groups()
+    try:
+        return date(int(year_s), int(month_s), int(day_s))
+    except ValueError:
+        return None
+
+
+def _matrix_delta_column_indices(
+    labels: list[str],
+    *,
+    week_start: date | None = None,
+) -> tuple[int, int, date | None, str]:
+    """Pick matrix columns for week-scale delta (not the last two builds)."""
+    test_days = [
+        _test_day_from_folder_day(report_day)
+        if (report_day := _parse_matrix_column_label_day(label)) is not None
+        else None
+        for label in labels
+    ]
+    valid_pairs = [(idx, test_day) for idx, test_day in enumerate(test_days) if test_day]
+    if len(valid_pairs) < 2:
+        return -1, -1, week_start, "insufficient"
+
+    effective_week = week_start
+    if effective_week is None:
+        effective_week = _release_week_start(valid_pairs[-1][1])
+
+    week_indices = [
+        idx
+        for idx, test_day in valid_pairs
+        if _release_week_start(test_day) == effective_week
+    ]
+    if len(week_indices) >= 2:
+        return week_indices[0], week_indices[-1], effective_week, "week_intra"
+
+    if len(week_indices) == 1:
+        prev_week = effective_week - timedelta(days=7)
+        prev_week_indices = [
+            idx
+            for idx, test_day in valid_pairs
+            if _release_week_start(test_day) == prev_week
+        ]
+        if prev_week_indices:
+            return (
+                prev_week_indices[-1],
+                week_indices[-1],
+                effective_week,
+                "week_over_week",
+            )
+
+    window_indices = [idx for idx, test_day in valid_pairs if test_day >= effective_week]
+    if len(window_indices) >= 2:
+        return window_indices[0], window_indices[-1], effective_week, "week_window"
+
+    span_days = (valid_pairs[-1][1] - valid_pairs[0][1]).days
+    if span_days >= 6:
+        return valid_pairs[0][0], valid_pairs[-1][0], effective_week, "span_fallback"
+
+    return -1, -1, effective_week, "insufficient"
+
+
+def _build_matrix_delta_rows(
+    rows: list[list[str]],
+    labels: list[str],
+    cell_all_not_executed: list[list[bool]] | None,
+    cell_all_blocked: list[list[bool]] | None,
+    *,
+    week_start: date | None = None,
+    top_n: int = 10,
+) -> dict[str, Any]:
+    empty: dict[str, Any] = {
+        "prev_label": "",
+        "curr_label": "",
+        "improvements": [],
+        "regressions": [],
+        "week_start": week_start,
+        "comparison_mode": "insufficient",
+    }
+    prev_i, curr_i, effective_week, comparison_mode = _matrix_delta_column_indices(
+        labels, week_start=week_start
+    )
+    if prev_i < 0 or curr_i < 0 or prev_i >= len(labels) or curr_i >= len(labels):
+        empty["week_start"] = effective_week
+        empty["comparison_mode"] = comparison_mode
+        return empty
+    if prev_i == curr_i:
+        empty["week_start"] = effective_week
+        empty["comparison_mode"] = comparison_mode
+        return empty
+    prev_label, curr_label = labels[prev_i], labels[curr_i]
+    detail = _matrix_detail_rows(rows)
+    changes: list[dict[str, Any]] = []
+    for row_idx, row in enumerate(detail):
+        name = str(row[0] or "").strip()
+        total = int(row[1]) if len(row) > 1 else 0
+        p_prev = int(row[2 + prev_i]) if 2 + prev_i < len(row) else 0
+        p_curr = int(row[2 + curr_i]) if 2 + curr_i < len(row) else 0
+        ne_row = (
+            cell_all_not_executed[row_idx]
+            if cell_all_not_executed and row_idx < len(cell_all_not_executed)
+            else []
+        )
+        ne_prev = bool(ne_row[prev_i]) if prev_i < len(ne_row) else False
+        ne_curr = bool(ne_row[curr_i]) if curr_i < len(ne_row) else False
+        delta = p_curr - p_prev
+        kind = "same"
+        if ne_prev and not ne_curr and p_curr == 0:
+            kind = "started"
+        elif ne_curr and not ne_prev:
+            kind = "not_run"
+        elif total > 0 and p_prev >= total and p_curr == 0 and not ne_curr:
+            kind = "regress"
+        elif delta > 0:
+            kind = "up"
+        elif delta < 0:
+            kind = "down"
+        changes.append(
+            {
+                "scenario": name,
+                "prev": p_prev,
+                "curr": p_curr,
+                "total": total,
+                "delta": delta,
+                "kind": kind,
+            }
+        )
+    improvements = sorted(
+        [c for c in changes if c["delta"] > 0],
+        key=lambda c: (-c["delta"], c["scenario"].lower()),
+    )[:top_n]
+    regressions = sorted(
+        [c for c in changes if c["delta"] < 0 or c["kind"] == "regress"],
+        key=lambda c: (c["delta"], c["scenario"].lower()),
+    )[:top_n]
+    return {
+        "prev_label": prev_label,
+        "curr_label": curr_label,
+        "improvements": improvements,
+        "regressions": regressions,
+        "all": changes,
+        "week_start": effective_week,
+        "comparison_mode": comparison_mode,
+    }
+
+
+def _format_analytics_delta_comparison_intro(delta: dict[str, Any]) -> str:
+    if not delta.get("prev_label") or not delta.get("curr_label"):
+        return ""
+    week_start = delta.get("week_start")
+    week_tag = (
+        _week_short_label(week_start)
+        if isinstance(week_start, date)
+        else ""
+    )
+    mode = str(delta.get("comparison_mode") or "")
+    if mode == "week_intra":
+        return (
+            f"Период: неделя {week_tag}, с первого билда недели по последний"
+            if week_tag
+            else "Период: с первого билда ISO-недели по последний"
+        )
+    if mode == "week_over_week":
+        return (
+            f"Период: конец предыдущей недели → конец недели {week_tag}"
+            if week_tag
+            else "Период: конец предыдущей недели → конец текущей"
+        )
+    if mode == "week_window":
+        return (
+            f"Период: с начала недели {week_tag} по последний билд"
+            if week_tag
+            else "Период: с начала ISO-недели по последний билд"
+        )
+    if mode == "span_fallback":
+        return "Период: не короче недели (первый и последний билд в rolling-данных)"
+    return ""
+
+
+def _build_group_heatmap_rows(
+    rows: list[list[str]],
+    labels: list[str],
+) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for row in _matrix_group_rows(rows):
+        title = str(row[0] or "").replace("Итого:", "", 1).strip()
+        total_cases = int(row[1]) if len(row) > 1 else 0
+        rates: dict[str, float] = {}
+        for idx, label in enumerate(labels):
+            passed = int(row[2 + idx]) if 2 + idx < len(row) else 0
+            if total_cases > 0:
+                rates[label] = round(100.0 * passed / total_cases, 1)
+            else:
+                rates[label] = 0.0
+        out.append({"group": title, "total_cases": total_cases, "rates": rates})
+    return out
+
+
+def _compute_flaky_scenarios(
+    rows: list[list[str]],
+    labels: list[str],
+    cell_all_not_executed: list[list[bool]] | None,
+) -> list[dict[str, Any]]:
+    if len(labels) < 2:
+        return []
+    detail = _matrix_detail_rows(rows)
+    flaky: list[dict[str, Any]] = []
+    for row_idx, row in enumerate(detail):
+        name = str(row[0] or "").strip()
+        total = int(row[1]) if len(row) > 1 else 0
+        if total <= 0:
+            continue
+        ne_row = (
+            cell_all_not_executed[row_idx]
+            if cell_all_not_executed and row_idx < len(cell_all_not_executed)
+            else []
+        )
+        passed_vals: list[int] = []
+        for col_idx in range(len(labels)):
+            if col_idx < len(ne_row) and ne_row[col_idx]:
+                continue
+            passed_vals.append(int(row[2 + col_idx]) if 2 + col_idx < len(row) else 0)
+        if len(passed_vals) < 2:
+            continue
+        if min(passed_vals) < max(passed_vals):
+            unstable_steps = 0
+            for a, b in zip(passed_vals, passed_vals[1:]):
+                if a != b:
+                    unstable_steps += 1
+            flaky.append(
+                {
+                    "scenario": name,
+                    "min_passed": min(passed_vals),
+                    "max_passed": max(passed_vals),
+                    "total": total,
+                    "steps": unstable_steps,
+                }
+            )
+    flaky.sort(key=lambda item: (-item["steps"], item["scenario"].lower()))
+    return flaky[:15]
+
+
+def _compute_best_branch_comparison(
+    rows: list[list[str]],
+    labels: list[str],
+    best_branch: dict[str, Any] | None,
+) -> dict[str, Any]:
+    if not labels or not best_branch:
+        return {"title": "", "worse": [], "better": [], "same": 0}
+    latest = labels[-1]
+    curr_i = len(labels) - 1
+    best_map = best_branch.get("scenario_passed_by_row") or {}
+    if not isinstance(best_map, dict):
+        best_map = {}
+    worse: list[str] = []
+    better: list[str] = []
+    same = 0
+    for row in _matrix_detail_rows(rows):
+        name = str(row[0] or "").strip()
+        total = int(row[1]) if len(row) > 1 else 0
+        curr = int(row[2 + curr_i]) if 2 + curr_i < len(row) else 0
+        best = int(best_map.get(name, 0))
+        if curr < best:
+            worse.append(f"{name} ({curr}/{best} из {total})")
+        elif curr > best:
+            better.append(f"{name} ({curr}/{best} из {total})")
+        else:
+            same += 1
+    return {
+        "title": str(best_branch.get("title") or best_branch.get("name") or ""),
+        "latest_label": latest,
+        "worse": worse[:12],
+        "better": better[:12],
+        "same": same,
+    }
+
+
+def _rate_bar_html(rate: float, *, width: int = 120) -> str:
+    pct = max(0.0, min(100.0, float(rate)))
+    fill = int(width * pct / 100.0)
+    return (
+        f"<span class='analytics-bar' style='display:inline-block;width:{width}px;"
+        f"height:10px;background:#e8eaed;border-radius:2px;vertical-align:middle;'>"
+        f"<span style='display:block;width:{fill}px;height:10px;background:#01875b;"
+        f"border-radius:2px;'></span></span>"
+    )
+
+
+def _render_analytics_build_rates_html(bundle: dict[str, Any]) -> str:
+    metrics = bundle.get("build_metrics") or []
+    if not metrics:
+        return "<p class='pie-empty'>Нет данных по билдам</p>"
+    lines = [
+        "<div class='table-scroll-wrap'>",
+        "<table class='analytics-rates-table analytics-wide-table analytics-sticky-first'><thead><tr>"
+        "<th>Билд</th><th>Pass rate</th><th>Охват</th><th>Passed</th><th>Failed</th><th>NE</th>"
+        "</tr></thead><tbody>",
+    ]
+    for item in metrics:
+        label = str(item.get("label") or "")
+        pr = float(item.get("pass_rate") or 0)
+        cov = float(item.get("coverage") or 0)
+        lines.append(
+            "<tr>"
+            f"<td>{html.escape(label)}</td>"
+            f"<td>{pr:.1f}% {_rate_bar_html(pr)}</td>"
+            f"<td>{cov:.1f}% {_rate_bar_html(cov)}</td>"
+            f"<td style='text-align:center;'>{int(item.get('passed', 0))}</td>"
+            f"<td style='text-align:center;'>{int(item.get('failed', 0))}</td>"
+            f"<td style='text-align:center;'>{int(item.get('not_executed', 0))}</td>"
+            "</tr>"
+        )
+    lines.append("</tbody></table></div>")
+    return "\n".join(lines)
+
+
+def _render_analytics_trend_week_rates_html(bundle: dict[str, Any]) -> str:
+    rates = bundle.get("trend_week_rates") or []
+    if not rates:
+        return "<p class='pie-empty'>Нет данных</p>"
+    lines = [
+        "<div class='table-scroll-wrap'>",
+        "<table class='analytics-rates-table analytics-wide-table analytics-sticky-first'><thead><tr>"
+        "<th>Неделя</th><th>Pass rate</th><th>Охват</th></tr></thead><tbody>",
+    ]
+    for item in rates:
+        pr = float(item.get("pass_rate") or 0)
+        cov = float(item.get("coverage") or 0)
+        lines.append(
+            "<tr>"
+            f"<td>{html.escape(str(item.get('label') or ''))}</td>"
+            f"<td>{pr:.1f}% {_rate_bar_html(pr)}</td>"
+            f"<td>{cov:.1f}% {_rate_bar_html(cov)}</td>"
+            "</tr>"
+        )
+    lines.append("</tbody></table></div>")
+    return "\n".join(lines)
+
+
+def _render_analytics_delta_html(bundle: dict[str, Any]) -> str:
+    delta = bundle.get("delta_rows") or {}
+    prev_label = str(delta.get("prev_label") or "")
+    curr_label = str(delta.get("curr_label") or "")
+    if not prev_label or not curr_label:
+        return (
+            "<p class='pie-empty'>Нужно минимум два билда в одной ISO-неделе "
+            "(или конец предыдущей и текущей недели) для сравнения</p>"
+        )
+    intro = _format_analytics_delta_comparison_intro(delta)
+    parts = [
+        f"<p>Сравнение <strong>{html.escape(prev_label)}</strong> → "
+        f"<strong>{html.escape(curr_label)}</strong>"
+        + (f"<br><span class='pie-empty'>{html.escape(intro)}</span>" if intro else "")
+        + "</p>",
+    ]
+
+    def _table(title: str, rows: list[dict[str, Any]]) -> str:
+        if not rows:
+            return f"<h4>{html.escape(title)}</h4><p><em>Нет изменений</em></p>"
+        out = [
+            f"<h4>{html.escape(title)}</h4>",
+            "<div class='table-scroll-wrap'>",
+            "<table class='analytics-wide-table analytics-sticky-first'><thead><tr>"
+            "<th>Сценарий</th><th>Было</th><th>Стало</th><th>Δ</th></tr></thead><tbody>",
+        ]
+        for row in rows:
+            d = int(row.get("delta", 0))
+            sign = f"+{d}" if d > 0 else str(d)
+            out.append(
+                "<tr>"
+                f"<td>{html.escape(str(row.get('scenario') or ''))}</td>"
+                f"<td style='text-align:center;'>{int(row.get('prev', 0))}</td>"
+                f"<td style='text-align:center;'>{int(row.get('curr', 0))}</td>"
+                f"<td style='text-align:center;'>{html.escape(sign)}</td>"
+                "</tr>"
+            )
+        out.append("</tbody></table></div>")
+        return "\n".join(out)
+
+    parts.append(_table("Топ улучшений", list(delta.get("improvements") or [])))
+    parts.append(_table("Топ регрессий", list(delta.get("regressions") or [])))
+    return "\n".join(parts)
+
+
+def _heatmap_cell_style(rate: float) -> str:
+    if rate >= 100.0:
+        return "background:#01875b;color:#fff;"
+    if rate >= 66.0:
+        return "background:#37b37e;color:#fff;"
+    if rate >= 33.0:
+        return "background:#ffc402;color:#2f2f2f;"
+    if rate > 0.0:
+        return "background:#ff9074;color:#2f2f2f;"
+    return "background:#c9c9c2;color:#2f2f2f;"
+
+
+def _short_build_column_label(label: str) -> str:
+    """Короткая подпись колонки билда (для вертикальных заголовков heatmap)."""
+    s = str(label or "").strip()
+    if not s:
+        return ""
+    m = re.search(r"(\d{4})\.(\d{2})\.(\d{2})\s*$", s)
+    if m:
+        return f"{m.group(2)}.{m.group(3)}"
+    if len(s) <= 14:
+        return s
+    return s[:12] + "…"
+
+
+_ANALYTICS_WIDE_TABLE_CSS = (
+    ".table-scroll-wrap{overflow-x:auto;-webkit-overflow-scrolling:touch;margin:8px 0 20px;"
+    "max-width:100%;border:1px solid #dfe1e6;border-radius:8px;background:#fcfcfd;"
+    "box-shadow:0 1px 2px rgba(9,30,66,.08);}"
+    "table.analytics-wide-table{width:max-content;min-width:min(100%,42rem);table-layout:auto;"
+    "border-collapse:separate;border-spacing:0;margin-bottom:0;}"
+    "table.analytics-wide-table th,table.analytics-wide-table td{font-size:13px;padding:6px 8px;}"
+    "table.analytics-wide-table td:first-child,table.analytics-wide-table th:first-child{"
+    "white-space:normal;min-width:11rem;max-width:26rem;}"
+    "table.analytics-sticky-first td:first-child,table.analytics-sticky-first th:first-child{"
+    "position:sticky;left:0;z-index:2;background:#fff;"
+    "box-shadow:4px 0 8px -4px rgba(9,30,66,.18);}"
+    "table.analytics-sticky-first thead th:first-child{z-index:4;background:#f0f2f5;}"
+    "table.analytics-sticky-2cols td:first-child,table.analytics-sticky-2cols th:first-child{"
+    "position:sticky;left:0;z-index:2;background:#fff;"
+    "box-shadow:4px 0 8px -4px rgba(9,30,66,.15);min-width:11rem;max-width:22rem;}"
+    "table.analytics-sticky-2cols td:nth-child(2),table.analytics-sticky-2cols th:nth-child(2){"
+    "position:sticky;left:14rem;z-index:2;background:#fff;"
+    "box-shadow:4px 0 8px -4px rgba(9,30,66,.12);white-space:nowrap;text-align:center;}"
+    "table.analytics-sticky-2cols thead th:nth-child(1),"
+    "table.analytics-sticky-2cols thead th:nth-child(2){z-index:4;background:#f0f2f5;}"
+    "table.analytics-sticky-2cols .group-total-row td:nth-child(1),"
+    "table.analytics-sticky-2cols .group-total-row td:nth-child(2){background:#ffffff;}"
+    "table.analytics-sticky-2cols .grand-total-row td:nth-child(1),"
+    "table.analytics-sticky-2cols .grand-total-row td:nth-child(2){background:#eef1f5;}"
+    ".analytics-heatmap thead th.heatmap-row-label{min-width:8.5rem;max-width:16rem;white-space:normal;"
+    "font-weight:700;background:#f0f2f5;}"
+    ".analytics-heatmap tbody td.heatmap-row-label{min-width:8.5rem;max-width:16rem;white-space:normal;"
+    "font-weight:600;background:#fff;}"
+    ".analytics-heatmap th.heatmap-build-head{vertical-align:bottom;height:7rem;padding:2px 4px;"
+    "font-size:9px;line-height:1.05;font-weight:700;background:#f0f2f5;max-width:2.1rem;}"
+    ".analytics-heatmap th.heatmap-build-head span{display:block;writing-mode:vertical-rl;"
+    "transform:rotate(180deg);max-height:6.4rem;margin:0 auto;text-align:left;overflow:hidden;"
+    "text-overflow:ellipsis;white-space:normal;}"
+    ".analytics-heatmap td{font-size:12px;padding:4px 5px;}"
+    ".weekly-defects-jira .table-scroll-wrap table{margin-bottom:0;width:max-content;"
+    "min-width:100%;table-layout:auto;border-collapse:separate;border-spacing:0;}"
+    ".weekly-defects-jira .table-scroll-wrap .weekly-defects-summary td:first-child,"
+    ".weekly-defects-jira .table-scroll-wrap .weekly-defects-summary th:first-child{"
+    "position:sticky;left:0;z-index:2;background:#fff;"
+    "box-shadow:3px 0 6px -3px rgba(9,30,66,.12);}"
+    ".weekly-defects-jira .table-scroll-wrap .weekly-defects-summary thead th:first-child{"
+    "z-index:4;background:#f4f5f7;}"
+    ".weekly-defects-jira .table-scroll-wrap .weekly-defects-matrix td:first-child,"
+    ".weekly-defects-jira .table-scroll-wrap .weekly-defects-matrix th:first-child{"
+    "position:sticky;left:0;z-index:2;background:#fff;"
+    "box-shadow:3px 0 6px -3px rgba(9,30,66,.12);}"
+    ".weekly-defects-jira .table-scroll-wrap .weekly-defects-matrix thead th:first-child{"
+    "z-index:4;background:#f4f5f7;}"
+)
+
+
+def _render_analytics_group_heatmap_html(bundle: dict[str, Any]) -> str:
+    groups = bundle.get("group_heatmap") or []
+    labels = bundle.get("labels") or []
+    if not groups or not labels:
+        return "<p class='pie-empty'>Нет групп сценариев</p>"
+    header = ["<th class='heatmap-row-label'>Группа</th>"]
+    for l in labels:
+        full = html.escape(str(l))
+        short = html.escape(_short_build_column_label(str(l)))
+        header.append(
+            "<th class='heatmap-build-head' "
+            f"title='{full}'><span>{short}</span></th>"
+        )
+    body: list[str] = [
+        "<div class='table-scroll-wrap'>",
+        "<table class='analytics-heatmap analytics-wide-table analytics-sticky-first'>",
+        "<thead><tr>" + "".join(header) + "</tr></thead><tbody>",
+    ]
+    for group in groups:
+        cells = [
+            f"<td class='heatmap-row-label'>{html.escape(str(group.get('group') or ''))}</td>"
+        ]
+        rates = group.get("rates") or {}
+        for label in labels:
+            rate = float(rates.get(label, 0))
+            cells.append(
+                f"<td style='text-align:center;{_heatmap_cell_style(rate)}'>"
+                f"{rate:.0f}%</td>"
+            )
+        body.append("<tr>" + "".join(cells) + "</tr>")
+    body.append("</tbody></table></div>")
+    return "\n".join(body)
+
+
+def _render_analytics_quality_html(
+    bundle: dict[str, Any],
+    defect_meta: dict[str, dict[str, str]] | None,
+) -> str:
+    parts: list[str] = []
+    latest = str(bundle.get("latest_label") or "")
+    fail_map = bundle.get("fail_no_jira") or {}
+    fail_list = fail_map.get(latest, []) if latest else []
+    parts.append("<h4>Fail без Jira (последний билд)</h4>")
+    if fail_list:
+        parts.append("<ul>")
+        parts.extend(f"<li>{html.escape(name)}</li>" for name in fail_list[:20])
+        parts.append("</ul>")
+    else:
+        parts.append("<p><em>Нет сценариев с fail без привязки к Jira</em></p>")
+
+    new_bugs = list(bundle.get("new_bugs") or [])
+    chronic = list(bundle.get("chronic_bugs") or [])
+    blockers = list(bundle.get("blocker_bugs") or [])
+    if new_bugs or chronic or blockers:
+        parts.append("<h4>Дефекты</h4><ul>")
+        if new_bugs:
+            links = ", ".join(_weekly_jira_key_span_html(k) for k in new_bugs[:10])
+            parts.append(f"<li><strong>Новые в {html.escape(latest)}:</strong> {links}</li>")
+        if chronic:
+            links = ", ".join(_weekly_jira_key_span_html(k) for k in chronic[:10])
+            parts.append(f"<li><strong>Хронические:</strong> {links}</li>")
+        if blockers:
+            links = ", ".join(_weekly_jira_key_span_html(k) for k in blockers[:10])
+            parts.append(f"<li><strong>Открытые Blocker/Critical:</strong> {links}</li>")
+        parts.append("</ul>")
+
+    flaky = bundle.get("flaky") or []
+    parts.append("<h4>Нестабильные сценарии</h4>")
+    if flaky:
+        parts.append("<div class='table-scroll-wrap'>")
+        parts.append(
+            "<table class='analytics-wide-table analytics-sticky-first'>"
+            "<thead><tr><th>Сценарий</th><th>Min</th><th>Max</th><th>Из total</th></tr></thead><tbody>"
+        )
+        for row in flaky:
+            parts.append(
+                "<tr>"
+                f"<td>{html.escape(str(row.get('scenario') or ''))}</td>"
+                f"<td style='text-align:center;'>{int(row.get('min_passed', 0))}</td>"
+                f"<td style='text-align:center;'>{int(row.get('max_passed', 0))}</td>"
+                f"<td style='text-align:center;'>{int(row.get('total', 0))}</td>"
+                "</tr>"
+            )
+        parts.append("</tbody></table></div>")
+    else:
+        parts.append("<p><em>Нет нестабильных сценариев за период</em></p>")
+
+    best = bundle.get("best_cmp") or {}
+    if best.get("title"):
+        parts.append(
+            f"<h4>Сравнение с {html.escape(str(best.get('title')))} "
+            f"({html.escape(str(best.get('latest_label') or ''))})</h4>"
+        )
+        parts.append(
+            f"<p>Без изменений: {int(best.get('same', 0))}; "
+            f"хуже эталона: {len(best.get('worse') or [])}; "
+            f"лучше эталона: {len(best.get('better') or [])}</p>"
+        )
+        if best.get("worse"):
+            parts.append("<p><strong>Хуже эталона:</strong></p><ul>")
+            parts.extend(
+                f"<li>{html.escape(str(x))}</li>" for x in (best.get("worse") or [])[:8]
+            )
+            parts.append("</ul>")
+    return "\n".join(parts)
+
+
+def _render_analytics_failure_text_html(bundle: dict[str, Any]) -> str:
+    parts: list[str] = []
+    comments = bundle.get("top_comments") or []
+    parts.append("<h4>Топ комментариев при Fail</h4>")
+    if comments:
+        parts.append("<div class='table-scroll-wrap'>")
+        parts.append(
+            "<table class='analytics-wide-table analytics-sticky-first'>"
+            "<thead><tr><th>Комментарий</th><th>Кол-во</th><th>Сценарии</th></tr></thead><tbody>"
+        )
+        for row in comments:
+            scenarios = ", ".join(row.get("scenarios") or [])
+            parts.append(
+                "<tr>"
+                f"<td>{html.escape(str(row.get('comment') or ''))}</td>"
+                f"<td style='text-align:center;'>{int(row.get('count', 0))}</td>"
+                f"<td>{html.escape(scenarios)}</td>"
+                "</tr>"
+            )
+        parts.append("</tbody></table></div>")
+    else:
+        parts.append("<p><em>Нет данных (case_steps.csv пуст или не собран)</em></p>")
+
+    index = bundle.get("build_log_index") or []
+    parts.append("<h4>Build-log по Jira</h4>")
+    if index:
+        parts.append("<div class='table-scroll-wrap'>")
+        parts.append(
+            "<table class='analytics-wide-table analytics-sticky-first'>"
+            "<thead><tr><th>Билд</th><th>Jira</th><th>Логи</th></tr></thead><tbody>"
+        )
+        for row in index[:40]:
+            key = str(row.get("issue_key") or "")
+            href = str(row.get("href") or "")
+            key_cell = (
+                f"<a href='{html.escape(href, quote=True)}'>{html.escape(key)}</a>"
+                if href
+                else _weekly_jira_key_span_html(key)
+            )
+            parts.append(
+                "<tr>"
+                f"<td>{html.escape(str(row.get('build') or ''))}</td>"
+                f"<td>{key_cell}</td>"
+                f"<td style='text-align:center;'>{int(row.get('url_count', 0))}</td>"
+                "</tr>"
+            )
+        parts.append("</tbody></table></div>")
+    else:
+        parts.append("<p><em>Нет build-log страниц</em></p>")
+    return "\n".join(parts)
+
+
+def _render_analytics_build_rates_wiki(bundle: dict[str, Any]) -> str:
+    metrics = bundle.get("build_metrics") or []
+    if not metrics:
+        return "_Нет данных_"
+    lines = ["|| Билд || Pass rate % || Охват % || Passed || Failed || NE ||"]
+    for item in metrics:
+        lines.append(
+            "| "
+            + " | ".join(
+                _wiki_escape(str(x))
+                for x in (
+                    item.get("label"),
+                    f"{float(item.get('pass_rate', 0)):.1f}",
+                    f"{float(item.get('coverage', 0)):.1f}",
+                    item.get("passed"),
+                    item.get("failed"),
+                    item.get("not_executed"),
+                )
+            )
+            + " |"
+        )
+    return "\n".join(lines)
+
+
+def _render_analytics_delta_wiki(bundle: dict[str, Any]) -> str:
+    delta = bundle.get("delta_rows") or {}
+    if not delta.get("prev_label"):
+        return (
+            "_Нужно минимум два билда в одной ISO-неделе "
+            "(или конец предыдущей и текущей недели)_"
+        )
+    intro = _format_analytics_delta_comparison_intro(delta)
+    lines = [
+        f"Сравнение {_wiki_escape(str(delta.get('prev_label')))} → "
+        f"{_wiki_escape(str(delta.get('curr_label')))}",
+    ]
+    if intro:
+        lines.append(f"_{_wiki_escape(intro)}_")
+    lines.extend(["", "h4. Топ улучшений"])
+    improvements = delta.get("improvements") or []
+    if improvements:
+        lines.append("|| Сценарий || Было || Стало || Δ ||")
+        for row in improvements:
+            d = int(row.get("delta", 0))
+            sign = f"+{d}" if d > 0 else str(d)
+            lines.append(
+                "| "
+                + " | ".join(
+                    _wiki_escape(str(x))
+                    for x in (row.get("scenario"), row.get("prev"), row.get("curr"), sign)
+                )
+                + " |"
+            )
+    else:
+        lines.append("_Нет_")
+    lines.extend(["", "h4. Топ регрессий"])
+    regressions = delta.get("regressions") or []
+    if regressions:
+        lines.append("|| Сценарий || Было || Стало || Δ ||")
+        for row in regressions:
+            d = int(row.get("delta", 0))
+            lines.append(
+                "| "
+                + " | ".join(
+                    _wiki_escape(str(x))
+                    for x in (row.get("scenario"), row.get("prev"), row.get("curr"), d)
+                )
+                + " |"
+            )
+    else:
+        lines.append("_Нет_")
+    return "\n".join(lines)
+
+
+def _render_analytics_group_heatmap_wiki(bundle: dict[str, Any]) -> str:
+    groups = bundle.get("group_heatmap") or []
+    labels = bundle.get("labels") or []
+    if not groups or not labels:
+        return "_Нет данных_"
+    header = ["Группа"] + labels
+    lines = ["|| " + " || ".join(_wiki_escape(c) for c in header) + " ||"]
+    for group in groups:
+        rates = group.get("rates") or {}
+        cells = [str(group.get("group") or "")]
+        cells.extend(f"{float(rates.get(lbl, 0)):.0f}%" for lbl in labels)
+        lines.append("| " + " | ".join(_wiki_escape(c) for c in cells) + " |")
+    return "\n".join(lines)
+
+
+def _render_analytics_quality_wiki(bundle: dict[str, Any]) -> str:
+    lines: list[str] = []
+    latest = str(bundle.get("latest_label") or "")
+    fail_list = (bundle.get("fail_no_jira") or {}).get(latest, [])
+    lines.append("h4. Fail без Jira (последний билд)")
+    if fail_list:
+        lines.extend(f"* {_wiki_escape(n)}" for n in fail_list[:20])
+    else:
+        lines.append("_Нет_")
+    for title, keys in (
+        ("Новые дефекты", bundle.get("new_bugs")),
+        ("Хронические", bundle.get("chronic_bugs")),
+        ("Blocker/Critical", bundle.get("blocker_bugs")),
+    ):
+        key_list = list(keys or [])
+        if key_list:
+            lines.append(f"h4. {_wiki_escape(title)}")
+            lines.append(", ".join(_wiki_escape(k) for k in key_list[:10]))
+    flaky = bundle.get("flaky") or []
+    lines.append("h4. Нестабильные сценарии")
+    if flaky:
+        lines.append("|| Сценарий || Min || Max || Total ||")
+        for row in flaky[:12]:
+            lines.append(
+                "| "
+                + " | ".join(
+                    _wiki_escape(str(x))
+                    for x in (
+                        row.get("scenario"),
+                        row.get("min_passed"),
+                        row.get("max_passed"),
+                        row.get("total"),
+                    )
+                )
+                + " |"
+            )
+    else:
+        lines.append("_Нет_")
+    return "\n".join(lines)
+
+
+def _render_analytics_failure_text_wiki(bundle: dict[str, Any]) -> str:
+    lines: list[str] = ["h4. Топ комментариев при Fail"]
+    comments = bundle.get("top_comments") or []
+    if comments:
+        lines.append("|| Комментарий || Кол-во || Сценарии ||")
+        for row in comments:
+            scenarios = ", ".join(row.get("scenarios") or [])
+            lines.append(
+                "| "
+                + " | ".join(
+                    _wiki_escape(str(x))
+                    for x in (row.get("comment"), row.get("count"), scenarios)
+                )
+                + " |"
+            )
+    else:
+        lines.append("_Нет данных case_steps_")
+    index = bundle.get("build_log_index") or []
+    lines.extend(["", "h4. Build-log"])
+    if index:
+        lines.append("|| Билд || Jira || URL count ||")
+        for row in index[:30]:
+            lines.append(
+                "| "
+                + " | ".join(
+                    _wiki_escape(str(x))
+                    for x in (row.get("build"), row.get("issue_key"), row.get("url_count"))
+                )
+                + " |"
+            )
+    else:
+        lines.append("_Нет_")
+    return "\n".join(lines)
+
+
+_ANALYTICS_PAGE_CSS = (
+    "<style>"
+    "body{font-family:Arial,sans-serif;margin:24px;}"
+    "h1{margin-bottom:8px;}"
+    "h2{margin-top:24px;margin-bottom:8px;font-weight:700;}"
+    "h3{margin-top:20px;margin-bottom:8px;font-weight:700;}"
+    ".analytics-toc{margin:12px 0 24px;padding:12px 16px;background:#f4f5f7;border-radius:4px;}"
+    "table{border-collapse:collapse;width:100%;margin-bottom:16px;table-layout:fixed;}"
+    "th,td{border:1px solid #d6d6d6;padding:6px 8px;text-align:left;}"
+    "th{background:#f0f2f5;}"
+    ".weekly-overall-grid{display:flex;flex-wrap:wrap;gap:24px;margin:12px 0;}"
+    ".weekly-overall-cell{flex:1 1 200px;min-width:200px;}.daily-pie-wrap{display:flex;flex-wrap:wrap;align-items:flex-start;gap:16px;margin:8px 0;}.pie-legend{display:flex;flex-wrap:wrap;gap:12px;align-items:center;font-size:13px;max-width:520px;}.pie-swatch{display:inline-block;width:12px;height:12px;border-radius:2px;margin-right:6px;vertical-align:middle;}.pie-empty{color:#666;margin:8px 0;}"
+    ".analytics-rates-table td{vertical-align:middle;}"
+    ".analytics-scroll-hint{margin:-4px 0 20px;padding:10px 14px;background:#e9f2ff;border-radius:6px;"
+    "font-size:13px;color:#172b4d;border:1px solid #b3d4ff;line-height:1.45;}"
+    + _ANALYTICS_WIDE_TABLE_CSS
+    + "</style>"
+)
+
+
+def _defect_analytics_from_trend(trend: dict[str, Any]) -> dict[str, Any]:
+    week_columns = list(trend.get("week_columns") or [])
+    defect_matrix = trend.get("defect_matrix") or {}
+    keys_ordered = list(trend.get("keys_ordered") or [])
+    totals_by_week = {col: 0 for col in week_columns}
+    for key in keys_ordered:
+        row = defect_matrix.get(key, {}) or {}
+        for col in week_columns:
+            if int(row.get(col, 0)) > 0:
+                totals_by_week[col] = totals_by_week.get(col, 0) + 1
+    bug_total_cases = {
+        key: sum(int((defect_matrix.get(key) or {}).get(col, 0)) for col in week_columns)
+        for key in keys_ordered
+    }
+    bug_builds_count = {
+        key: sum(1 for col in week_columns if int((defect_matrix.get(key) or {}).get(col, 0)) > 0)
+        for key in keys_ordered
+    }
+    matrix = {
+        key: {col: int((defect_matrix.get(key) or {}).get(col, 0)) for col in week_columns}
+        for key in keys_ordered
+    }
+    return {
+        "keys_ordered": keys_ordered,
+        "matrix": matrix,
+        "totals_by_build": totals_by_week,
+        "cases_with_bug_by_build": {c: 0 for c in week_columns},
+        "cases_without_bug_by_build": {c: 0 for c in week_columns},
+        "failed_cases_with_bug_by_build": {c: 0 for c in week_columns},
+        "failed_cases_without_bug_by_build": {c: 0 for c in week_columns},
+        "bug_total_cases": bug_total_cases,
+        "bug_builds_count": bug_builds_count,
+        "hot_bugs": [],
+    }
+
+
+def _render_analytics_sections_html(
+    weekday_labels: list[str],
+    rows: list[list[str]],
+    cell_all_not_executed: list[list[bool]] | None,
+    cell_all_blocked: list[list[bool]] | None,
+    *,
+    column_status_counts: dict[str, dict[str, int]] | None = None,
+    defect_keys: list[str] | None = None,
+    cycle_keys_by_label: dict[str, list[dict[str, Any]]] | None = None,
+    defect_analytics: dict[str, Any] | None = None,
+    defect_meta: dict[str, dict[str, str]] | None = None,
+    best_branch_column: dict[str, Any] | None = None,
+    section_tag: str = "h3",
+    defect_column_labels: list[str] | None = None,
+    defect_matrix_title: str = "билд",
+) -> str:
+    labels = list(weekday_labels)
+    best_column = best_branch_column or {}
+    best_title = str(best_column.get("title") or "").strip()
+    has_best_column = bool(best_title)
+    data_labels = ([best_title] if has_best_column else []) + labels
+    best_scenario_map = (
+        best_column.get("scenario_passed_by_row")
+        if isinstance(best_column.get("scenario_passed_by_row"), dict)
+        else {}
+    )
+    best_overall_counts = (
+        best_column.get("overall_counts")
+        if isinstance(best_column.get("overall_counts"), dict)
+        else {}
+    )
+    best_cycle_keys = best_column.get("cycle_keys")
+    if not isinstance(best_cycle_keys, list):
+        best_cycle_keys = []
+    header_cells = ["<th>Тестовый цикл</th>", "<th>Всего кейсов</th>"]
+    header_cells.extend(f"<th>{html.escape(label)}</th>" for label in data_labels)
+    sections: list[str] = []
+
+    sections.append(
+        f"<{section_tag} id='overall-score'><strong>Общий score</strong></{section_tag}>"
+    )
+    counts_by_label = column_status_counts or {}
+    cycle_keys_map = cycle_keys_by_label or {}
+    if data_labels:
+        sections.append("<div class='weekly-overall-grid'>")
+        if has_best_column:
+            cycle_keys_attr = ""
+            if best_cycle_keys:
+                cycle_keys_attr = (
+                    " data-zephyr-cycle-keys=\""
+                    + html.escape(json.dumps(best_cycle_keys, ensure_ascii=True), quote=True)
+                    + "\""
+                )
+            sections.append(
+                f"<div class='weekly-overall-cell'{cycle_keys_attr}>"
+                + f"<h4>{html.escape(best_title)}</h4>"
+                + f"{_daily_status_pie_svg(best_overall_counts)}"
+                + "</div>"
+            )
+        for label in labels:
+            counts = counts_by_label.get(label, {}) or {}
+            cycle_keys = cycle_keys_map.get(label) or []
+            cycle_keys_attr = ""
+            if cycle_keys:
+                cycle_keys_attr = (
+                    " data-zephyr-cycle-keys=\""
+                    + html.escape(json.dumps(cycle_keys, ensure_ascii=True), quote=True)
+                    + "\""
+                )
+            sections.append(
+                f"<div class='weekly-overall-cell'{cycle_keys_attr}>"
+                f"<h4>{html.escape(str(label))}</h4>"
+                f"{_daily_status_pie_svg(counts)}"
+                "</div>"
+            )
+        sections.append("</div>")
+    else:
+        sections.append("<p class='pie-empty'>Нет данных по статусам</p>")
+
+    sections.append(
+        f"<{section_tag} id='scenario-score'><strong>Score по сценариям</strong></{section_tag}>"
+    )
+    n_builds = len(data_labels)
+    if n_builds > 0:
+        equal_pct = 100.0 / (n_builds + 2)
+        build_pct = equal_pct * 0.7
+        remain_pct = 100.0 - build_pct * n_builds
+        cycle_pct = remain_pct * 0.78
+        total_pct = remain_pct - cycle_pct
+        col_tags = [
+            f"<col style='width:{cycle_pct:.2f}%'>",
+            f"<col style='width:{total_pct:.2f}%'>",
+        ]
+        col_tags.extend(f"<col style='width:{build_pct:.2f}%'>" for _ in range(n_builds))
+        colgroup_html = "<colgroup>" + "".join(col_tags) + "</colgroup>"
+    else:
+        colgroup_html = ""
+    sections.append("<div class='table-scroll-wrap'>")
+    sections.extend(
+        [
+            "<table class='analytics-wide-table analytics-sticky-2cols'>",
+            colgroup_html,
+            "<thead><tr>" + "".join(header_cells) + "</tr></thead><tbody>",
+        ]
+    )
+    for row_idx, row in enumerate(rows):
+        if str(row[0]).startswith("Итого:"):
+            total_cells = [
+                f"<td style='font-weight:700;background:#ffffff;color:#1f2328;'>{html.escape(row[0])}</td>",
+                (
+                    "<td class='total-cases-cell' "
+                    "style='font-weight:700;background:#ffffff;color:#1f2328;text-align:center;'>"
+                    f"{html.escape(row[1])}</td>"
+                ),
+            ]
+            data_values: list[str] = []
+            if has_best_column:
+                data_values.append(str(best_scenario_map.get(str(row[0] or "").strip(), 0)))
+            data_values.extend(
+                str(row[2 + idx] if 2 + idx < len(row) else "0") for idx in range(len(labels))
+            )
+            total_cells.extend(
+                (
+                    "<td style='font-weight:700;background:#ffffff;color:#1f2328;text-align:center;'>"
+                    f"{html.escape(value)}</td>"
+                )
+                for value in data_values
+            )
+            sections.append("<tr class='group-total-row'>" + "".join(total_cells) + "</tr>")
+            continue
+        passed_cells: list[str] = []
+        ne_row = (
+            cell_all_not_executed[row_idx]
+            if cell_all_not_executed and row_idx < len(cell_all_not_executed)
+            else []
+        )
+        blocked_row = (
+            cell_all_blocked[row_idx]
+            if cell_all_blocked and row_idx < len(cell_all_blocked)
+            else []
+        )
+        for idx in range(len(data_labels)):
+            if has_best_column and idx == 0:
+                passed_value = int(best_scenario_map.get(str(row[0] or "").strip(), 0))
+                all_ne = False
+                all_blocked = False
+            else:
+                regular_idx = idx - (1 if has_best_column else 0)
+                passed_value = int(row[2 + regular_idx]) if 2 + regular_idx < len(row) else 0
+                all_ne = bool(ne_row[regular_idx]) if regular_idx < len(ne_row) else False
+                all_blocked = (
+                    bool(blocked_row[regular_idx]) if regular_idx < len(blocked_row) else False
+                )
+            passed_cells.append(
+                "<td class='passed-count-cell' "
+                f"style='background:{_passed_count_color(passed_value, all_not_executed=all_ne, all_blocked=all_blocked)};"
+                f"color:{_passed_count_text_color(passed_value, all_not_executed=all_ne, all_blocked=all_blocked)};"
+                "text-align:center;'>"
+                f"{passed_value}</td>"
+            )
+        sections.append(
+            "<tr>"
+            f"<td>{html.escape(row[0])}</td>"
+            f"<td class='total-cases-cell' style='text-align:center;'>{html.escape(row[1])}</td>"
+            + "".join(passed_cells)
+            + "</tr>"
+        )
+    if rows:
+        detail_rows = [r for r in rows if not str(r[0]).startswith("Итого:")]
+        total_cases_grand = sum(int(r[1]) for r in detail_rows if len(r) > 1)
+        passed_grand: list[int] = []
+        if has_best_column:
+            passed_grand.append(
+                sum(int(best_scenario_map.get(str(r[0] or "").strip(), 0)) for r in detail_rows)
+            )
+        passed_grand.extend(
+            sum(int(r[2 + idx]) for r in detail_rows if 2 + idx < len(r))
+            for idx in range(len(labels))
+        )
+        grand_cells = [
+            "<td style='font-weight:700;background:#eef1f5;color:#1f2328;'>Итого</td>",
+            (
+                "<td class='total-cases-cell' "
+                "style='font-weight:700;background:#eef1f5;color:#1f2328;text-align:center;'>"
+                f"{total_cases_grand}</td>"
+            ),
+        ]
+        grand_cells.extend(
+            (
+                "<td style='font-weight:700;background:#eef1f5;color:#1f2328;text-align:center;'>"
+                f"{value}</td>"
+            )
+            for value in passed_grand
+        )
+        sections.append("<tr class='grand-total-row'>" + "".join(grand_cells) + "</tr>")
+    sections.append("</tbody></table></div>")
+
+    sections.append(f"<{section_tag} id='defects'><strong>Заведённые дефекты</strong></{section_tag}>")
+    merged_analytics = _coalesce_weekly_defect_analytics(defect_analytics, defect_keys)
+    defect_cols = defect_column_labels if defect_column_labels is not None else labels
+    if merged_analytics and (merged_analytics.get("keys_ordered") or []):
+        sections.append(_weekly_defect_analytics_html(merged_analytics, defect_meta, defect_cols))
+    else:
+        sections.append(_weekly_defects_html_block(defect_keys or []))
+    return "\n".join(sections)
+
+
+def _render_analytics_sections_wiki(
+    weekday_labels: list[str],
+    rows: list[list[str]],
+    *,
+    column_status_counts: dict[str, dict[str, int]] | None = None,
+    cycle_keys_by_label: dict[str, list[dict[str, Any]]] | None = None,
+    defect_keys: list[str] | None = None,
+    defect_analytics: dict[str, Any] | None = None,
+    defect_meta: dict[str, dict[str, str]] | None = None,
+    best_branch_column: dict[str, Any] | None = None,
+    defect_column_labels: list[str] | None = None,
+) -> str:
+    labels = list(weekday_labels)
+    best_column = best_branch_column or {}
+    best_title = str(best_column.get("title") or "").strip()
+    has_best_column = bool(best_title)
+    data_labels = ([best_title] if has_best_column else []) + labels
+    best_scenario_map = (
+        best_column.get("scenario_passed_by_row")
+        if isinstance(best_column.get("scenario_passed_by_row"), dict)
+        else {}
+    )
+    best_overall_counts = (
+        best_column.get("overall_counts")
+        if isinstance(best_column.get("overall_counts"), dict)
+        else {}
+    )
+    best_cycle_keys = best_column.get("cycle_keys")
+    if not isinstance(best_cycle_keys, list):
+        best_cycle_keys = []
+    lines: list[str] = []
+    lines.append("{anchor:overall_score}")
+    lines.append("h3. *Общий score*")
+    lines.append("")
+    counts_by_label = column_status_counts or {}
+    cycle_keys_map = cycle_keys_by_label or {}
+    if data_labels:
+        if has_best_column:
+            lines.append(f"h4. {_wiki_escape(best_title)}")
+            best_block = _weekly_overall_zephyr_or_chart_wiki(
+                cast(list[dict[str, Any]], best_cycle_keys),
+                best_overall_counts,
+            )
+            lines.extend((best_block or "_Нет данных по статусам_").splitlines())
+            lines.append("")
+        for label in labels:
+            counts = counts_by_label.get(label, {}) or {}
+            lines.append(f"h4. {_wiki_escape(str(label))}")
+            c_objs = cycle_keys_map.get(label)
+            if not isinstance(c_objs, list):
+                c_objs = []
+            chart_block = _weekly_overall_zephyr_or_chart_wiki(
+                cast(list[dict[str, Any]], c_objs),
+                counts,
+            )
+            lines.extend((chart_block or "_Нет данных по статусам_").splitlines())
+            lines.append("")
+    else:
+        lines.append("_Нет данных по статусам_")
+        lines.append("")
+
+    lines.append("{anchor:scenario_score}")
+    lines.append("h3. *Score по сценариям*")
+    lines.append("")
+    header_cells = ["Тестовый цикл", "Всего кейсов"]
+    header_cells.extend(_wiki_escape(label) for label in data_labels)
+    lines.append("|| " + " || ".join(header_cells) + " ||")
+    for row in rows:
+        if str(row[0]).startswith("Итого:"):
+            row_values = [f"*{row[0]}*", f"*{row[1]}*"]
+            if has_best_column:
+                row_values.append(f"*{best_scenario_map.get(str(row[0] or '').strip(), 0)}*")
+            for idx in range(len(labels)):
+                row_values.append(f"*{row[2 + idx] if 2 + idx < len(row) else '0'}*")
+            lines.append("| " + " | ".join(_wiki_escape(str(v)) for v in row_values) + " |")
+            continue
+        row_values = [row[0], row[1]]
+        if has_best_column:
+            row_values.append(str(best_scenario_map.get(str(row[0] or "").strip(), 0)))
+        for idx in range(len(labels)):
+            row_values.append(row[2 + idx] if 2 + idx < len(row) else "0")
+        lines.append("| " + " | ".join(_wiki_escape(str(v)) for v in row_values) + " |")
+    if rows:
+        detail_rows = [r for r in rows if not str(r[0]).startswith("Итого:")]
+        total_cases_grand = sum(int(r[1]) for r in detail_rows if len(r) > 1)
+        passed_grand: list[int] = []
+        if has_best_column:
+            passed_grand.append(
+                sum(int(best_scenario_map.get(str(r[0] or "").strip(), 0)) for r in detail_rows)
+            )
+        passed_grand.extend(
+            sum(int(r[2 + idx]) for r in detail_rows if 2 + idx < len(r))
+            for idx in range(len(labels))
+        )
+        grand_values = ["*Итого*", f"*{total_cases_grand}*"] + [f"*{v}*" for v in passed_grand]
+        lines.append("| " + " | ".join(_wiki_escape(str(v)) for v in grand_values) + " |")
+    lines.append("")
+
+    lines.append("{anchor:defects}")
+    lines.append("h3. *Заведённые дефекты*")
+    lines.append("")
+    merged_analytics = _coalesce_weekly_defect_analytics(defect_analytics, defect_keys)
+    defect_cols = defect_column_labels if defect_column_labels is not None else labels
+    if merged_analytics and (merged_analytics.get("keys_ordered") or []):
+        defects_block = _weekly_defect_analytics_wiki(merged_analytics, defect_meta, defect_cols)
+    else:
+        defects_block = _weekly_defects_wiki_block(defect_keys or [])
+    if defects_block:
+        lines.extend(defects_block.splitlines())
+    lines.append("")
+    return "\n".join(lines)
+
+
+def _render_trend_scenario_table_html(trend: dict[str, Any]) -> str:
+    week_columns = list(trend.get("week_columns") or [])
+    scenario_by_week = trend.get("scenario_by_week") or {}
+    metric = trend.get("metric") or "passed"
+    value_header = "Pass rate %" if metric == "rate" else "Passed"
+    if not week_columns:
+        return "<p>Нет данных</p>"
+    header = ["<th>Тестовый цикл</th>"] + [f"<th>{html.escape(c)}</th>" for c in week_columns]
+    rows_html = [
+        "<div class='table-scroll-wrap'>",
+        "<table class='analytics-wide-table analytics-sticky-first'><thead><tr>" + "".join(header) + "</tr></thead><tbody>",
+    ]
+    for cycle in sorted(scenario_by_week.keys(), key=str.lower):
+        cells = [f"<td>{html.escape(cycle)}</td>"]
+        week_map = scenario_by_week.get(cycle, {}) or {}
+        for col in week_columns:
+            val = week_map.get(col, 0)
+            cells.append(f"<td style='text-align:center;'>{html.escape(str(val))}</td>")
+        rows_html.append("<tr>" + "".join(cells) + "</tr>")
+    rows_html.append("</tbody></table></div>")
+    return "\n".join(rows_html)
+
+
+def _render_trend_scenario_table_wiki(trend: dict[str, Any]) -> str:
+    week_columns = list(trend.get("week_columns") or [])
+    scenario_by_week = trend.get("scenario_by_week") or {}
+    if not week_columns:
+        return "_Нет данных_"
+    header = ["Тестовый цикл"] + week_columns
+    lines = ["|| " + " || ".join(_wiki_escape(c) for c in header) + " ||"]
+    for cycle in sorted(scenario_by_week.keys(), key=str.lower):
+        week_map = scenario_by_week.get(cycle, {}) or {}
+        cells = [cycle] + [str(week_map.get(col, 0)) for col in week_columns]
+        lines.append("| " + " | ".join(_wiki_escape(c) for c in cells) + " |")
+    return "\n".join(lines)
+
+
+def render_weekly_analytics_html(
+    *,
+    trend: dict[str, Any],
+    rolling_matrix: tuple[Any, ...],
+    per_week_matrices: list[tuple[Any, ...]],
+    defect_meta: dict[str, dict[str, str]] | None,
+    rolling_best_branch: dict[str, Any] | None = None,
+    per_week_best: dict[date | None, dict[str, Any]] | None = None,
+    extended_bundle: dict[str, Any] | None = None,
+) -> str:
+    page_title = (os.getenv("ZEPHYR_CONFLUENCE_WEEKLY_ANALYTICS_TITLE") or "Zephyr Weekly Analytics").strip()
+    bundle = extended_bundle or _build_extended_analytics_bundle(
+        rolling_matrix=rolling_matrix,
+        trend=trend,
+        rolling_best_branch=rolling_best_branch,
+        defect_meta=defect_meta,
+    )
+    parts = [
+        "<!doctype html><html><head><meta charset='utf-8'>",
+        f"<title>{html.escape(page_title)}</title>",
+        _ANALYTICS_PAGE_CSS,
+        "</head><body>",
+        f"<h1>{html.escape(page_title)}</h1>",
+        "<div class='analytics-toc'><strong>Содержание</strong><ul>",
+        "<li><a href='#analytics_build_rates'>Тренд по билдам</a></li>",
+        "<li><a href='#analytics_delta'>Изменения билд к билду</a></li>",
+        "<li><a href='#analytics_group_heatmap'>Группы сценариев</a></li>",
+        "<li><a href='#analytics_trend'>Динамика по неделям</a></li>",
+        "<li><a href='#analytics_rolling'>Сводка за период</a></li>",
+        "<li><a href='#analytics_quality'>Качество сигнала</a></li>",
+        "<li><a href='#analytics_failure_text'>Тексты падений и build-log</a></li>",
+        "<li><a href='#analytics_by_week'>По неделям</a></li>",
+        "</ul></div>",
+        "<p class='analytics-scroll-hint'>Широкие таблицы в серой рамке: прокрутка по горизонтали внутри блока. "
+        "Первая колонка закреплена слева; в таблице «Score по сценариям» также закреплена колонка «Всего кейсов».</p>",
+    ]
+
+    parts.append("<h2 id='analytics_build_rates'>Тренд pass rate / охват по билдам</h2>")
+    parts.append(_render_analytics_build_rates_html(bundle))
+    parts.append("<h2 id='analytics_delta'>Изменения между билдами</h2>")
+    parts.append(_render_analytics_delta_html(bundle))
+    parts.append("<h2 id='analytics_group_heatmap'>Heatmap по группам сценариев</h2>")
+    parts.append(_render_analytics_group_heatmap_html(bundle))
+
+    parts.append("<h2 id='analytics_trend'>Динамика по неделям</h2>")
+    parts.append("<h3>Pass rate и охват по неделям</h3>")
+    parts.append(_render_analytics_trend_week_rates_html(bundle))
+    parts.append("<h3>Общий score (по неделям)</h3>")
+    week_cols = list(trend.get("week_columns") or [])
+    overall = trend.get("overall_by_week") or {}
+    cycle_keys_by_week = trend.get("cycle_keys_by_week") or {}
+    if week_cols:
+        parts.append("<div class='weekly-overall-grid'>")
+        for col in week_cols:
+            week_counts = overall.get(col, {}) or {}
+            counts_attr = _zephyr_status_counts_data_attr(week_counts)
+            ckw = cycle_keys_by_week.get(col)
+            if not isinstance(ckw, list):
+                ckw = []
+            cycle_attr = ""
+            if ckw:
+                cycle_attr = (
+                    " data-zephyr-cycle-keys=\""
+                    + html.escape(json.dumps(ckw, ensure_ascii=True), quote=True)
+                    + "\""
+                )
+            parts.append(
+                f"<div class='weekly-overall-cell'{counts_attr}{cycle_attr}>"
+                f"<h4>{html.escape(col)}</h4>"
+                f"{_daily_status_chart_html_block(week_counts)}</div>"
+            )
+        parts.append("</div>")
+    else:
+        parts.append("<p class='pie-empty'>Нет данных</p>")
+    parts.append("<h3>Score по сценариям (тренд)</h3>")
+    parts.append(_render_trend_scenario_table_html(trend))
+    trend_defects = _defect_analytics_from_trend(trend)
+    parts.append("<h3>Заведённые дефекты (тренд)</h3>")
+    parts.append(
+        _weekly_defect_analytics_html(trend_defects, defect_meta, week_cols)
+        if week_cols
+        else "<p><em>Нет данных</em></p>"
+    )
+
+    parts.append("<h2 id='analytics_rolling'>Сводка за период</h2>")
+    if rolling_matrix and rolling_matrix[1]:
+        (
+            _rw,
+            r_labels,
+            r_rows,
+            r_ne,
+            r_blocked,
+            r_counts,
+            r_defect_keys,
+            r_cycle_keys,
+            r_defect_analytics,
+        ) = rolling_matrix
+        parts.append(
+            _render_analytics_sections_html(
+                r_labels,
+                r_rows,
+                r_ne,
+                r_blocked,
+                column_status_counts=r_counts,
+                defect_keys=r_defect_keys,
+                cycle_keys_by_label=r_cycle_keys,
+                defect_analytics=r_defect_analytics,
+                defect_meta=defect_meta,
+                best_branch_column=rolling_best_branch,
+                section_tag="h3",
+            )
+        )
+    else:
+        parts.append("<p><em>Нет данных за период</em></p>")
+
+    parts.append("<h2 id='analytics_quality'>Качество сигнала</h2>")
+    parts.append(_render_analytics_quality_html(bundle, defect_meta))
+    parts.append("<h2 id='analytics_failure_text'>Тексты падений и build-log</h2>")
+    parts.append(_render_analytics_failure_text_html(bundle))
+
+    parts.append("<h2 id='analytics_by_week'>По неделям</h2>")
+    per_week_best = per_week_best or {}
+    for matrix in reversed(per_week_matrices):
+        week_start = matrix[0]
+        week_title = _weekly_matrix_title_text(week_start, matrix[1])
+        parts.append(f"<h3>{html.escape(week_title)}</h3>")
+        parts.append(
+            _render_analytics_sections_html(
+                matrix[1],
+                matrix[2],
+                matrix[3],
+                matrix[4],
+                column_status_counts=matrix[5],
+                defect_keys=matrix[6],
+                cycle_keys_by_label=matrix[7],
+                defect_analytics=matrix[8],
+                defect_meta=defect_meta,
+                best_branch_column=per_week_best.get(week_start),
+                section_tag="h4",
+            )
+        )
+
+    parts.append("</body></html>")
+    return "\n".join(parts)
+
+
+def render_weekly_analytics_wiki(
+    *,
+    trend: dict[str, Any],
+    rolling_matrix: tuple[Any, ...],
+    per_week_matrices: list[tuple[Any, ...]],
+    defect_meta: dict[str, dict[str, str]] | None,
+    rolling_best_branch: dict[str, Any] | None = None,
+    per_week_best: dict[date | None, dict[str, Any]] | None = None,
+    extended_bundle: dict[str, Any] | None = None,
+) -> str:
+    page_title = (os.getenv("ZEPHYR_CONFLUENCE_WEEKLY_ANALYTICS_TITLE") or "Zephyr Weekly Analytics").strip()
+    bundle = extended_bundle or _build_extended_analytics_bundle(
+        rolling_matrix=rolling_matrix,
+        trend=trend,
+        rolling_best_branch=rolling_best_branch,
+        defect_meta=defect_meta,
+    )
+    lines = [
+        f"h1. {_wiki_escape(page_title)}",
+        "",
+        "{anchor:analytics_build_rates}",
+        "h2. Тренд pass rate / охват по билдам",
+        "",
+        _render_analytics_build_rates_wiki(bundle),
+        "",
+        "{anchor:analytics_delta}",
+        "h2. Изменения между билдами",
+        "",
+        _render_analytics_delta_wiki(bundle),
+        "",
+        "{anchor:analytics_group_heatmap}",
+        "h2. Heatmap по группам сценариев",
+        "",
+        _render_analytics_group_heatmap_wiki(bundle),
+        "",
+        "{anchor:analytics_trend}",
+        "h2. Динамика по неделям",
+        "",
+        "h3. Pass rate и охват по неделям",
+        "",
+    ]
+    trend_rates_wiki_lines = ["|| Неделя || Pass rate % || Охват % ||"]
+    for item in bundle.get("trend_week_rates") or []:
+        trend_rates_wiki_lines.append(
+            "| "
+            + " | ".join(
+                _wiki_escape(str(x))
+                for x in (
+                    item.get("label"),
+                    f"{float(item.get('pass_rate', 0)):.1f}",
+                    f"{float(item.get('coverage', 0)):.1f}",
+                )
+            )
+            + " |"
+        )
+    if len(trend_rates_wiki_lines) == 1:
+        trend_rates_wiki_lines.append("_Нет данных_")
+    lines.extend(trend_rates_wiki_lines)
+    lines.extend(["", "h3. Общий score (по неделям)", ""])
+    week_cols = list(trend.get("week_columns") or [])
+    overall = trend.get("overall_by_week") or {}
+    cycle_keys_by_week = trend.get("cycle_keys_by_week") or {}
+    for col in week_cols:
+        lines.append(f"h4. {_wiki_escape(col)}")
+        ckw = cycle_keys_by_week.get(col)
+        if not isinstance(ckw, list):
+            ckw = []
+        block = _weekly_overall_zephyr_or_chart_wiki(
+            cast(list[dict[str, Any]], ckw),
+            overall.get(col, {}) or {},
+        )
+        lines.extend((block or "_Нет данных_").splitlines())
+        lines.append("")
+    lines.extend(
+        [
+            "h3. Score по сценариям (тренд)",
+            "",
+            _render_trend_scenario_table_wiki(trend),
+            "",
+            "h3. Заведённые дефекты (тренд)",
+            "",
+        ]
+    )
+    trend_defects = _defect_analytics_from_trend(trend)
+    if week_cols:
+        lines.extend(_weekly_defect_analytics_wiki(trend_defects, defect_meta, week_cols).splitlines())
+    lines.append("")
+
+    lines.extend(["{anchor:analytics_rolling}", "h2. Сводка за период", ""])
+    if rolling_matrix and rolling_matrix[1]:
+        lines.append(
+            _render_analytics_sections_wiki(
+                rolling_matrix[1],
+                rolling_matrix[2],
+                column_status_counts=rolling_matrix[5],
+                cycle_keys_by_label=rolling_matrix[7],
+                defect_keys=rolling_matrix[6],
+                defect_analytics=rolling_matrix[8],
+                defect_meta=defect_meta,
+                best_branch_column=rolling_best_branch,
+            )
+        )
+    else:
+        lines.append("_Нет данных за период_")
+        lines.append("")
+
+    lines.extend(
+        [
+            "{anchor:analytics_quality}",
+            "h2. Качество сигнала",
+            "",
+            _render_analytics_quality_wiki(bundle),
+            "",
+            "{anchor:analytics_failure_text}",
+            "h2. Тексты падений и build-log",
+            "",
+            _render_analytics_failure_text_wiki(bundle),
+            "",
+        ]
+    )
+
+    lines.extend(["{anchor:analytics_by_week}", "h2. По неделям", ""])
+    per_week_best = per_week_best or {}
+    for matrix in reversed(per_week_matrices):
+        week_start = matrix[0]
+        lines.append(f"h3. {_wiki_escape(_weekly_matrix_title_text(week_start, matrix[1]))}")
+        lines.append("")
+        lines.append(
+            _render_analytics_sections_wiki(
+                matrix[1],
+                matrix[2],
+                column_status_counts=matrix[5],
+                cycle_keys_by_label=matrix[7],
+                defect_keys=matrix[6],
+                defect_analytics=matrix[8],
+                defect_meta=defect_meta,
+                best_branch_column=per_week_best.get(week_start),
+            )
+        )
+    return "\n".join(lines)
+
+
+def write_weekly_analytics_reports(
+    output_dir: str,
+    *,
+    trend: dict[str, Any],
+    rolling_matrix: tuple[Any, ...],
+    per_week_matrices: list[tuple[Any, ...]],
+    defect_meta: dict[str, dict[str, str]] | None,
+    formats: set[str],
+    rolling_best_branch: dict[str, Any] | None = None,
+    per_week_best: dict[date | None, dict[str, Any]] | None = None,
+    report_data: dict[tuple[str, str], dict[str, Any]] | None = None,
+    case_steps_rows: list[list[str]] | None = None,
+    build_log_dir: str = "",
+) -> list[str]:
+    os.makedirs(output_dir, exist_ok=True)
+    extended_bundle = _build_extended_analytics_bundle(
+        rolling_matrix=rolling_matrix,
+        trend=trend,
+        rolling_best_branch=rolling_best_branch,
+        defect_meta=defect_meta,
+        report_data=report_data,
+        case_steps_rows=case_steps_rows,
+        build_log_dir=build_log_dir,
+    )
+    updated: list[str] = []
+    if "html" in formats:
+        html_path = os.path.join(output_dir, "weekly_analytics.html")
+        body = render_weekly_analytics_html(
+            trend=trend,
+            rolling_matrix=rolling_matrix,
+            per_week_matrices=per_week_matrices,
+            defect_meta=defect_meta,
+            rolling_best_branch=rolling_best_branch,
+            per_week_best=per_week_best,
+            extended_bundle=extended_bundle,
+        )
+        if _write_text_if_changed(html_path, body):
+            updated.append(html_path)
+    if "wiki" in formats:
+        wiki_path = os.path.join(output_dir, "weekly_analytics.confluence.txt")
+        body = render_weekly_analytics_wiki(
+            trend=trend,
+            rolling_matrix=rolling_matrix,
+            per_week_matrices=per_week_matrices,
+            defect_meta=defect_meta,
+            rolling_best_branch=rolling_best_branch,
+            per_week_best=per_week_best,
+            extended_bundle=extended_bundle,
+        )
+        if _write_text_if_changed(wiki_path, body):
+            updated.append(wiki_path)
+    return updated
 
 
 def _daily_sanitize_cycle_title(title: str) -> str:
@@ -8910,6 +10939,38 @@ def _daily_status_summary_lines(counts: dict[str, int]) -> list[str]:
     return lines
 
 
+def _daily_status_chart_html_block(counts: dict[str, int]) -> str:
+    """HTML: data table for Confluence Chart macro (replaces inline SVG pies)."""
+    ordered: list[tuple[str, str]] = [
+        ("passed", "Пройден"),
+        ("failed", "Не пройден"),
+        ("not_executed", "Не выполнен"),
+        ("blocked", "Заблокирован"),
+        ("other", "Прочее"),
+    ]
+    row_cells: list[str] = []
+    for key, label in ordered:
+        value = int(counts.get(key, 0))
+        if value <= 0:
+            continue
+        row_cells.append(
+            "<tr>"
+            f"<td>{html.escape(label)}</td>"
+            f"<td style='text-align:center;'>{value}</td>"
+            "</tr>"
+        )
+    if not row_cells:
+        return "<p class='pie-empty'>Нет данных по статусам</p>"
+    return (
+        "<div class='daily-chart-macro-block'>"
+        "<table class='weekly-chart-data'>"
+        "<thead><tr><th>Категория</th><th>Количество</th></tr></thead>"
+        "<tbody>"
+        + "".join(row_cells)
+        + "</tbody></table></div>"
+    )
+
+
 def _daily_status_chart_wiki_block(counts: dict[str, int]) -> str:
     """Confluence wiki: table + native Chart macro (pie)."""
     ordered: list[tuple[str, str]] = [
@@ -9120,6 +11181,17 @@ def _daily_zephyr_test_results_summary_storage_macro(
         '<ac:parameter ac:name="reportKey">TEST_RESULTS_SUMMARY_BY_STATUS</ac:parameter>'
         "</ac:structured-macro>"
     )
+
+
+def _weekly_overall_zephyr_or_chart_wiki(
+    cycle_objects: list[dict[str, Any]] | None,
+    counts: dict[str, int] | None,
+) -> str:
+    """Wiki fragment: live Zephyr Reporting macro when test runs are known, else Chart pie."""
+    z = _daily_zephyr_test_results_summary_storage_macro(list(cycle_objects or []))
+    if z:
+        return z
+    return _daily_status_chart_wiki_block(counts or {}) or ""
 
 
 def _daily_status_chart_storage_macro(counts: dict[str, int]) -> str:
@@ -10215,6 +12287,9 @@ def run_once(args: argparse.Namespace) -> int:
             publish_confluence_daily = bool(confluence_cfg and confluence_cfg.publish_daily)
             publish_confluence_weekly = bool(confluence_cfg and confluence_cfg.publish_weekly)
             publish_confluence_bugs = bool(confluence_cfg and confluence_cfg.publish_bugs)
+            publish_confluence_weekly_analytics = bool(
+                confluence_cfg and confluence_cfg.publish_weekly_analytics
+            )
             confluence_publish_roots: ConfluencePublishRoots | None = None
             confluence_week_parents: ConfluenceWeekParentCache | None = None
             need_cycles_cases_data = (
@@ -10633,6 +12708,7 @@ def run_once(args: argparse.Namespace) -> int:
                 args.cycle_progress_output
                 or args.weekly_cycle_matrix_output
                 or args.export_weekly_readable
+                or _export_weekly_analytics_enabled(args)
             )
             # One aggregation for readable/matrix paths, then rolling filter **before** writing
             # daily/weekly artifacts so HTML/wiki/Confluence targets match the same date window.
@@ -11049,6 +13125,101 @@ def run_once(args: argparse.Namespace) -> int:
                     bugs_rollup_dir,
                     list_on_disk=_list_bugs_rollup_html_paths,
                 )
+            weekly_analytics_paths: list[str] = []
+            if _export_weekly_analytics_enabled(args):
+                analytics_started_at = time.perf_counter()
+                if not weekly_cycle_matrices:
+                    weekly_cycle_matrices = _weekly_cycle_matrix_data_all(report_data_for_matrix)
+                if not weekly_cycle_matrices:
+                    print("Skipping weekly analytics: no weekly matrix data.")
+                else:
+                    selected_analytics_formats = set(
+                        args.weekly_analytics_format or ["html", "wiki"]
+                    )
+                    jira_analytics_base = _resolve_weekly_jira_metadata_base(args.base_url)
+                    jira_analytics_headers = (
+                        _jira_bug_metadata_auth_headers(headers) or headers
+                    )
+                    analytics_defect_keys: list[str] = []
+                    seen_analytics_keys: set[str] = set()
+                    for matrix_entry in weekly_cycle_matrices:
+                        analytics_payload = matrix_entry[8] or {}
+                        for key in analytics_payload.get("keys_ordered", []) or []:
+                            if key not in seen_analytics_keys:
+                                seen_analytics_keys.add(key)
+                                analytics_defect_keys.append(key)
+                        for key in matrix_entry[7] or []:
+                            k = str(key).strip()
+                            if k and k not in seen_analytics_keys:
+                                seen_analytics_keys.add(k)
+                                analytics_defect_keys.append(k)
+                    rolling_matrix = _weekly_cycle_matrix_data_rolling(report_data_for_matrix)
+                    trend_data = _weekly_analytics_trend_data(weekly_cycle_matrices)
+                    analytics_defect_meta = _fetch_jira_bug_metadata(
+                        analytics_defect_keys,
+                        base_url=jira_analytics_base,
+                        auth_headers=jira_analytics_headers,
+                    )
+                    analytics_abtest = (
+                        abtest_issues
+                        if abtest_issues is not None
+                        else fetch_autofleet_abtest_candidates(
+                            base_url=jira_analytics_base,
+                            auth_headers=jira_analytics_headers,
+                        )
+                    )
+                    analytics_schedule = _build_best_branch_schedule_from_jira(analytics_abtest)
+                    rolling_best_name = _weekly_best_branch_name_for_report_week(
+                        analytics_schedule,
+                        rolling_matrix[0],
+                        base_url=jira_analytics_base,
+                        auth_headers=jira_analytics_headers,
+                        abtest_issues=analytics_abtest,
+                    )
+                    rolling_best_column = _weekly_best_branch_column_context_for_week(
+                        rolling_matrix,
+                        report_data=report_data_for_matrix,
+                        best_branch_name=rolling_best_name,
+                        report_week_start=rolling_matrix[0],
+                    )
+                    per_week_best_columns: dict[date | None, dict[str, Any]] = {}
+                    for matrix_entry in weekly_cycle_matrices:
+                        week_start_key = matrix_entry[0]
+                        best_name = _weekly_best_branch_name_for_report_week(
+                            analytics_schedule,
+                            week_start_key,
+                            base_url=jira_analytics_base,
+                            auth_headers=jira_analytics_headers,
+                            abtest_issues=analytics_abtest,
+                        )
+                        per_week_best_columns[week_start_key] = (
+                            _weekly_best_branch_column_context_for_week(
+                                matrix_entry,
+                                report_data=report_data_for_matrix,
+                                best_branch_name=best_name,
+                                report_week_start=week_start_key,
+                            )
+                        )
+                    weekly_analytics_paths = write_weekly_analytics_reports(
+                        args.weekly_analytics_dir,
+                        trend=trend_data,
+                        rolling_matrix=rolling_matrix,
+                        per_week_matrices=weekly_cycle_matrices,
+                        defect_meta=analytics_defect_meta,
+                        formats=selected_analytics_formats,
+                        rolling_best_branch=rolling_best_column,
+                        per_week_best=per_week_best_columns,
+                        report_data=report_data_for_matrix,
+                        case_steps_rows=case_steps_rows,
+                        build_log_dir=args.build_log_report_dir,
+                    )
+                    timings.record(
+                        "write weekly analytics reports",
+                        time.perf_counter() - analytics_started_at,
+                        f"files={len(weekly_analytics_paths)}",
+                    )
+            if build_log_html_publish_paths and not args.export_weekly_readable:
+                weekly_html_publish_paths.extend(build_log_html_publish_paths)
             if confluence_cfg and publish_confluence_daily:
                 if not args.export_daily_readable:
                     print(
@@ -11218,6 +13389,30 @@ def run_once(args: argparse.Namespace) -> int:
                             "Confluence bugs publish skipped: no build-log or bugs rollup "
                             "HTML files found on disk."
                         )
+            if confluence_cfg and publish_confluence_weekly_analytics:
+                analytics_html = os.path.join(args.weekly_analytics_dir, "weekly_analytics.html")
+                if not _export_weekly_analytics_enabled(args):
+                    print(
+                        "Confluence weekly analytics publish skipped: "
+                        "--export-weekly-analytics not enabled."
+                    )
+                elif not os.path.isfile(analytics_html):
+                    print(
+                        "Confluence weekly analytics publish skipped: "
+                        f"missing {analytics_html}"
+                    )
+                else:
+                    with timed_step(
+                        timings,
+                        "publish weekly analytics to Confluence",
+                        f"file={analytics_html}",
+                    ):
+                        outcomes = publish_reports_to_confluence(
+                            [analytics_html], confluence_cfg
+                        )
+                    print("Confluence weekly analytics publish:")
+                    for line in outcomes:
+                        print(f"- {line}")
             print(f"Saved summary CSV: {args.output}")
             print(f"Saved per-folder CSV directory: {args.per_folder_dir}")
             if args.export_cycles_cases:
@@ -11259,6 +13454,9 @@ def run_once(args: argparse.Namespace) -> int:
             if args.export_weekly_readable:
                 print(f"Saved weekly readable reports: {args.weekly_readable_dir}")
                 print(f"Weekly readable files updated: {len(weekly_readable_paths)}")
+            if _export_weekly_analytics_enabled(args):
+                print(f"Saved weekly analytics reports: {args.weekly_analytics_dir}")
+                print(f"Weekly analytics files updated: {len(weekly_analytics_paths)}")
             print(f"Processed folders: {len(folder_rows)}")
             print(f"Fetched executions: {total_executions}")
             if total_skipped:
