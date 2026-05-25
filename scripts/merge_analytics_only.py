@@ -36,16 +36,17 @@ def main() -> None:
         1,
     )
 
-    # 2) Insert render + page writers before _daily_sanitize_cycle_title
-    render_block = extract_block(
-        source,
-        "def _render_analytics_sections_html(",
-        "def _daily_sanitize_cycle_title(",
-    )
-    anchor2 = "def _daily_sanitize_cycle_title("
-    if anchor2 not in target:
-        raise SystemExit("anchor for render insert not found")
-    target = target.replace(anchor2, render_block + anchor2, 1)
+    # 2) Insert shared analytics section renderers before render_weekly_html_report
+    if "def _render_analytics_sections_html(" not in target:
+        render_block = extract_block(
+            source,
+            "def _render_analytics_sections_html(",
+            "def render_weekly_html_report(",
+        )
+        anchor2 = "def render_weekly_html_report("
+        if anchor2 not in target:
+            raise SystemExit("anchor for render insert not found")
+        target = target.replace(anchor2, render_block + anchor2, 1)
 
     # 3) ConfluencePublishConfig
     target = target.replace(

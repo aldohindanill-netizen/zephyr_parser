@@ -8607,6 +8607,307 @@ def _list_bugs_rollup_html_paths(output_dir: str) -> list[str]:
     return [path] if os.path.isfile(path) else []
 
 
+def _render_analytics_sections_html(
+    weekday_labels: list[str],
+    rows: list[list[str]],
+    cell_all_not_executed: list[list[bool]] | None,
+    cell_all_blocked: list[list[bool]] | None,
+    *,
+    column_status_counts: dict[str, dict[str, int]] | None = None,
+    defect_keys: list[str] | None = None,
+    cycle_keys_by_label: dict[str, list[dict[str, Any]]] | None = None,
+    defect_analytics: dict[str, Any] | None = None,
+    defect_meta: dict[str, dict[str, str]] | None = None,
+    best_branch_column: dict[str, Any] | None = None,
+    section_tag: str = "h3",
+    defect_column_labels: list[str] | None = None,
+    defect_matrix_title: str = "билд",
+) -> str:
+    labels = list(weekday_labels)
+    best_column = best_branch_column or {}
+    best_title = str(best_column.get("title") or "").strip()
+    has_best_column = bool(best_title)
+    data_labels = ([best_title] if has_best_column else []) + labels
+    best_scenario_map = (
+        best_column.get("scenario_passed_by_row")
+        if isinstance(best_column.get("scenario_passed_by_row"), dict)
+        else {}
+    )
+    best_overall_counts = (
+        best_column.get("overall_counts")
+        if isinstance(best_column.get("overall_counts"), dict)
+        else {}
+    )
+    best_cycle_keys = best_column.get("cycle_keys")
+    if not isinstance(best_cycle_keys, list):
+        best_cycle_keys = []
+    header_cells = ["<th>Тестовый цикл</th>", "<th>Всего кейсов</th>"]
+    header_cells.extend(f"<th>{html.escape(label)}</th>" for label in data_labels)
+    sections: list[str] = []
+
+    sections.append(
+        f"<{section_tag} id='overall-score'><strong>Общий score</strong></{section_tag}>"
+    )
+    counts_by_label = column_status_counts or {}
+    cycle_keys_map = cycle_keys_by_label or {}
+    if data_labels:
+        sections.append("<div class='weekly-overall-grid'>")
+        if has_best_column:
+            cycle_keys_attr = ""
+            if best_cycle_keys:
+                cycle_keys_attr = (
+                    " data-zephyr-cycle-keys=\""
+                    + html.escape(json.dumps(best_cycle_keys, ensure_ascii=True), quote=True)
+                    + "\""
+                )
+            sections.append(
+                f"<div class='weekly-overall-cell'{cycle_keys_attr}>"
+                + f"<h4>{html.escape(best_title)}</h4>"
+                + f"{_daily_status_pie_svg(best_overall_counts)}"
+                + "</div>"
+            )
+        for label in labels:
+            counts = counts_by_label.get(label, {}) or {}
+            cycle_keys = cycle_keys_map.get(label) or []
+            cycle_keys_attr = ""
+            if cycle_keys:
+                cycle_keys_attr = (
+                    " data-zephyr-cycle-keys=\""
+                    + html.escape(json.dumps(cycle_keys, ensure_ascii=True), quote=True)
+                    + "\""
+                )
+            sections.append(
+                f"<div class='weekly-overall-cell'{cycle_keys_attr}>"
+                f"<h4>{html.escape(str(label))}</h4>"
+                f"{_daily_status_pie_svg(counts)}"
+                "</div>"
+            )
+        sections.append("</div>")
+    else:
+        sections.append("<p class='pie-empty'>Нет данных по статусам</p>")
+
+    sections.append(
+        f"<{section_tag} id='scenario-score'><strong>Score по сценариям</strong></{section_tag}>"
+    )
+    n_builds = len(data_labels)
+    if n_builds > 0:
+        equal_pct = 100.0 / (n_builds + 2)
+        build_pct = equal_pct * 0.7
+        remain_pct = 100.0 - build_pct * n_builds
+        cycle_pct = remain_pct * 0.78
+        total_pct = remain_pct - cycle_pct
+        col_tags = [
+            f"<col style='width:{cycle_pct:.2f}%'>",
+            f"<col style='width:{total_pct:.2f}%'>",
+        ]
+        col_tags.extend(f"<col style='width:{build_pct:.2f}%'>" for _ in range(n_builds))
+        colgroup_html = "<colgroup>" + "".join(col_tags) + "</colgroup>"
+    else:
+        colgroup_html = ""
+    sections.extend(
+        ["<table>", colgroup_html, "<thead><tr>" + "".join(header_cells) + "</tr></thead><tbody>"]
+    )
+    for row_idx, row in enumerate(rows):
+        if str(row[0]).startswith("Итого:"):
+            total_cells = [
+                f"<td style='font-weight:700;background:#ffffff;color:#1f2328;'>{html.escape(row[0])}</td>",
+                (
+                    "<td class='total-cases-cell' "
+                    "style='font-weight:700;background:#ffffff;color:#1f2328;text-align:center;'>"
+                    f"{html.escape(row[1])}</td>"
+                ),
+            ]
+            data_values: list[str] = []
+            if has_best_column:
+                data_values.append(str(best_scenario_map.get(str(row[0] or "").strip(), 0)))
+            data_values.extend(
+                str(row[2 + idx] if 2 + idx < len(row) else "0") for idx in range(len(labels))
+            )
+            total_cells.extend(
+                (
+                    "<td style='font-weight:700;background:#ffffff;color:#1f2328;text-align:center;'>"
+                    f"{html.escape(value)}</td>"
+                )
+                for value in data_values
+            )
+            sections.append("<tr class='group-total-row'>" + "".join(total_cells) + "</tr>")
+            continue
+        passed_cells: list[str] = []
+        ne_row = (
+            cell_all_not_executed[row_idx]
+            if cell_all_not_executed and row_idx < len(cell_all_not_executed)
+            else []
+        )
+        blocked_row = (
+            cell_all_blocked[row_idx]
+            if cell_all_blocked and row_idx < len(cell_all_blocked)
+            else []
+        )
+        for idx in range(len(data_labels)):
+            if has_best_column and idx == 0:
+                passed_value = int(best_scenario_map.get(str(row[0] or "").strip(), 0))
+                all_ne = False
+                all_blocked = False
+            else:
+                regular_idx = idx - (1 if has_best_column else 0)
+                passed_value = int(row[2 + regular_idx]) if 2 + regular_idx < len(row) else 0
+                all_ne = bool(ne_row[regular_idx]) if regular_idx < len(ne_row) else False
+                all_blocked = (
+                    bool(blocked_row[regular_idx]) if regular_idx < len(blocked_row) else False
+                )
+            passed_cells.append(
+                "<td class='passed-count-cell' "
+                f"style='background:{_passed_count_color(passed_value, all_not_executed=all_ne, all_blocked=all_blocked)};"
+                f"color:{_passed_count_text_color(passed_value, all_not_executed=all_ne, all_blocked=all_blocked)};"
+                "text-align:center;'>"
+                f"{passed_value}</td>"
+            )
+        sections.append(
+            "<tr>"
+            f"<td>{html.escape(row[0])}</td>"
+            f"<td class='total-cases-cell' style='text-align:center;'>{html.escape(row[1])}</td>"
+            + "".join(passed_cells)
+            + "</tr>"
+        )
+    if rows:
+        detail_rows = [r for r in rows if not str(r[0]).startswith("Итого:")]
+        total_cases_grand = sum(int(r[1]) for r in detail_rows if len(r) > 1)
+        passed_grand: list[int] = []
+        if has_best_column:
+            passed_grand.append(
+                sum(int(best_scenario_map.get(str(r[0] or "").strip(), 0)) for r in detail_rows)
+            )
+        passed_grand.extend(
+            sum(int(r[2 + idx]) for r in detail_rows if 2 + idx < len(r))
+            for idx in range(len(labels))
+        )
+        grand_cells = [
+            "<td style='font-weight:700;background:#eef1f5;color:#1f2328;'>Итого</td>",
+            (
+                "<td class='total-cases-cell' "
+                "style='font-weight:700;background:#eef1f5;color:#1f2328;text-align:center;'>"
+                f"{total_cases_grand}</td>"
+            ),
+        ]
+        grand_cells.extend(
+            (
+                "<td style='font-weight:700;background:#eef1f5;color:#1f2328;text-align:center;'>"
+                f"{value}</td>"
+            )
+            for value in passed_grand
+        )
+        sections.append("<tr class='grand-total-row'>" + "".join(grand_cells) + "</tr>")
+    sections.append("</tbody></table>")
+
+    sections.append(f"<{section_tag} id='defects'><strong>Заведённые дефекты</strong></{section_tag}>")
+    merged_analytics = _coalesce_weekly_defect_analytics(defect_analytics, defect_keys)
+    defect_cols = defect_column_labels if defect_column_labels is not None else labels
+    if merged_analytics and (merged_analytics.get("keys_ordered") or []):
+        sections.append(_weekly_defect_analytics_html(merged_analytics, defect_meta, defect_cols))
+    else:
+        sections.append(_weekly_defects_html_block(defect_keys or []))
+    return "\n".join(sections)
+
+
+def _render_analytics_sections_wiki(
+    weekday_labels: list[str],
+    rows: list[list[str]],
+    *,
+    column_status_counts: dict[str, dict[str, int]] | None = None,
+    defect_keys: list[str] | None = None,
+    defect_analytics: dict[str, Any] | None = None,
+    defect_meta: dict[str, dict[str, str]] | None = None,
+    best_branch_column: dict[str, Any] | None = None,
+    defect_column_labels: list[str] | None = None,
+) -> str:
+    labels = list(weekday_labels)
+    best_column = best_branch_column or {}
+    best_title = str(best_column.get("title") or "").strip()
+    has_best_column = bool(best_title)
+    data_labels = ([best_title] if has_best_column else []) + labels
+    best_scenario_map = (
+        best_column.get("scenario_passed_by_row")
+        if isinstance(best_column.get("scenario_passed_by_row"), dict)
+        else {}
+    )
+    best_overall_counts = (
+        best_column.get("overall_counts")
+        if isinstance(best_column.get("overall_counts"), dict)
+        else {}
+    )
+    lines: list[str] = []
+    lines.append("{anchor:overall_score}")
+    lines.append("h3. *Общий score*")
+    lines.append("")
+    counts_by_label = column_status_counts or {}
+    if data_labels:
+        if has_best_column:
+            lines.append(f"h4. {_wiki_escape(best_title)}")
+            best_chart = _daily_status_chart_wiki_block(best_overall_counts)
+            lines.extend((best_chart or "_Нет данных по статусам_").splitlines())
+            lines.append("")
+        for label in labels:
+            counts = counts_by_label.get(label, {}) or {}
+            lines.append(f"h4. {_wiki_escape(str(label))}")
+            chart_block = _daily_status_chart_wiki_block(counts)
+            lines.extend((chart_block or "_Нет данных по статусам_").splitlines())
+            lines.append("")
+    else:
+        lines.append("_Нет данных по статусам_")
+        lines.append("")
+
+    lines.append("{anchor:scenario_score}")
+    lines.append("h3. *Score по сценариям*")
+    lines.append("")
+    header_cells = ["Тестовый цикл", "Всего кейсов"]
+    header_cells.extend(_wiki_escape(label) for label in data_labels)
+    lines.append("|| " + " || ".join(header_cells) + " ||")
+    for row in rows:
+        if str(row[0]).startswith("Итого:"):
+            row_values = [f"*{row[0]}*", f"*{row[1]}*"]
+            if has_best_column:
+                row_values.append(f"*{best_scenario_map.get(str(row[0] or '').strip(), 0)}*")
+            for idx in range(len(labels)):
+                row_values.append(f"*{row[2 + idx] if 2 + idx < len(row) else '0'}*")
+            lines.append("| " + " | ".join(_wiki_escape(str(v)) for v in row_values) + " |")
+            continue
+        row_values = [row[0], row[1]]
+        if has_best_column:
+            row_values.append(str(best_scenario_map.get(str(row[0] or "").strip(), 0)))
+        for idx in range(len(labels)):
+            row_values.append(row[2 + idx] if 2 + idx < len(row) else "0")
+        lines.append("| " + " | ".join(_wiki_escape(str(v)) for v in row_values) + " |")
+    if rows:
+        detail_rows = [r for r in rows if not str(r[0]).startswith("Итого:")]
+        total_cases_grand = sum(int(r[1]) for r in detail_rows if len(r) > 1)
+        passed_grand: list[int] = []
+        if has_best_column:
+            passed_grand.append(
+                sum(int(best_scenario_map.get(str(r[0] or "").strip(), 0)) for r in detail_rows)
+            )
+        passed_grand.extend(
+            sum(int(r[2 + idx]) for r in detail_rows if 2 + idx < len(r))
+            for idx in range(len(labels))
+        )
+        grand_values = ["*Итого*", f"*{total_cases_grand}*"] + [f"*{v}*" for v in passed_grand]
+        lines.append("| " + " | ".join(_wiki_escape(str(v)) for v in grand_values) + " |")
+    lines.append("")
+
+    lines.append("{anchor:defects}")
+    lines.append("h3. *Заведённые дефекты*")
+    lines.append("")
+    merged_analytics = _coalesce_weekly_defect_analytics(defect_analytics, defect_keys)
+    defect_cols = defect_column_labels if defect_column_labels is not None else labels
+    if merged_analytics and (merged_analytics.get("keys_ordered") or []):
+        defects_block = _weekly_defect_analytics_wiki(merged_analytics, defect_meta, defect_cols)
+    else:
+        defects_block = _weekly_defects_wiki_block(defect_keys or [])
+    if defects_block:
+        lines.extend(defects_block.splitlines())
+    lines.append("")
+    return "\n".join(lines)
+
+
 def render_weekly_html_report(
     week_start: date | None,
     weekday_labels: list[str],
@@ -9976,326 +10277,6 @@ def _defect_analytics_from_trend(trend: dict[str, Any]) -> dict[str, Any]:
         "bug_builds_count": bug_builds_count,
         "hot_bugs": [],
     }
-
-
-def _render_analytics_sections_html(
-    weekday_labels: list[str],
-    rows: list[list[str]],
-    cell_all_not_executed: list[list[bool]] | None,
-    cell_all_blocked: list[list[bool]] | None,
-    *,
-    column_status_counts: dict[str, dict[str, int]] | None = None,
-    defect_keys: list[str] | None = None,
-    cycle_keys_by_label: dict[str, list[dict[str, Any]]] | None = None,
-    defect_analytics: dict[str, Any] | None = None,
-    defect_meta: dict[str, dict[str, str]] | None = None,
-    best_branch_column: dict[str, Any] | None = None,
-    section_tag: str = "h3",
-    defect_column_labels: list[str] | None = None,
-    defect_matrix_title: str = "билд",
-) -> str:
-    labels = list(weekday_labels)
-    best_column = best_branch_column or {}
-    best_title = str(best_column.get("title") or "").strip()
-    has_best_column = bool(best_title)
-    data_labels = ([best_title] if has_best_column else []) + labels
-    best_scenario_map = (
-        best_column.get("scenario_passed_by_row")
-        if isinstance(best_column.get("scenario_passed_by_row"), dict)
-        else {}
-    )
-    best_overall_counts = (
-        best_column.get("overall_counts")
-        if isinstance(best_column.get("overall_counts"), dict)
-        else {}
-    )
-    best_cycle_keys = best_column.get("cycle_keys")
-    if not isinstance(best_cycle_keys, list):
-        best_cycle_keys = []
-    header_cells = ["<th>Тестовый цикл</th>", "<th>Всего кейсов</th>"]
-    header_cells.extend(f"<th>{html.escape(label)}</th>" for label in data_labels)
-    sections: list[str] = []
-
-    sections.append(
-        f"<{section_tag} id='overall-score'><strong>Общий score</strong></{section_tag}>"
-    )
-    counts_by_label = column_status_counts or {}
-    cycle_keys_map = cycle_keys_by_label or {}
-    if data_labels:
-        sections.append("<div class='weekly-overall-grid'>")
-        if has_best_column:
-            cycle_keys_attr = ""
-            if best_cycle_keys:
-                cycle_keys_attr = (
-                    " data-zephyr-cycle-keys=\""
-                    + html.escape(json.dumps(best_cycle_keys, ensure_ascii=True), quote=True)
-                    + "\""
-                )
-            sections.append(
-                f"<div class='weekly-overall-cell'{cycle_keys_attr}>"
-                + f"<h4>{html.escape(best_title)}</h4>"
-                + f"{_daily_status_pie_svg(best_overall_counts)}"
-                + "</div>"
-            )
-        for label in labels:
-            counts = counts_by_label.get(label, {}) or {}
-            cycle_keys = cycle_keys_map.get(label) or []
-            cycle_keys_attr = ""
-            if cycle_keys:
-                cycle_keys_attr = (
-                    " data-zephyr-cycle-keys=\""
-                    + html.escape(json.dumps(cycle_keys, ensure_ascii=True), quote=True)
-                    + "\""
-                )
-            sections.append(
-                f"<div class='weekly-overall-cell'{cycle_keys_attr}>"
-                f"<h4>{html.escape(str(label))}</h4>"
-                f"{_daily_status_pie_svg(counts)}"
-                "</div>"
-            )
-        sections.append("</div>")
-    else:
-        sections.append("<p class='pie-empty'>Нет данных по статусам</p>")
-
-    sections.append(
-        f"<{section_tag} id='scenario-score'><strong>Score по сценариям</strong></{section_tag}>"
-    )
-    n_builds = len(data_labels)
-    if n_builds > 0:
-        equal_pct = 100.0 / (n_builds + 2)
-        build_pct = equal_pct * 0.7
-        remain_pct = 100.0 - build_pct * n_builds
-        cycle_pct = remain_pct * 0.78
-        total_pct = remain_pct - cycle_pct
-        col_tags = [
-            f"<col style='width:{cycle_pct:.2f}%'>",
-            f"<col style='width:{total_pct:.2f}%'>",
-        ]
-        col_tags.extend(f"<col style='width:{build_pct:.2f}%'>" for _ in range(n_builds))
-        colgroup_html = "<colgroup>" + "".join(col_tags) + "</colgroup>"
-    else:
-        colgroup_html = ""
-    sections.append("<div class='table-scroll-wrap'>")
-    sections.extend(
-        [
-            "<table class='analytics-wide-table analytics-sticky-2cols'>",
-            colgroup_html,
-            "<thead><tr>" + "".join(header_cells) + "</tr></thead><tbody>",
-        ]
-    )
-    for row_idx, row in enumerate(rows):
-        if str(row[0]).startswith("Итого:"):
-            total_cells = [
-                f"<td style='font-weight:700;background:#ffffff;color:#1f2328;'>{html.escape(row[0])}</td>",
-                (
-                    "<td class='total-cases-cell' "
-                    "style='font-weight:700;background:#ffffff;color:#1f2328;text-align:center;'>"
-                    f"{html.escape(row[1])}</td>"
-                ),
-            ]
-            data_values: list[str] = []
-            if has_best_column:
-                data_values.append(str(best_scenario_map.get(str(row[0] or "").strip(), 0)))
-            data_values.extend(
-                str(row[2 + idx] if 2 + idx < len(row) else "0") for idx in range(len(labels))
-            )
-            total_cells.extend(
-                (
-                    "<td style='font-weight:700;background:#ffffff;color:#1f2328;text-align:center;'>"
-                    f"{html.escape(value)}</td>"
-                )
-                for value in data_values
-            )
-            sections.append("<tr class='group-total-row'>" + "".join(total_cells) + "</tr>")
-            continue
-        passed_cells: list[str] = []
-        ne_row = (
-            cell_all_not_executed[row_idx]
-            if cell_all_not_executed and row_idx < len(cell_all_not_executed)
-            else []
-        )
-        blocked_row = (
-            cell_all_blocked[row_idx]
-            if cell_all_blocked and row_idx < len(cell_all_blocked)
-            else []
-        )
-        for idx in range(len(data_labels)):
-            if has_best_column and idx == 0:
-                passed_value = int(best_scenario_map.get(str(row[0] or "").strip(), 0))
-                all_ne = False
-                all_blocked = False
-            else:
-                regular_idx = idx - (1 if has_best_column else 0)
-                passed_value = int(row[2 + regular_idx]) if 2 + regular_idx < len(row) else 0
-                all_ne = bool(ne_row[regular_idx]) if regular_idx < len(ne_row) else False
-                all_blocked = (
-                    bool(blocked_row[regular_idx]) if regular_idx < len(blocked_row) else False
-                )
-            passed_cells.append(
-                "<td class='passed-count-cell' "
-                f"style='background:{_passed_count_color(passed_value, all_not_executed=all_ne, all_blocked=all_blocked)};"
-                f"color:{_passed_count_text_color(passed_value, all_not_executed=all_ne, all_blocked=all_blocked)};"
-                "text-align:center;'>"
-                f"{passed_value}</td>"
-            )
-        sections.append(
-            "<tr>"
-            f"<td>{html.escape(row[0])}</td>"
-            f"<td class='total-cases-cell' style='text-align:center;'>{html.escape(row[1])}</td>"
-            + "".join(passed_cells)
-            + "</tr>"
-        )
-    if rows:
-        detail_rows = [r for r in rows if not str(r[0]).startswith("Итого:")]
-        total_cases_grand = sum(int(r[1]) for r in detail_rows if len(r) > 1)
-        passed_grand: list[int] = []
-        if has_best_column:
-            passed_grand.append(
-                sum(int(best_scenario_map.get(str(r[0] or "").strip(), 0)) for r in detail_rows)
-            )
-        passed_grand.extend(
-            sum(int(r[2 + idx]) for r in detail_rows if 2 + idx < len(r))
-            for idx in range(len(labels))
-        )
-        grand_cells = [
-            "<td style='font-weight:700;background:#eef1f5;color:#1f2328;'>Итого</td>",
-            (
-                "<td class='total-cases-cell' "
-                "style='font-weight:700;background:#eef1f5;color:#1f2328;text-align:center;'>"
-                f"{total_cases_grand}</td>"
-            ),
-        ]
-        grand_cells.extend(
-            (
-                "<td style='font-weight:700;background:#eef1f5;color:#1f2328;text-align:center;'>"
-                f"{value}</td>"
-            )
-            for value in passed_grand
-        )
-        sections.append("<tr class='grand-total-row'>" + "".join(grand_cells) + "</tr>")
-    sections.append("</tbody></table></div>")
-
-    sections.append(f"<{section_tag} id='defects'><strong>Заведённые дефекты</strong></{section_tag}>")
-    merged_analytics = _coalesce_weekly_defect_analytics(defect_analytics, defect_keys)
-    defect_cols = defect_column_labels if defect_column_labels is not None else labels
-    if merged_analytics and (merged_analytics.get("keys_ordered") or []):
-        sections.append(_weekly_defect_analytics_html(merged_analytics, defect_meta, defect_cols))
-    else:
-        sections.append(_weekly_defects_html_block(defect_keys or []))
-    return "\n".join(sections)
-
-
-def _render_analytics_sections_wiki(
-    weekday_labels: list[str],
-    rows: list[list[str]],
-    *,
-    column_status_counts: dict[str, dict[str, int]] | None = None,
-    cycle_keys_by_label: dict[str, list[dict[str, Any]]] | None = None,
-    defect_keys: list[str] | None = None,
-    defect_analytics: dict[str, Any] | None = None,
-    defect_meta: dict[str, dict[str, str]] | None = None,
-    best_branch_column: dict[str, Any] | None = None,
-    defect_column_labels: list[str] | None = None,
-) -> str:
-    labels = list(weekday_labels)
-    best_column = best_branch_column or {}
-    best_title = str(best_column.get("title") or "").strip()
-    has_best_column = bool(best_title)
-    data_labels = ([best_title] if has_best_column else []) + labels
-    best_scenario_map = (
-        best_column.get("scenario_passed_by_row")
-        if isinstance(best_column.get("scenario_passed_by_row"), dict)
-        else {}
-    )
-    best_overall_counts = (
-        best_column.get("overall_counts")
-        if isinstance(best_column.get("overall_counts"), dict)
-        else {}
-    )
-    best_cycle_keys = best_column.get("cycle_keys")
-    if not isinstance(best_cycle_keys, list):
-        best_cycle_keys = []
-    lines: list[str] = []
-    lines.append("{anchor:overall_score}")
-    lines.append("h3. *Общий score*")
-    lines.append("")
-    counts_by_label = column_status_counts or {}
-    cycle_keys_map = cycle_keys_by_label or {}
-    if data_labels:
-        if has_best_column:
-            lines.append(f"h4. {_wiki_escape(best_title)}")
-            best_block = _weekly_overall_zephyr_or_chart_wiki(
-                cast(list[dict[str, Any]], best_cycle_keys),
-                best_overall_counts,
-            )
-            lines.extend((best_block or "_Нет данных по статусам_").splitlines())
-            lines.append("")
-        for label in labels:
-            counts = counts_by_label.get(label, {}) or {}
-            lines.append(f"h4. {_wiki_escape(str(label))}")
-            c_objs = cycle_keys_map.get(label)
-            if not isinstance(c_objs, list):
-                c_objs = []
-            chart_block = _weekly_overall_zephyr_or_chart_wiki(
-                cast(list[dict[str, Any]], c_objs),
-                counts,
-            )
-            lines.extend((chart_block or "_Нет данных по статусам_").splitlines())
-            lines.append("")
-    else:
-        lines.append("_Нет данных по статусам_")
-        lines.append("")
-
-    lines.append("{anchor:scenario_score}")
-    lines.append("h3. *Score по сценариям*")
-    lines.append("")
-    header_cells = ["Тестовый цикл", "Всего кейсов"]
-    header_cells.extend(_wiki_escape(label) for label in data_labels)
-    lines.append("|| " + " || ".join(header_cells) + " ||")
-    for row in rows:
-        if str(row[0]).startswith("Итого:"):
-            row_values = [f"*{row[0]}*", f"*{row[1]}*"]
-            if has_best_column:
-                row_values.append(f"*{best_scenario_map.get(str(row[0] or '').strip(), 0)}*")
-            for idx in range(len(labels)):
-                row_values.append(f"*{row[2 + idx] if 2 + idx < len(row) else '0'}*")
-            lines.append("| " + " | ".join(_wiki_escape(str(v)) for v in row_values) + " |")
-            continue
-        row_values = [row[0], row[1]]
-        if has_best_column:
-            row_values.append(str(best_scenario_map.get(str(row[0] or "").strip(), 0)))
-        for idx in range(len(labels)):
-            row_values.append(row[2 + idx] if 2 + idx < len(row) else "0")
-        lines.append("| " + " | ".join(_wiki_escape(str(v)) for v in row_values) + " |")
-    if rows:
-        detail_rows = [r for r in rows if not str(r[0]).startswith("Итого:")]
-        total_cases_grand = sum(int(r[1]) for r in detail_rows if len(r) > 1)
-        passed_grand: list[int] = []
-        if has_best_column:
-            passed_grand.append(
-                sum(int(best_scenario_map.get(str(r[0] or "").strip(), 0)) for r in detail_rows)
-            )
-        passed_grand.extend(
-            sum(int(r[2 + idx]) for r in detail_rows if 2 + idx < len(r))
-            for idx in range(len(labels))
-        )
-        grand_values = ["*Итого*", f"*{total_cases_grand}*"] + [f"*{v}*" for v in passed_grand]
-        lines.append("| " + " | ".join(_wiki_escape(str(v)) for v in grand_values) + " |")
-    lines.append("")
-
-    lines.append("{anchor:defects}")
-    lines.append("h3. *Заведённые дефекты*")
-    lines.append("")
-    merged_analytics = _coalesce_weekly_defect_analytics(defect_analytics, defect_keys)
-    defect_cols = defect_column_labels if defect_column_labels is not None else labels
-    if merged_analytics and (merged_analytics.get("keys_ordered") or []):
-        defects_block = _weekly_defect_analytics_wiki(merged_analytics, defect_meta, defect_cols)
-    else:
-        defects_block = _weekly_defects_wiki_block(defect_keys or [])
-    if defects_block:
-        lines.extend(defects_block.splitlines())
-    lines.append("")
-    return "\n".join(lines)
 
 
 def _render_trend_scenario_table_html(trend: dict[str, Any]) -> str:
