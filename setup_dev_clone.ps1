@@ -70,7 +70,12 @@ if (Test-Path -LiteralPath (Join-Path $TargetPath ".git")) {
         if ($Branch) {
             git checkout $Branch
         }
-        git pull --ff-only
+        $tracking = "origin/main"
+        if ($Branch) {
+            git fetch origin $Branch 2>$null
+            $tracking = "origin/$Branch"
+        }
+        git reset --hard $tracking
     }
     finally {
         Pop-Location
