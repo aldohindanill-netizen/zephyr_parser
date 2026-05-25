@@ -1247,6 +1247,11 @@ def request_json(
             raise RuntimeError(
                 f"HTTP {exc.code} while requesting '{url}' [{method_upper}]. Response: {body}"
             ) from exc
+        except json.JSONDecodeError as exc:
+            preview = raw.decode("utf-8", errors="replace")[:300]
+            raise RuntimeError(
+                f"Non-JSON response from '{url}' ({len(raw)} bytes): {preview!r}"
+            ) from exc
         except urllib.error.URLError as exc:
             if method_upper == "GET" and attempt < retries:
                 delay = 0.5 * (2**attempt)
@@ -1420,18 +1425,53 @@ def _confluence_request_json(
     if body is not None:
         payload = json.dumps(body).encode("utf-8")
         headers["Content-Type"] = "application/json"
-    request = urllib.request.Request(url, headers=headers, method=method.upper(), data=payload)
-    try:
-        with urllib.request.urlopen(request, timeout=30) as response:
-            raw = response.read().decode("utf-8")
-            return json.loads(raw) if raw else {}
-    except urllib.error.HTTPError as exc:
-        err_body = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(
-            f"Confluence HTTP {exc.code} for '{url}' [{method.upper()}]. Response: {err_body}"
-        ) from exc
-    except urllib.error.URLError as exc:
-        raise RuntimeError(f"Confluence network error for '{url}': {exc}") from exc
+    method_upper = method.upper()
+    timeout = _env_int("ZEPHYR_CONFLUENCE_TIMEOUT_SEC", 60)
+    retries = _env_int("ZEPHYR_CONFLUENCE_RETRIES", 3)
+    request = urllib.request.Request(url, headers=headers, method=method_upper, data=payload)
+    for attempt in range(retries + 1):
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                raw = response.read().decode("utf-8")
+                if not raw:
+                    return {}
+                try:
+                    return json.loads(raw)
+                except json.JSONDecodeError as exc:
+                    raise RuntimeError(
+                        f"Confluence non-JSON response for '{url}': {raw[:300]!r}"
+                    ) from exc
+        except urllib.error.HTTPError as exc:
+            retryable = exc.code == 429 or 500 <= exc.code <= 599
+            if retryable and attempt < retries:
+                retry_after = exc.headers.get("Retry-After") if exc.headers else None
+                try:
+                    delay = float(retry_after) if retry_after else 1.0 * (2**attempt)
+                except ValueError:
+                    delay = 1.0 * (2**attempt)
+                print(
+                    f"Retrying Confluence {method_upper} after HTTP {exc.code} "
+                    f"in {delay:.1f}s: {url}",
+                    file=sys.stderr,
+                )
+                time.sleep(delay)
+                continue
+            err_body = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(
+                f"Confluence HTTP {exc.code} for '{url}' [{method_upper}]. Response: {err_body}"
+            ) from exc
+        except urllib.error.URLError as exc:
+            if attempt < retries:
+                delay = 1.0 * (2**attempt)
+                print(
+                    f"Retrying Confluence {method_upper} after network error "
+                    f"in {delay:.1f}s: {url}",
+                    file=sys.stderr,
+                )
+                time.sleep(delay)
+                continue
+            raise RuntimeError(f"Confluence network error for '{url}': {exc}") from exc
+    raise RuntimeError(f"Confluence request failed after retries: {url}")
 
 
 def _confluence_page_title_for_file(path: str, cfg: ConfluencePublishConfig) -> str:
@@ -1870,12 +1910,11 @@ def _confluence_lookup_page_for_upsert(
         hit = _confluence_find_child_page_by_title(cfg, parent_page_id, title)
         if hit:
             return (hit[0], hit[1], parent_page_id)
-        if cfg.update_existing and legacy_title and legacy_title != title:
+        if legacy_title and legacy_title != title:
             hit = _confluence_find_child_page_by_title(cfg, parent_page_id, legacy_title)
             if hit:
                 return (hit[0], hit[1], parent_page_id)
-    if not cfg.update_existing:
-        return None
+    # Titles are unique per space: page may exist under another parent (e.g. before Week folders).
     hit = _confluence_find_page_by_title(cfg, title)
     if hit:
         page_id, version = hit
@@ -1943,9 +1982,42 @@ def _confluence_upsert_storage_page(
     }
     if effective_parent:
         create_body["ancestors"] = [{"id": effective_parent}]
-    created = _confluence_request_json(
-        cfg, f"{cfg.api_prefix}/content", method="POST", body=create_body
-    )
+    try:
+        created = _confluence_request_json(
+            cfg, f"{cfg.api_prefix}/content", method="POST", body=create_body
+        )
+    except RuntimeError as exc:
+        err = str(exc)
+        if "HTTP 400" not in err or "already exists" not in err.lower():
+            raise
+        existing = _confluence_lookup_page_for_upsert(
+            cfg,
+            title,
+            parent_page_id=effective_parent,
+            legacy_title=legacy_title,
+        )
+        if not existing:
+            raise
+        page_id, current_version, current_parent = existing
+        need_reparent = bool(
+            effective_parent
+            and (not current_parent or current_parent != effective_parent)
+        )
+        body = {
+            "id": page_id,
+            "type": "page",
+            "title": title,
+            "space": {"key": cfg.space_key},
+            "version": {"number": current_version + 1},
+            "body": {"storage": {"value": storage_html, "representation": "storage"}},
+        }
+        if need_reparent:
+            body["ancestors"] = [{"id": effective_parent}]
+        _confluence_request_json(
+            cfg, f"{cfg.api_prefix}/content/{page_id}", method="PUT", body=body
+        )
+        action = "moved+updated" if need_reparent else "updated"
+        return page_id, action
     page_id = str(created.get("id") or "").strip()
     if not page_id:
         raise RuntimeError(f"Confluence page create returned no id for title '{title}'")
@@ -5115,8 +5187,16 @@ def _fetch_jira_bug_metadata(
                         f"Jira search response has no issues list (keys={chunk[:3]}…)"
                     )
         if last_exc is not None:
+            hint = ""
+            err_text = repr(last_exc)
+            if "JSONDecodeError" in err_text or "Non-JSON response" in err_text:
+                hint = (
+                    f" — check ZEPHYR_JIRA_BASE_URL ({base_url!r}) "
+                    "and ZEPHYR_JIRA_API_TOKEN (Jira REST, not Zephyr Scale host)"
+                )
             sys.stderr.write(
-                f"[weekly] Jira metadata lookup failed for {len(chunk)} key(s): {last_exc!r}\n"
+                f"[weekly] Jira metadata lookup failed for {len(chunk)} key(s): "
+                f"{last_exc!r}{hint}\n"
             )
         return None
 
@@ -8814,12 +8894,14 @@ def _render_analytics_sections_wiki(
     rows: list[list[str]],
     *,
     column_status_counts: dict[str, dict[str, int]] | None = None,
+    cycle_keys_by_label: dict[str, list[dict[str, Any]]] | None = None,
     defect_keys: list[str] | None = None,
     defect_analytics: dict[str, Any] | None = None,
     defect_meta: dict[str, dict[str, str]] | None = None,
     best_branch_column: dict[str, Any] | None = None,
     defect_column_labels: list[str] | None = None,
 ) -> str:
+    # cycle_keys_by_label accepted for call-site parity with HTML (Confluence macros only).
     labels = list(weekday_labels)
     best_column = best_branch_column or {}
     best_title = str(best_column.get("title") or "").strip()
@@ -13055,7 +13137,11 @@ def run_once(args: argparse.Namespace) -> int:
                 timings.record(
                     "write weekly readable reports",
                     time.perf_counter() - weekly_readable_started_at,
-                    f"files={len(weekly_readable_paths)}",
+                    (
+                        f"changed={len(weekly_readable_paths)}"
+                        if weekly_readable_paths
+                        else "changed=0 (content unchanged on disk)"
+                    ),
                 )
             if confluence_cfg and (
                 publish_confluence_daily
@@ -13197,7 +13283,11 @@ def run_once(args: argparse.Namespace) -> int:
                     timings.record(
                         "write weekly analytics reports",
                         time.perf_counter() - analytics_started_at,
-                        f"files={len(weekly_analytics_paths)}",
+                        (
+                            f"changed={len(weekly_analytics_paths)}"
+                            if weekly_analytics_paths
+                            else "changed=0 (content unchanged on disk)"
+                        ),
                     )
             if build_log_html_publish_paths and not args.export_weekly_readable:
                 weekly_html_publish_paths.extend(build_log_html_publish_paths)
