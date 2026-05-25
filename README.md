@@ -1,5 +1,7 @@
 # zephyr_parser
 
+**Версия:** 1.3.0 (`PIPELINE_VERSION`)
+
 CLI для генерации отчётов по тест-экзекьюшенам Zephyr (Jira-hosted API): CSV, HTML/wiki для Confluence, weekly matrix.
 
 Связанный репозиторий: **[zephyr-bot](https://github.com/aldohindanill-netizen/zephyr-bot)** — Telegram-бот для ввода результатов (отдельный проект).
@@ -132,6 +134,19 @@ python scripts/confluence_delete_children.py --parent-page-id 123456 --execute -
 Папка «Баги» этим скриптом не затрагивается (удаляются только прямые дети корневой страницы).
 
 Сводка багов: одна страница `reports/bugs_rollup/bugs_index.html`, `ZEPHYR_BUGS_ROLLUP_LAST_WEEKS=2` — глубина раздела «последние N недель».
+
+### Возможные дубликаты багов
+
+В таблице сводки добавлена колонка **«Возможно дубль»** (ссылка на другой Jira-ключ).
+
+- Основной сигнал: **Expected result** и **Actual result** из таблицы в Jira `description` (как в шаблоне бага). Пара считается дублем, если `min(expected_sim, actual_sim) >= ZEPHYR_BUGS_DUPLICATE_TEXT_THRESHOLD` (по умолчанию **0.78**). Похожие только заголовки (summary) без совпадения результатов — не дубль.
+- Fallback: если Expected/Actual не распарсились — сравнение по summary (старое поведение).
+- Ручные правила: `reports/bugs_rollup/duplicate_overrides.json` (`merge` / `split` пары ключей).
+- Семантика (opt-in): `pip install sentence-transformers`, затем  
+  `python scripts/compute_bug_embeddings.py --from-rollup-dir reports/bugs_rollup`  
+  (векторы по Expected+Actual, не по summary) и `ZEPHYR_BUGS_DUPLICATE_EMBEDDINGS=true` (порог **0.85**).
+
+Отладка: `reports/bugs_rollup/duplicate_candidates.json` (поля `expected_sim`, `actual_sim`), `duplicate_rollup_keys.json`.
 
 ---
 

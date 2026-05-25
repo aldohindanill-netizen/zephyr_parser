@@ -9,6 +9,7 @@ weekly_zephyr_report.csv
 logs/
 
 # generated report artifacts
+reports/
 reports/by_folder/
 reports/daily_readable/
 reports/weekly_readable/

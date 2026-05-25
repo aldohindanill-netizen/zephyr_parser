@@ -36,6 +36,16 @@ from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable, TextIO
 
+from bug_duplicate_detection import (
+    DuplicateCandidate,
+    find_duplicate_candidates,
+    load_duplicate_overrides,
+    load_embedding_cache,
+    parse_jira_description_fields,
+    resolve_paths_for_rollup_dir,
+    write_duplicate_candidates_debug,
+)
+
 
 DEFAULT_DATE_FIELDS = [
     "executedOn",
@@ -4930,7 +4940,7 @@ def _fetch_jira_bug_metadata(
     if not pending:
         return out
 
-    field_keys = ["summary", "status", "priority", "issuetype"]
+    field_keys = ["summary", "status", "priority", "issuetype", "description"]
     fields_csv = ",".join(field_keys)
 
     def _issue_to_entry(issue: dict[str, Any]) -> tuple[str, dict[str, str]] | None:
@@ -4943,6 +4953,7 @@ def _fetch_jira_bug_metadata(
         status_obj = fields.get("status") or {}
         priority_obj = fields.get("priority") or {}
         issuetype_obj = fields.get("issuetype") or {}
+        desc_fields = parse_jira_description_fields(fields.get("description"))
         entry = {
             "summary": str(fields.get("summary") or "").strip(),
             "status": str(
@@ -4954,6 +4965,9 @@ def _fetch_jira_bug_metadata(
             "issuetype": str(
                 (issuetype_obj.get("name") if isinstance(issuetype_obj, dict) else "") or ""
             ).strip(),
+            "expected_result": str(desc_fields.get("expected_result") or "").strip(),
+            "actual_result": str(desc_fields.get("actual_result") or "").strip(),
+            "preconditions": str(desc_fields.get("preconditions") or "").strip(),
         }
         return key, entry
 
@@ -7403,6 +7417,35 @@ def _weekly_jira_key_wiki(issue_key: str) -> str:
     return f"{{jira:key={_wiki_escape(key)}}}"
 
 
+def _duplicate_candidate_cell_html(
+    key: str,
+    duplicate_candidates: dict[str, DuplicateCandidate | None] | None,
+) -> str:
+    if duplicate_candidates is None:
+        return ""
+    cand = duplicate_candidates.get(key)
+    if cand is None:
+        return "<td class='bugs-dup-cell'>—</td>"
+    title = html.escape(f"{cand.method}, {cand.score:.2f}")
+    link = _weekly_jira_key_span_html(cand.other_key)
+    return (
+        f"<td class='bugs-dup-cell' title='{title}'>"
+        f"возможно дубль {link}</td>"
+    )
+
+
+def _duplicate_candidate_cell_wiki(
+    key: str,
+    duplicate_candidates: dict[str, DuplicateCandidate | None] | None,
+) -> str:
+    if duplicate_candidates is None:
+        return ""
+    cand = duplicate_candidates.get(key)
+    if cand is None:
+        return "—"
+    return f"возможно дубль {_weekly_jira_key_wiki(cand.other_key)}"
+
+
 def _filter_keys_by_issuetype(
     keys: list[str],
     defect_meta: dict[str, dict[str, str]] | None,
@@ -7436,6 +7479,7 @@ def _weekly_defect_analytics_html(
     defect_analytics: dict[str, Any] | None,
     defect_meta: dict[str, dict[str, str]] | None,
     column_labels: list[str],
+    duplicate_candidates: dict[str, DuplicateCandidate | None] | None = None,
 ) -> str:
     analytics = defect_analytics or {}
     keys_ordered = list(analytics.get("keys_ordered") or [])
@@ -7454,6 +7498,8 @@ def _weekly_defect_analytics_html(
     hot_bugs = [k for k in (analytics.get("hot_bugs") or []) if k in keys_ordered]
     meta = defect_meta or {}
     extended = _weekly_defect_extended_analytics_enabled()
+    show_dup_col = duplicate_candidates is not None
+    dup_header = "<th>Возможно дубль</th>" if show_dup_col else ""
 
     parts: list[str] = []
     parts.append('<div class="weekly-defects-jira">')
@@ -7489,6 +7535,7 @@ def _weekly_defect_analytics_html(
             "<thead><tr>"
             "<th>Ключ</th><th>Summary</th><th>Priority</th><th>Status</th>"
             "<th>Кейсов</th><th>Билдов</th>"
+            f"{dup_header}"
             "</tr></thead><tbody>"
         )
         for key in top_keys:
@@ -7501,6 +7548,7 @@ def _weekly_defect_analytics_html(
                 f"<td>{_jira_status_lozenge_html(entry.get('status', ''))}</td>"
                 f"<td style='text-align:center;'>{int(bug_total_cases.get(key, 0))}</td>"
                 f"<td style='text-align:center;'>{int(bug_builds_count.get(key, 0))}</td>"
+                f"{_duplicate_candidate_cell_html(key, duplicate_candidates)}"
                 "</tr>"
             )
         parts.append("</tbody></table>")
@@ -7564,6 +7612,7 @@ def _weekly_defect_analytics_html(
         "<thead><tr>"
         "<th>Ключ</th><th>Summary</th><th>Priority</th><th>Status</th>"
         "<th>Кейсов</th><th>Билдов</th>"
+        f"{dup_header}"
         "</tr></thead><tbody>"
     )
     for key in keys_ordered:
@@ -7576,6 +7625,7 @@ def _weekly_defect_analytics_html(
             f"<td>{_jira_status_lozenge_html(entry.get('status', ''))}</td>"
             f"<td style='text-align:center;'>{int(bug_total_cases.get(key, 0))}</td>"
             f"<td style='text-align:center;'>{int(bug_builds_count.get(key, 0))}</td>"
+            f"{_duplicate_candidate_cell_html(key, duplicate_candidates)}"
             "</tr>"
         )
     parts.append("</tbody></table>")
@@ -7588,6 +7638,7 @@ def _weekly_defect_analytics_wiki(
     defect_analytics: dict[str, Any] | None,
     defect_meta: dict[str, dict[str, str]] | None,
     column_labels: list[str],
+    duplicate_candidates: dict[str, DuplicateCandidate | None] | None = None,
 ) -> str:
     analytics = defect_analytics or {}
     keys_ordered = list(analytics.get("keys_ordered") or [])
@@ -7606,6 +7657,8 @@ def _weekly_defect_analytics_wiki(
     hot_bugs = [k for k in (analytics.get("hot_bugs") or []) if k in keys_ordered]
     meta = defect_meta or {}
     extended = _weekly_defect_extended_analytics_enabled()
+    show_dup_col = duplicate_candidates is not None
+    dup_header_wiki = " || Возможно дубль" if show_dup_col else ""
 
     parts: list[str] = []
 
@@ -7629,7 +7682,8 @@ def _weekly_defect_analytics_wiki(
         # 2. Топ
         parts.append(f"h4. Топ багов (до {_DEFECT_TOP_LIMIT})")
         parts.append(
-            "|| Ключ || Summary || Priority || Status || Кейсов || Билдов ||"
+            "|| Ключ || Summary || Priority || Status || Кейсов || Билдов"
+            f"{dup_header_wiki} ||"
         )
         for key in keys_ordered[:_DEFECT_TOP_LIMIT]:
             entry = meta.get(key, {}) or {}
@@ -7641,6 +7695,8 @@ def _weekly_defect_analytics_wiki(
                 str(int(bug_total_cases.get(key, 0))),
                 str(int(bug_builds_count.get(key, 0))),
             ]
+            if show_dup_col:
+                cells.append(_duplicate_candidate_cell_wiki(key, duplicate_candidates))
             parts.append("| " + " | ".join(cells) + " |")
         parts.append("")
 
@@ -7674,7 +7730,10 @@ def _weekly_defect_analytics_wiki(
     if parts:
         parts.append("")
     parts.append("h4. Все баги")
-    parts.append("|| Ключ || Summary || Priority || Status || Кейсов || Билдов ||")
+    parts.append(
+        "|| Ключ || Summary || Priority || Status || Кейсов || Билдов"
+        f"{dup_header_wiki} ||"
+    )
     for key in keys_ordered:
         entry = meta.get(key, {}) or {}
         cells = [
@@ -7685,6 +7744,8 @@ def _weekly_defect_analytics_wiki(
             str(int(bug_total_cases.get(key, 0))),
             str(int(bug_builds_count.get(key, 0))),
         ]
+        if show_dup_col:
+            cells.append(_duplicate_candidate_cell_wiki(key, duplicate_candidates))
         parts.append("| " + " | ".join(cells) + " |")
 
     return "\n".join(parts)
@@ -7719,6 +7780,7 @@ _WEEKLY_HTML_DEFECT_STYLES = (
     ".weekly-defects-hot .weekly-jira-key-link{margin-right:4px;}"
     ".jira-lozenge{vertical-align:middle;}"
     ".bugs-rollup-subtitle{color:#5e6c84;margin:0 0 16px;}"
+    ".bugs-dup-cell{font-size:13px;color:#42526e;}"
 )
 
 
@@ -7818,6 +7880,7 @@ def _bugs_rollup_html_section(
     defect_meta: dict[str, dict[str, str]] | None,
     column_labels: list[str],
     week_keys: list[date],
+    duplicate_candidates: dict[str, DuplicateCandidate | None] | None = None,
 ) -> list[str]:
     blocks = [f"<h2><strong>{html.escape(section_title)}</strong></h2>"]
     subtitle = _bugs_rollup_section_subtitle(week_keys, column_labels)
@@ -7826,7 +7889,12 @@ def _bugs_rollup_html_section(
     keys = list((defect_analytics or {}).get("keys_ordered") or [])
     if keys:
         blocks.append(
-            _weekly_defect_analytics_html(defect_analytics, defect_meta, column_labels)
+            _weekly_defect_analytics_html(
+                defect_analytics,
+                defect_meta,
+                column_labels,
+                duplicate_candidates,
+            )
         )
     else:
         blocks.append("<p><em>Баги не найдены в данных Zephyr за выбранный период.</em></p>")
@@ -7842,6 +7910,8 @@ def render_bugs_rollup_html_report(
     all_labels: list[str],
     last_weeks_keys: list[date],
     all_week_keys: list[date],
+    last_weeks_duplicates: dict[str, DuplicateCandidate | None] | None = None,
+    all_duplicates: dict[str, DuplicateCandidate | None] | None = None,
 ) -> str:
     sections = [
         "<!doctype html>",
@@ -7858,6 +7928,7 @@ def render_bugs_rollup_html_report(
             defect_meta=defect_meta,
             column_labels=last_weeks_labels,
             week_keys=last_weeks_keys,
+            duplicate_candidates=last_weeks_duplicates,
         )
     )
     sections.extend(
@@ -7867,6 +7938,7 @@ def render_bugs_rollup_html_report(
             defect_meta=defect_meta,
             column_labels=all_labels,
             week_keys=all_week_keys,
+            duplicate_candidates=all_duplicates,
         )
     )
     sections.append("</body></html>")
@@ -7880,6 +7952,7 @@ def _bugs_rollup_wiki_section(
     defect_meta: dict[str, dict[str, str]] | None,
     column_labels: list[str],
     week_keys: list[date],
+    duplicate_candidates: dict[str, DuplicateCandidate | None] | None = None,
 ) -> list[str]:
     lines = [f"h2. {section_title}", ""]
     subtitle = _bugs_rollup_section_subtitle(week_keys, column_labels)
@@ -7889,7 +7962,12 @@ def _bugs_rollup_wiki_section(
     keys = list((defect_analytics or {}).get("keys_ordered") or [])
     if keys:
         lines.append(
-            _weekly_defect_analytics_wiki(defect_analytics, defect_meta, column_labels)
+            _weekly_defect_analytics_wiki(
+                defect_analytics,
+                defect_meta,
+                column_labels,
+                duplicate_candidates,
+            )
         )
     else:
         lines.append("_Баги не найдены в данных Zephyr за выбранный период._")
@@ -7906,6 +7984,8 @@ def render_bugs_rollup_wiki_report(
     all_labels: list[str],
     last_weeks_keys: list[date],
     all_week_keys: list[date],
+    last_weeks_duplicates: dict[str, DuplicateCandidate | None] | None = None,
+    all_duplicates: dict[str, DuplicateCandidate | None] | None = None,
 ) -> str:
     lines = [f"h1. {BUGS_ROLLUP_DISPLAY_TITLE}", ""]
     lines.extend(
@@ -7915,6 +7995,7 @@ def render_bugs_rollup_wiki_report(
             defect_meta=defect_meta,
             column_labels=last_weeks_labels,
             week_keys=last_weeks_keys,
+            duplicate_candidates=last_weeks_duplicates,
         )
     )
     lines.extend(
@@ -7924,9 +8005,36 @@ def render_bugs_rollup_wiki_report(
             defect_meta=defect_meta,
             column_labels=all_labels,
             week_keys=all_week_keys,
+            duplicate_candidates=all_duplicates,
         )
     )
     return "\n".join(lines).rstrip() + "\n"
+
+
+def _bugs_rollup_duplicate_candidates_for_analytics(
+    analytics: dict[str, Any],
+    defect_meta: dict[str, dict[str, str]] | None,
+    *,
+    embedding_cache: dict[str, Any] | None,
+    overrides: dict[str, Any] | None,
+) -> dict[str, DuplicateCandidate | None] | None:
+    from bug_duplicate_detection import bugs_duplicate_detect_enabled
+
+    if not bugs_duplicate_detect_enabled():
+        return None
+    keys = [
+        str(k).strip()
+        for k in (analytics.get("keys_ordered") or [])
+        if str(k).strip()
+    ]
+    if not keys:
+        return None
+    return find_duplicate_candidates(
+        keys,
+        defect_meta or {},
+        embedding_cache=embedding_cache,
+        overrides=overrides,
+    )
 
 
 def write_bugs_rollup_reports(
@@ -7946,6 +8054,61 @@ def write_bugs_rollup_reports(
     all_labels, all_analytics, all_week_keys = _defect_rollup_from_report_data(
         report_data, last_n_weeks=None
     )
+    cache_path, overrides_path = resolve_paths_for_rollup_dir(output_dir)
+    embedding_cache = load_embedding_cache(cache_path)
+    overrides = load_duplicate_overrides(overrides_path)
+    last_duplicates = _bugs_rollup_duplicate_candidates_for_analytics(
+        last_analytics, defect_meta, embedding_cache=embedding_cache, overrides=overrides
+    )
+    all_duplicates = _bugs_rollup_duplicate_candidates_for_analytics(
+        all_analytics, defect_meta, embedding_cache=embedding_cache, overrides=overrides
+    )
+    debug_merged: dict[str, DuplicateCandidate | None] = {}
+    if last_duplicates:
+        debug_merged.update(last_duplicates)
+    if all_duplicates:
+        debug_merged.update(all_duplicates)
+    if debug_merged:
+        write_duplicate_candidates_debug(
+            os.path.join(output_dir, "duplicate_candidates.json"),
+            debug_merged,
+        )
+        keys_path = os.path.join(output_dir, "duplicate_rollup_keys.json")
+        all_keys = sorted(
+            {
+                str(k).strip()
+                for k in (
+                    list((last_analytics or {}).get("keys_ordered") or [])
+                    + list((all_analytics or {}).get("keys_ordered") or [])
+                )
+                if str(k).strip()
+            }
+        )
+        summaries = {
+            k: str((defect_meta or {}).get(k, {}).get("summary") or "")
+            for k in all_keys
+        }
+        expected_results = {
+            k: str((defect_meta or {}).get(k, {}).get("expected_result") or "")
+            for k in all_keys
+        }
+        actual_results = {
+            k: str((defect_meta or {}).get(k, {}).get("actual_result") or "")
+            for k in all_keys
+        }
+        _write_text_always(
+            keys_path,
+            json.dumps(
+                {
+                    "keys": all_keys,
+                    "summaries": summaries,
+                    "expected_results": expected_results,
+                    "actual_results": actual_results,
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+        )
     written: list[str] = []
     if "html" in formats:
         html_path = os.path.join(output_dir, "bugs_index.html")
@@ -7957,6 +8120,8 @@ def write_bugs_rollup_reports(
             all_labels=all_labels,
             last_weeks_keys=last_week_keys,
             all_week_keys=all_week_keys,
+            last_weeks_duplicates=last_duplicates,
+            all_duplicates=all_duplicates,
         )
         _write_text_always(html_path, body)
         written.append(html_path)
@@ -7970,6 +8135,8 @@ def write_bugs_rollup_reports(
             all_labels=all_labels,
             last_weeks_keys=last_week_keys,
             all_week_keys=all_week_keys,
+            last_weeks_duplicates=last_duplicates,
+            all_duplicates=all_duplicates,
         )
         _write_text_always(wiki_path, body)
         written.append(wiki_path)

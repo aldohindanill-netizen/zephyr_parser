@@ -1,6 +1,13 @@
 $ErrorActionPreference = "Stop"
 
 $RepoRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
+$pipelineVersionPath = Join-Path $RepoRoot "PIPELINE_VERSION"
+if (Test-Path -LiteralPath $pipelineVersionPath) {
+    $pipelineVersion = (Get-Content -LiteralPath $pipelineVersionPath -TotalCount 1).Trim()
+    if ($pipelineVersion) {
+        Write-Host "Pipeline: $pipelineVersion"
+    }
+}
 $envPath = Join-Path $RepoRoot ".env"
 $envExamplePath = Join-Path $RepoRoot ".env.example"
 

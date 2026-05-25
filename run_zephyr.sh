@@ -3,6 +3,13 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -f "$SCRIPT_DIR/PIPELINE_VERSION" ]]; then
+  read -r pipeline_version < "$SCRIPT_DIR/PIPELINE_VERSION" || true
+  pipeline_version="${pipeline_version//$'\r'/}"
+  if [[ -n "${pipeline_version//[[:space:]]/}" ]]; then
+    echo "Pipeline: $pipeline_version"
+  fi
+fi
 ENV_FILE="$SCRIPT_DIR/.env"
 ENV_EXAMPLE="$SCRIPT_DIR/.env.example"
 
