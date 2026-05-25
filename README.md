@@ -65,6 +65,80 @@ Python: `PYTHON_BIN`, затем `python3`, затем `python` (Windows: `py -3
 
 ---
 
+## Локальная отладка
+
+### Отдельный dev-клон (рекомендуется для веток)
+
+Второй каталог на диске = отдельная рабочая копия: можно переключать ветки и ломать код, **не трогая** production-папку, откуда ходит Task Scheduler.
+
+Из production-репозитория (один раз):
+
+```powershell
+.\setup_dev_clone.ps1 -CopyEnv
+```
+
+По умолчанию клонирует в соседнюю папку `..\zephyr_parser_dev` (тот же GitHub `origin`). Секреты копируются из production `.env`; изоляция путей — через `.env.local`.
+
+```powershell
+cd ..\zephyr_parser_dev
+# заполнить sandbox page id в .env.local
+.\run_zephyr_local.ps1
+```
+
+| | `zephyr_parser` (production) | `zephyr_parser_dev` |
+|---|------------------------------|---------------------|
+| Task Scheduler | да | **нет** (не запускать `install_zephyr_scheduled_task.ps1`) |
+| `git checkout` feature | влияет на Scheduler | безопасно |
+| Отчёты | `reports/` | `reports_local/` |
+
+Свой URL (форк на GitHub): `.\setup_dev_clone.ps1 -RemoteUrl https://github.com/YOU/zephyr_parser_dev.git -CopyEnv`
+
+Подробности после установки: `DEV_CLONE.md` в dev-клоне.
+
+### Тот же каталог, другие пути (`run_zephyr_local.ps1`)
+
+Отладка на этой же машине **без влияния** на Task Scheduler и каталог `reports/`:
+
+1. Скопировать шаблон: `Copy-Item .env.local.example .env.local`
+2. В `.env.local` указать `ZEPHYR_CONFLUENCE_PARENT_PAGE_ID` sandbox-страницы (токены остаются в `.env`)
+3. Запускать **только** локальный launcher:
+
+```powershell
+.\run_zephyr_local.ps1
+```
+
+Цепочка: `run_zephyr_local.ps1` → `run_zephyr.ps1 -UseLocalEnv` → overlay `.env.local` поверх `.env`.
+
+| Что изолировано | Production (Scheduler) | Local debug |
+|-----------------|------------------------|-------------|
+| Env-файл | `.env` | `.env` + `.env.local` |
+| Отчёты | `reports/` | `reports_local/` |
+| Lock | `reports/.zephyr_weekly_report.lock` | `reports_local/.zephyr_weekly_report.lock` |
+| Confluence | `ZEPHYR_CONFLUENCE_PARENT_PAGE_ID` из `.env` | sandbox id + `[LOCAL]` prefix |
+
+**Не использовать** `.\run_zephyr.ps1` для отладки — перезапишет production `reports/` и может опубликовать в prod Confluence.
+
+Быстрый прогон за 1 день:
+
+```powershell
+.\run_zephyr_local.ps1 --regenerate-last-n-days 1
+```
+
+Только файлы, без Confluence: в `.env.local` выставить `ZEPHYR_CONFLUENCE_PUBLISH_DAILY=false`, `ZEPHYR_CONFLUENCE_PUBLISH_WEEKLY=false`, `ZEPHYR_CONFLUENCE_PUBLISH_WEEKLY_ANALYTICS=false`.
+
+Проверка HTML: открыть `reports_local/daily_readable/*.html` в браузере.
+
+Скрипты в `scripts/` по умолчанию читают только `.env`. Для local-путей экспортируйте нужные переменные в сессию, например:
+
+```powershell
+$env:ZEPHYR_BUGS_ROLLUP_DIR = 'reports_local/bugs_rollup'
+python scripts/refresh_bugs_rollup_duplicates.py
+```
+
+Частичная отладка без полного пайплайна: `scripts/debug_jira_description.py`, `python -m unittest discover -s tests`.
+
+---
+
 ## Tree discovery (по умолчанию)
 
 1. Кастомный источник (`ZEPHYR_TREE_SOURCE_*`), если настроен

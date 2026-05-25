@@ -1,4 +1,41 @@
+param(
+    [switch]$UseLocalEnv,
+    [Parameter(ValueFromRemainingArguments = $true)]
+    [object[]]$Args
+)
+
 $ErrorActionPreference = "Stop"
+
+function Import-RepoDotEnv {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    Get-Content -LiteralPath $Path | ForEach-Object {
+        $line = $_.Trim()
+        if (-not $line -or $line.StartsWith('#') -or -not $line.Contains('=')) { return }
+
+        $parts = $line -split '=', 2
+        $name = $parts[0].Trim()
+        $value = $parts[1].Trim()
+
+        if (($value.StartsWith("'") -and $value.EndsWith("'")) -or
+            ($value.StartsWith('"') -and $value.EndsWith('"'))) {
+            $value = $value.Substring(1, $value.Length - 2)
+        }
+
+        [Environment]::SetEnvironmentVariable($name, $value, 'Process')
+    }
+}
+
+function Test-EnvEnabled {
+    param(
+        [string]$Value,
+        [bool]$Default = $false
+    )
+    if ([string]::IsNullOrWhiteSpace($Value)) {
+        return $Default
+    }
+    return @("1", "true", "yes", "y", "on") -contains $Value.Trim().ToLowerInvariant()
+}
 
 $RepoRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $pipelineVersionPath = Join-Path $RepoRoot "PIPELINE_VERSION"
@@ -10,6 +47,8 @@ if (Test-Path -LiteralPath $pipelineVersionPath) {
 }
 $envPath = Join-Path $RepoRoot ".env"
 $envExamplePath = Join-Path $RepoRoot ".env.example"
+$envLocalPath = Join-Path $RepoRoot ".env.local"
+$envLocalExamplePath = Join-Path $RepoRoot ".env.local.example"
 
 if (-not (Test-Path -LiteralPath $envPath)) {
     Write-Host @"
@@ -23,31 +62,24 @@ Or copy .env.example to .env in File Explorer, then edit .env.
     exit 1
 }
 
-Get-Content -LiteralPath $envPath | ForEach-Object {
-    $line = $_.Trim()
-    if (-not $line -or $line.StartsWith('#') -or -not $line.Contains('=')) { return }
+Import-RepoDotEnv -Path $envPath
 
-    $parts = $line -split '=', 2
-    $name = $parts[0].Trim()
-    $value = $parts[1].Trim()
-
-    if (($value.StartsWith("'") -and $value.EndsWith("'")) -or
-        ($value.StartsWith('"') -and $value.EndsWith('"'))) {
-        $value = $value.Substring(1, $value.Length - 2)
+$useLocalOverlay = $UseLocalEnv.IsPresent -or (Test-EnvEnabled $env:ZEPHYR_USE_LOCAL_ENV $false)
+if ($useLocalOverlay) {
+    if (Test-Path -LiteralPath $envLocalPath) {
+        Import-RepoDotEnv -Path $envLocalPath
+        Write-Host "Loaded local overrides: $envLocalPath"
     }
+    else {
+        Write-Host @"
 
-    [Environment]::SetEnvironmentVariable($name, $value, 'Process')
-}
+-UseLocalEnv requested but missing: $envLocalPath
 
-function Test-EnvEnabled {
-  param(
-    [string]$Value,
-    [bool]$Default = $false
-  )
-  if ([string]::IsNullOrWhiteSpace($Value)) {
-    return $Default
-  }
-  return @("1", "true", "yes", "y", "on") -contains $Value.Trim().ToLowerInvariant()
+Copy the template and set sandbox Confluence page ids:
+  Copy-Item -LiteralPath '$envLocalExamplePath' -Destination '$envLocalPath'
+"@ -ForegroundColor Yellow
+        exit 1
+    }
 }
 
 $env:ZEPHYR_CONFLUENCE_AUTH_SCHEME = "bearer"
@@ -58,7 +90,7 @@ if (-not $env:ZEPHYR_RUN_LOCK_FILE) {
   $env:ZEPHYR_RUN_LOCK_FILE = Join-Path $RepoRoot "reports\.zephyr_weekly_report.lock"
 }
 
-$extraArgs = @($args)
+$extraArgs = @($Args)
 
 $reportScript = Join-Path $RepoRoot "zephyr_weekly_report.py"
 $readableTemplateDir = Join-Path $RepoRoot "report_templates\readable"

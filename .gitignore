@@ -10,6 +10,7 @@ logs/
 
 # generated report artifacts
 reports/
+reports_local/
 reports/by_folder/
 reports/daily_readable/
 reports/weekly_readable/
