@@ -14,7 +14,7 @@ $LogFile = Join-Path $LogDir ("scheduled_{0:yyyy-MM-dd}.log" -f (Get-Date))
 
 function Import-RepoDotEnv {
     if (-not (Test-Path -LiteralPath $EnvFile)) { return }
-    Get-Content -LiteralPath $EnvFile | ForEach-Object {
+    Get-Content -LiteralPath $EnvFile -Encoding utf8 | ForEach-Object {
         $line = $_.Trim()
         if (-not $line -or $line.StartsWith('#') -or -not $line.Contains('=')) { return }
         $parts = $line -split '=', 2

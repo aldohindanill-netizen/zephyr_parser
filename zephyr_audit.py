@@ -173,3 +173,12 @@ def audit_integration(
     if detail:
         fields["detail"] = detail
     audit_event("integration_call", result=result, **fields)
+
+
+def audit_embeddings_start(**extra: Any) -> None:
+    audit_event("embeddings_start", **extra)
+
+
+def audit_embeddings_finish(exit_code: int, **extra: Any) -> None:
+    result = "success" if exit_code == 0 else "failure"
+    audit_event("embeddings_finish", result=result, exit_code=exit_code, **extra)

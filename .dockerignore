@@ -1,0 +1,12 @@
+.git
+.cursor
+reports
+reports_local
+logs
+.env
+.env.local
+__pycache__
+*.pyc
+.venv
+.venv-embeddings
+tests

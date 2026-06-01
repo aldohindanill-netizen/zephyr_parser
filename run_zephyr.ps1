@@ -6,10 +6,16 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+# Cyrillic log lines from Python must not be mis-decoded on the Windows console (cp1251).
+$utf8NoBom = [System.Text.UTF8Encoding]::new($false)
+[Console]::OutputEncoding = $utf8NoBom
+[Console]::InputEncoding = $utf8NoBom
+$OutputEncoding = $utf8NoBom
+
 function Import-RepoDotEnv {
     param([Parameter(Mandatory = $true)][string]$Path)
 
-    Get-Content -LiteralPath $Path | ForEach-Object {
+    Get-Content -LiteralPath $Path -Encoding utf8 | ForEach-Object {
         $line = $_.Trim()
         if (-not $line -or $line.StartsWith('#') -or -not $line.Contains('=')) { return }
 
@@ -265,19 +271,67 @@ if ($env:ZEPHYR_RUN_LOCK_FILE) {
 
 $pythonArgs = @("-u") + $cmdArgs
 
-if ($env:PYTHON_BIN) {
-  & $env:PYTHON_BIN @pythonArgs
-  exit $LASTEXITCODE
+function Write-ZephyrPythonLine {
+  param([object]$Line)
+  if ($Line -is [System.Management.Automation.ErrorRecord]) {
+    $text = if ($Line.Exception) { $Line.Exception.Message } else { "$Line" }
+    Write-Host $text
+    return
+  }
+  Write-Host ([string]$Line)
 }
 
-if (Get-Command py -ErrorAction SilentlyContinue) {
-  & py -3 @pythonArgs
-  exit $LASTEXITCODE
+function Invoke-ZephyrPython {
+  param([string[]]$PythonArgList)
+  # Retry lines must not abort the launcher (PS 7+ treats native stderr as error when Stop).
+  $savedEap = $ErrorActionPreference
+  $ErrorActionPreference = "Continue"
+  $savedNative = $null
+  if (Get-Variable -Name PSNativeCommandUseErrorActionPreference -ErrorAction SilentlyContinue) {
+    $savedNative = $PSNativeCommandUseErrorActionPreference
+    $PSNativeCommandUseErrorActionPreference = $false
+  }
+  try {
+    # Merge stdout+stderr and stream to host while Python runs. Without this, a full
+    # stdout pipe from the child can block on Windows PowerShell while stderr still prints.
+    if ($env:PYTHON_BIN) {
+      & $env:PYTHON_BIN @PythonArgList 2>&1 | ForEach-Object { Write-ZephyrPythonLine $_ }
+    }
+    elseif (Get-Command py -ErrorAction SilentlyContinue) {
+      & py -3 @PythonArgList 2>&1 | ForEach-Object { Write-ZephyrPythonLine $_ }
+    }
+    elseif (Get-Command python -ErrorAction SilentlyContinue) {
+      & python @PythonArgList 2>&1 | ForEach-Object { Write-ZephyrPythonLine $_ }
+    }
+    else {
+      throw "Python not found. Install Python 3.10+ (with py launcher or python on PATH), or set PYTHON_BIN to your python.exe path."
+    }
+    return $LASTEXITCODE
+  }
+  finally {
+    $ErrorActionPreference = $savedEap
+    if ($null -ne $savedNative) {
+      $PSNativeCommandUseErrorActionPreference = $savedNative
+    }
+  }
 }
 
-if (Get-Command python -ErrorAction SilentlyContinue) {
-  & python @pythonArgs
-  exit $LASTEXITCODE
+function Get-ZephyrPythonLabel {
+  if ($env:PYTHON_BIN) {
+    return "PYTHON_BIN=$($env:PYTHON_BIN)"
+  }
+  if (Get-Command py -ErrorAction SilentlyContinue) {
+    return "py -3"
+  }
+  if (Get-Command python -ErrorAction SilentlyContinue) {
+    return "python"
+  }
+  return "python (not found)"
 }
 
-throw "Python not found. Install Python 3.10+ (with py launcher or python on PATH), or set PYTHON_BIN to your python.exe path."
+Write-Host "Starting Python (zephyr_weekly_report.py) via $(Get-ZephyrPythonLabel)..."
+$exitCode = Invoke-ZephyrPython -PythonArgList $pythonArgs
+if ($null -eq $exitCode) { $exitCode = 1 }
+
+# pipeline_health.html is written in zephyr_weekly_report.main() finally (after audit run_finish).
+exit $exitCode

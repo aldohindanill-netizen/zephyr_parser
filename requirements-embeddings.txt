@@ -1,0 +1,3 @@
+# Optional: nightly bug-duplicate embeddings (see install_zephyr_embeddings_task.ps1).
+numpy>=1.24.0
+sentence-transformers>=2.2.0

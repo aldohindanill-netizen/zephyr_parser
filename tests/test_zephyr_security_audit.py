@@ -65,12 +65,42 @@ class AuditLogTests(unittest.TestCase):
                 za.audit_run_start(mode="test")
                 za.audit_export_file("/tmp/out.csv", kind="weekly_csv")
                 za.audit_run_finish(0)
+                za.audit_embeddings_start()
+                za.audit_embeddings_finish(0)
             with open(log_path, encoding="utf-8") as fh:
                 lines = fh.read().strip().splitlines()
-        self.assertGreaterEqual(len(lines), 3)
+        self.assertGreaterEqual(len(lines), 5)
         first = json.loads(lines[0])
         self.assertEqual(first["operation"], "run_start")
         self.assertEqual(first["reason"], "unit test")
+        emb_start = json.loads(lines[-2])
+        emb_finish = json.loads(lines[-1])
+        self.assertEqual(emb_start["operation"], "embeddings_start")
+        self.assertEqual(emb_finish["operation"], "embeddings_finish")
+        self.assertEqual(emb_start["run_id"], first["run_id"])
+        self.assertEqual(emb_finish["run_id"], first["run_id"])
+        self.assertEqual(emb_finish["exit_code"], 0)
+
+    def test_embeddings_audit_reuses_preset_run_id(self) -> None:
+        za.reset_run_id()
+        preset = "00000000-0000-4000-8000-000000000001"
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = os.path.join(tmp, "audit.jsonl")
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "ZEPHYR_AUDIT_ENABLED": "true",
+                    "ZEPHYR_AUDIT_LOG": log_path,
+                    "ZEPHYR_AUDIT_RUN_ID": preset,
+                },
+                clear=False,
+            ):
+                za.audit_embeddings_start()
+                za.audit_embeddings_finish(0)
+            with open(log_path, encoding="utf-8") as fh:
+                records = [json.loads(line) for line in fh]
+        self.assertEqual(records[0]["run_id"], preset)
+        self.assertEqual(records[1]["run_id"], preset)
 
 
 if __name__ == "__main__":

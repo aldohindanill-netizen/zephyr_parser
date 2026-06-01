@@ -1,6 +1,6 @@
 # zephyr_parser
 
-**Версия:** 1.4.0 (`PIPELINE_VERSION`)
+**Версия:** 1.5.0 (`PIPELINE_VERSION`)
 
 CLI для генерации отчётов по тест-экзекьюшенам Zephyr (Jira-hosted API): CSV, HTML/wiki для Confluence, weekly matrix.
 
@@ -217,7 +217,7 @@ python scripts/confluence_delete_children.py --parent-page-id 123456 --execute -
 
 Папка «Баги» этим скриптом не затрагивается (удаляются только прямые дети корневой страницы).
 
-Сводка багов: одна страница `reports/bugs_rollup/bugs_index.html`, `ZEPHYR_BUGS_ROLLUP_LAST_WEEKS=2` — глубина раздела «последние N недель».
+Сводка багов: одна страница `reports/bugs_rollup/bugs_index.html`, `ZEPHYR_BUGS_ROLLUP_LAST_WEEKS=4` (prod) — глубина раздела «последние N недель» в Confluence.
 
 ### Возможные дубликаты багов
 
@@ -225,18 +225,16 @@ python scripts/confluence_delete_children.py --parent-page-id 123456 --execute -
 
 - Основной сигнал: **Expected result** и **Actual result** из таблицы в Jira `description` (как в шаблоне бага). Пара считается дублем, если `min(expected_sim, actual_sim) >= ZEPHYR_BUGS_DUPLICATE_TEXT_THRESHOLD` (по умолчанию **0.78**). Похожие только заголовки (summary) без совпадения результатов — не дубль.
 - Fallback: если Expected/Actual не распарсились — сравнение по summary (старое поведение).
-- Ручные правила: `reports/bugs_rollup/duplicate_overrides.json` (`merge` / `split` пары ключей).
-- Семантика (opt-in): `pip install sentence-transformers`, затем  
-  `py -3 scripts/compute_bug_embeddings.py --from-rollup-dir reports/bugs_rollup`  
-  (векторы по Expected+Actual, не по summary) и `ZEPHYR_BUGS_DUPLICATE_EMBEDDINGS=true` (порог **0.85**).
+- Ручные правила (опционально): `reports/bugs_rollup/duplicate_overrides.json` (`merge` / `split`); prod по умолчанию не использует.
+- Семантика (prod): задача `ZephyrParserEmbeddingsDaily` в **13:00** (`install_zephyr_embeddings_task.ps1`), venv `.venv-embeddings`, `run_embeddings_scheduled.ps1`; в `.env`: `ZEPHYR_BUGS_DUPLICATE_EMBEDDINGS=true` (порог **0.85**). Векторы по Expected+Actual, не по summary.
 
-**Runbook (порядок):**
+**Runbook (prod):** см. [PRODUCTION_RELEASE.md](PRODUCTION_RELEASE.md) § Task 4.1.7.
 
-1. `py -3 scripts/calibrate_bug_duplicates.py` — сверка порога на эталонных парах  
-2. Полный прогон `run_zephyr` (rollup + `duplicate_rollup_keys.json`)  
-3. `py -3 scripts/refresh_bugs_rollup_duplicates.py` (`--use-local-env` в dev-клоне)  
-4. Опционально: embeddings (шаг выше) → снова refresh → включить `ZEPHYR_BUGS_DUPLICATE_EMBEDDINGS=true`  
-5. Ручные пары: `duplicate_overrides.json` (`merge` / `split`)
+**Runbook (dev):**
+
+1. Полный прогон `run_zephyr` (rollup + `duplicate_rollup_keys.json`)  
+2. `py -3 scripts/refresh_bugs_rollup_duplicates.py` (`run_embeddings_local.ps1` в dev-клоне)  
+3. `run_embeddings_local.ps1` или `run_embeddings_scheduled.ps1` → включить `ZEPHYR_BUGS_DUPLICATE_EMBEDDINGS=true` в `.env.local` для проверки
 
 Отладка: `reports/bugs_rollup/duplicate_candidates.json` (поля `expected_sim`, `actual_sim`), `duplicate_rollup_keys.json`.
 

@@ -1239,7 +1239,7 @@ def request_json(
                     delay = 0.5 * (2**attempt)
                 print(
                     f"Retrying GET after HTTP {exc.code} in {delay:.1f}s: {url}",
-                    file=sys.stderr,
+                    flush=True,
                 )
                 time.sleep(delay)
                 continue
@@ -1257,7 +1257,7 @@ def request_json(
                 delay = 0.5 * (2**attempt)
                 print(
                     f"Retrying GET after network error in {delay:.1f}s: {url}",
-                    file=sys.stderr,
+                    flush=True,
                 )
                 time.sleep(delay)
                 continue
@@ -1310,6 +1310,26 @@ def _get_repo_dotenv_parsed() -> dict[str, str]:
     return from_file
 
 
+def _env_prefers_repo_dotenv(name: str, default: str = "") -> str:
+    """Read env var from repo ``.env`` / ``.env.local`` (UTF-8) before process env.
+
+    PowerShell loaders on Windows may mis-decode Cyrillic in ``.env`` into the
+    process environment; Confluence section titles must come from the file.
+    """
+    parsed = dict(_get_repo_dotenv_parsed())
+    try:
+        import repo_env as re
+
+        parsed.update(re.get_repo_dotenv_local_parsed())
+    except ImportError:
+        pass
+    if name in parsed:
+        value = str(parsed[name]).strip()
+        if value:
+            return value
+    return (os.getenv(name) or default).strip()
+
+
 def _load_repo_dotenv_if_absent() -> None:
     """Fill os.environ from ``.env`` next to this script for keys not already set.
 
@@ -1329,7 +1349,7 @@ def _load_confluence_publish_config() -> ConfluencePublishConfig | None:
     api_token = (os.getenv("ZEPHYR_CONFLUENCE_API_TOKEN") or "").strip()
     space_key = (os.getenv("ZEPHYR_CONFLUENCE_SPACE_KEY") or "").strip()
     parent_page_id = (os.getenv("ZEPHYR_CONFLUENCE_PARENT_PAGE_ID") or "").strip() or None
-    title_prefix = (os.getenv("ZEPHYR_CONFLUENCE_TITLE_PREFIX") or "").strip()
+    title_prefix = _env_prefers_repo_dotenv("ZEPHYR_CONFLUENCE_TITLE_PREFIX", "")
     api_prefix = (os.getenv("ZEPHYR_CONFLUENCE_API_PREFIX") or "rest/api").strip().strip("/")
     auth_scheme = (os.getenv("ZEPHYR_CONFLUENCE_AUTH_SCHEME") or "basic").strip().lower()
     publish_daily = _parse_bool_env(os.getenv("ZEPHYR_CONFLUENCE_PUBLISH_DAILY"))
@@ -1349,11 +1369,14 @@ def _load_confluence_publish_config() -> ConfluencePublishConfig | None:
         (os.getenv("ZEPHYR_CONFLUENCE_BUGS_PARENT_PAGE_ID") or "").strip() or None
     )
     bugs_parent_title = (
-        (os.getenv("ZEPHYR_CONFLUENCE_BUGS_PARENT_TITLE") or "Баги").strip() or "Баги"
+        _env_prefers_repo_dotenv("ZEPHYR_CONFLUENCE_BUGS_PARENT_TITLE", "Баги") or "Баги"
     )
     week_folder_title_template = (
-        os.getenv("ZEPHYR_CONFLUENCE_WEEK_FOLDER_TITLE_TEMPLATE") or "Week {year}-w{week:02d}"
-    ).strip() or "Week {year}-w{week:02d}"
+        _env_prefers_repo_dotenv(
+            "ZEPHYR_CONFLUENCE_WEEK_FOLDER_TITLE_TEMPLATE", "Week {year}-w{week:02d}"
+        )
+        or "Week {year}-w{week:02d}"
+    )
     if not (publish_daily or publish_weekly or publish_bugs or publish_weekly_analytics):
         return None
     if auth_scheme not in {"basic", "bearer"}:
@@ -1423,8 +1446,8 @@ def _confluence_request_json(
         headers.update(extra_headers)
     payload: bytes | None = None
     if body is not None:
-        payload = json.dumps(body).encode("utf-8")
-        headers["Content-Type"] = "application/json"
+        payload = json.dumps(body, ensure_ascii=False).encode("utf-8")
+        headers["Content-Type"] = "application/json; charset=utf-8"
     method_upper = method.upper()
     timeout = _env_int("ZEPHYR_CONFLUENCE_TIMEOUT_SEC", 60)
     retries = _env_int("ZEPHYR_CONFLUENCE_RETRIES", 3)
@@ -2046,6 +2069,39 @@ def _confluence_resolve_existing_on_duplicate_title(
     return (page_id, version, _confluence_get_page_parent_id(cfg, page_id))
 
 
+def _maybe_audit_export_file(path: str, *, kind: str = "file") -> None:
+    try:
+        import zephyr_audit as za
+
+        if za.audit_enabled() and path and os.path.isfile(path):
+            za.audit_export_file(path, kind=kind)
+    except Exception:
+        pass
+
+
+def _maybe_audit_publish_confluence(
+    *,
+    title: str,
+    page_id: str,
+    action: str,
+    path: str,
+    result: str = "success",
+) -> None:
+    try:
+        import zephyr_audit as za
+
+        if za.audit_enabled():
+            za.audit_publish_confluence(
+                title=title,
+                page_id=page_id,
+                action=action,
+                path=path,
+                result=result,
+            )
+    except Exception:
+        pass
+
+
 def _confluence_upsert_storage_page(
     cfg: ConfluencePublishConfig,
     title: str,
@@ -2451,6 +2507,33 @@ def _publish_single_html_to_confluence(
     parent_page_id: str | None = None,
 ) -> list[str]:
     outcomes: list[str] = []
+
+    def _upsert_audited(
+        title: str,
+        storage_html: str,
+        **kwargs: Any,
+    ) -> tuple[str, str]:
+        try:
+            page_id, action = _confluence_upsert_storage_page(
+                cfg, title, storage_html, **kwargs
+            )
+        except Exception:
+            _maybe_audit_publish_confluence(
+                title=title,
+                page_id="",
+                action="failed",
+                path=html_path,
+                result="failure",
+            )
+            raise
+        _maybe_audit_publish_confluence(
+            title=title,
+            page_id=page_id,
+            action=action,
+            path=html_path,
+        )
+        return page_id, action
+
     with open(html_path, encoding="utf-8") as source:
         raw_html = source.read()
     base_name = os.path.basename(html_path)
@@ -2473,8 +2556,7 @@ def _publish_single_html_to_confluence(
             or primary_title.endswith(BUGS_ROLLUP_CONFLUENCE_TITLE)
         ):
             legacy_title = _confluence_publish_title(BUGS_ROLLUP_DISPLAY_TITLE, cfg)
-        page_id, action = _confluence_upsert_storage_page(
-            cfg,
+        page_id, action = _upsert_audited(
             primary_title,
             body_html,
             legacy_title=legacy_title,
@@ -2489,8 +2571,7 @@ def _publish_single_html_to_confluence(
         primary_title, legacy_title = _confluence_resolve_publish_titles(
             html_path, raw_html, cfg
         )
-        page_id, action = _confluence_upsert_storage_page(
-            cfg,
+        page_id, action = _upsert_audited(
             primary_title,
             body_html,
             legacy_title=legacy_title,
@@ -2512,8 +2593,8 @@ def _publish_single_html_to_confluence(
             ).strip(),
             cfg,
         )
-        page_id, action = _confluence_upsert_storage_page(
-            cfg, analytics_title, body_html, parent_page_id=parent_page_id
+        page_id, action = _upsert_audited(
+            analytics_title, body_html, parent_page_id=parent_page_id
         )
         outcomes.append(f"{action}: {analytics_title} (page id {page_id})")
         return outcomes
@@ -2528,8 +2609,7 @@ def _publish_single_html_to_confluence(
         primary_title, legacy_title = _confluence_resolve_publish_titles(
             html_path, raw_html, cfg
         )
-        page_id, action = _confluence_upsert_storage_page(
-            cfg,
+        page_id, action = _upsert_audited(
             primary_title,
             body_html,
             legacy_title=legacy_title,
@@ -2567,8 +2647,7 @@ def _publish_single_html_to_confluence(
         body_html = _append_confluence_attachment_image(body_html, chart_name)
     body_html = _wrap_daily_report_with_excerpt_macro(body_html)
     primary_title, legacy_title = _confluence_resolve_publish_titles(html_path, raw_html, cfg)
-    page_id, action = _confluence_upsert_storage_page(
-        cfg,
+    page_id, action = _upsert_audited(
         primary_title,
         body_html,
         legacy_title=legacy_title,
@@ -5209,23 +5288,51 @@ def _jira_cycle_url(cycle_key: str) -> str:
 
 
 def _jira_issue_url(issue_key: str) -> str:
-    base_url = (
-        (os.getenv("ZEPHYR_JIRA_BASE_URL") or "").strip().rstrip("/")
-        or (os.getenv("ZEPHYR_BASE_URL") or "https://jira.navio.auto").strip().rstrip("/")
+    base_url = _resolve_weekly_jira_metadata_base(
+        os.getenv("ZEPHYR_BASE_URL", "https://jira.navio.auto")
     )
     return f"{base_url}/browse/{urllib.parse.quote(issue_key)}"
 
 
 _JIRA_META_CACHE: dict[str, dict[str, str]] = {}
+# Set when Jira REST bulk search fails; skips slow per-key fallbacks.
+_JIRA_META_BULK_SKIP_FALLBACK = False
+
+
+def _jira_metadata_bulk_failure(exc: BaseException) -> bool:
+    text = repr(exc)
+    if "Non-JSON response" in text or "JSONDecodeError" in text:
+        return True
+    return (
+        "Network error" in text
+        or "getaddrinfo failed" in text
+        or "urlopen error" in text
+    )
+
+
+def _normalize_jira_rest_base_url(url: str) -> str:
+    """Normalize Jira REST base URL and warn on common typos."""
+    cleaned = (url or "").strip().rstrip("/")
+    if cleaned.endswith(".autoS"):
+        fixed = cleaned[:-1]
+        sys.stderr.write(
+            f"[weekly] Warning: JIRA base URL typo {cleaned!r} — using {fixed!r}. "
+            "Fix ZEPHYR_JIRA_BASE_URL in .env.\n"
+        )
+        return fixed
+    return cleaned
 
 
 def _resolve_weekly_jira_metadata_base(cli_base_url: str) -> str:
     """REST base for Jira issue/search (may differ from Zephyr Scale API host)."""
-    return (
-        (os.getenv("ZEPHYR_JIRA_BASE_URL") or "").strip().rstrip("/")
-        or (os.getenv("ZEPHYR_BASE_URL") or "").strip().rstrip("/")
-        or (cli_base_url or "").strip().rstrip("/")
+    raw = (
+        _env_prefers_repo_dotenv("ZEPHYR_JIRA_BASE_URL", "")
+        or (os.getenv("ZEPHYR_JIRA_BASE_URL") or "").strip()
+        or _env_prefers_repo_dotenv("ZEPHYR_BASE_URL", "")
+        or (os.getenv("ZEPHYR_BASE_URL") or "").strip()
+        or (cli_base_url or "").strip()
     )
+    return _normalize_jira_rest_base_url(raw)
 
 
 def _jira_bug_metadata_auth_headers(
@@ -5251,6 +5358,9 @@ def _fetch_jira_bug_metadata(
     Returns {key: {summary, status, priority, issuetype}}.
     Errors and missing keys are silently skipped — the caller falls back to plain key links.
     """
+    global _JIRA_META_BULK_SKIP_FALLBACK
+    _JIRA_META_BULK_SKIP_FALLBACK = False
+
     out: dict[str, dict[str, str]] = {}
     eff_headers = _jira_bug_metadata_auth_headers(auth_headers)
     if not keys or not base_url or not eff_headers:
@@ -5376,11 +5486,16 @@ def _fetch_jira_bug_metadata(
         if last_exc is not None:
             hint = ""
             err_text = repr(last_exc)
-            if "JSONDecodeError" in err_text or "Non-JSON response" in err_text:
-                hint = (
-                    f" — check ZEPHYR_JIRA_BASE_URL ({base_url!r}) "
-                    "and ZEPHYR_JIRA_API_TOKEN (Jira REST, not Zephyr Scale host)"
-                )
+            if _jira_metadata_bulk_failure(last_exc):
+                global _JIRA_META_BULK_SKIP_FALLBACK
+                _JIRA_META_BULK_SKIP_FALLBACK = True
+                if "Non-JSON" in err_text or "JSONDecodeError" in err_text:
+                    hint = (
+                        f" — check ZEPHYR_JIRA_BASE_URL ({base_url!r}) "
+                        "and ZEPHYR_JIRA_API_TOKEN (Jira REST, not Zephyr Scale host)"
+                    )
+                else:
+                    hint = f" — check ZEPHYR_JIRA_BASE_URL ({base_url!r}) and network/VPN"
             sys.stderr.write(
                 f"[weekly] Jira metadata lookup failed for {len(chunk)} key(s): "
                 f"{last_exc!r}{hint}\n"
@@ -5389,6 +5504,8 @@ def _fetch_jira_bug_metadata(
 
     chunk_size = 100
     for start in range(0, len(pending), chunk_size):
+        if _JIRA_META_BULK_SKIP_FALLBACK:
+            break
         chunk = pending[start : start + chunk_size]
         issues: list[dict[str, Any]] = list(_search_chunk(chunk) or [])
         got_keys = {
@@ -5396,6 +5513,12 @@ def _fetch_jira_bug_metadata(
             for i in issues
             if isinstance(i, dict) and str(i.get("key") or "").strip()
         }
+        if _JIRA_META_BULK_SKIP_FALLBACK:
+            sys.stderr.write(
+                "[weekly] Skipping per-issue Jira metadata fallback "
+                "(bulk Jira REST failed); weekly matrix will use plain keys.\n"
+            )
+            continue
         for req in chunk:
             r = str(req).strip()
             if not r or r.upper() in got_keys:
@@ -6272,8 +6395,19 @@ def _resolve_daily_title_day(cycles: dict[str, Any]) -> date | None:
     return _parse_display_date(title_date)
 
 
+_DAILY_DOCUMENT_TITLE_SUFFIX_DEFAULT = "Отчёт теста ML planner'а на полигонах"
+# Bump to force daily HTML rewrite (e.g. after UTF-8 launcher fixes).
+_DAILY_HTML_BUILD_REV = "3"
+
+
 def _daily_document_title(folder_name: str) -> str:
-    return f"[{folder_name}] Отчёт теста ML planner'а на полигонах"
+    suffix = (
+        _env_prefers_repo_dotenv(
+            "ZEPHYR_DAILY_DOCUMENT_TITLE_SUFFIX", _DAILY_DOCUMENT_TITLE_SUFFIX_DEFAULT
+        )
+        or _DAILY_DOCUMENT_TITLE_SUFFIX_DEFAULT
+    )
+    return f"[{folder_name}] {suffix}"
 
 
 def _normalize_weekly_cycle_label(label: str) -> tuple[str, bool]:
@@ -8509,7 +8643,7 @@ _WEEKLY_HTML_DEFECT_STYLES = (
 
 
 def _bugs_rollup_last_weeks_count() -> int:
-    raw = (os.getenv("ZEPHYR_BUGS_ROLLUP_LAST_WEEKS") or "2").strip()
+    raw = (os.getenv("ZEPHYR_BUGS_ROLLUP_LAST_WEEKS") or "4").strip()
     try:
         return max(1, int(raw))
     except ValueError:
@@ -11685,6 +11819,7 @@ def render_daily_html_report(
     sections = [
         "<!doctype html>",
         "<html><head><meta charset='utf-8'>",
+        f"<!-- zephyr-daily-build-rev:{_DAILY_HTML_BUILD_REV} -->",
         f"<title>{html.escape(doc_title)}</title>",
         (
             "<style>"
@@ -12426,9 +12561,10 @@ def _emit_startup_heartbeat() -> None:
 def main() -> int:
     _load_repo_dotenv_if_absent()
     args = parse_args()
-    _emit_startup_heartbeat()
 
     lock_acquired = False
+    audit_run = False
+    exit_code = 1
     try:
         if args.run_lock_file:
             lock_acquired = _try_acquire_run_lock(args.run_lock_file)
@@ -12439,14 +12575,40 @@ def main() -> int:
                 )
                 return 0
 
+        import zephyr_audit as za
+
+        za.audit_run_start()
+        audit_run = True
+
         loop_interval_minutes = _resolve_loop_interval_minutes(args)
         if loop_interval_minutes is not None:
-            return _run_loop(args, loop_interval_minutes)
+            exit_code = _run_loop(args, loop_interval_minutes)
+        else:
+            exit_code = run_once(args)
+        return exit_code
+    except Exception as exc:  # noqa: BLE001
+        import traceback
 
-        return run_once(args)
+        print(f"Fatal error: {exc}", file=sys.stderr)
+        traceback.print_exc()
+        exit_code = 1
+        return exit_code
     finally:
         if lock_acquired:
             _release_run_lock()
+        if audit_run:
+            try:
+                import zephyr_audit as za
+
+                za.audit_run_finish(exit_code)
+            except Exception:
+                pass
+        try:
+            import zephyr_pipeline_health as ph
+
+            ph.write_pipeline_health_html(exit_code=exit_code if audit_run else None)
+        except Exception:
+            pass
 
 
 def run_once(args: argparse.Namespace) -> int:
@@ -12975,10 +13137,13 @@ def run_once(args: argparse.Namespace) -> int:
                 write_csv(path, weekly)
 
             write_folder_summary_csv(args.output, folder_rows)
+            _maybe_audit_export_file(args.output, kind="weekly_csv")
             if args.export_cycles_cases:
                 write_cycles_cases_csv(args.cycles_cases_output, cycles_cases_rows)
+                _maybe_audit_export_file(args.cycles_cases_output, kind="cycles_cases_csv")
             if args.export_case_steps:
                 write_case_steps_csv(args.case_steps_output, case_steps_rows)
+                _maybe_audit_export_file(args.case_steps_output, kind="case_steps_csv")
             timings.record("write CSV outputs", time.perf_counter() - write_csv_started_at)
             needs_report_data = bool(
                 args.cycle_progress_output
@@ -13927,8 +14092,10 @@ def _maybe_setup_run_log_file() -> None:
     sys.stdout = _TeeIO(orig_out, log_f)
     sys.stderr = _TeeIO(orig_err, log_f)
     atexit.register(_restore_stdio_and_close_log, orig_out, orig_err, log_f)
+    print(f"Run log file: {log_path}", flush=True)
 
 
 if __name__ == "__main__":
     _maybe_setup_run_log_file()
+    _emit_startup_heartbeat()
     raise SystemExit(main())
