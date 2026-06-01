@@ -34,7 +34,7 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
-from typing import Any, Callable, TextIO, cast
+from typing import Any, Callable, Iterable, TextIO, cast
 
 from bug_duplicate_detection import (
     DuplicateCandidate,
@@ -1820,7 +1820,8 @@ def _confluence_week_start_from_publish_path(path: str) -> date | None:
         report_day = datetime.strptime(match.group(1), "%Y-%m-%d").date()
     except ValueError:
         return None
-    return _release_week_start(report_day)
+    test_day = _test_day_from_folder_day(report_day)
+    return _release_week_start(test_day)
 
 
 def resolve_confluence_publish_roots(cfg: ConfluencePublishConfig) -> ConfluencePublishRoots:
@@ -1865,6 +1866,14 @@ def publish_reports_to_confluence_by_week(
         for line in batch_outcomes:
             outcomes.append(f"[{folder_title}] {line}")
     if ungrouped:
+        names = ", ".join(os.path.basename(p) for p in ungrouped[:10])
+        extra = f" (+{len(ungrouped) - 10} more)" if len(ungrouped) > 10 else ""
+        print(
+            "Confluence publish warning: "
+            f"{len(ungrouped)} daily/weekly HTML file(s) have no week in the filename "
+            f"and will publish under the root parent: {names}{extra}",
+            file=sys.stderr,
+        )
         batch_outcomes = publish_reports_to_confluence(
             ungrouped, cfg, parent_page_id=fallback_parent
         )
@@ -3392,7 +3401,12 @@ def _build_daily_report_title(folder_name: str, cycles: dict[str, Any]) -> str:
 
 
 def _build_daily_report_base_name(folder_id: str, folder_name: str, cycles: dict[str, Any]) -> str:
-    report_date = _resolve_daily_title_date(cycles) or "unknown-date"
+    report_day = _parse_report_day_from_folder_name(folder_name)
+    if report_day is None:
+        report_day = _resolve_folder_report_day(folder_name, cycles)
+    if report_day is None:
+        report_day = _resolve_daily_title_day(cycles)
+    report_date = report_day.isoformat() if report_day else "unknown-date"
     return f"nightly-dev-{slugify(folder_name)}_{report_date}_{folder_id}"
 
 
@@ -4418,6 +4432,15 @@ def build_case_iteration_key_fallback(
     return out
 
 
+_CASE_STEPS_MIN_ROW_LEN = 15
+
+
+def _case_step_cell(row: list[str], index: int) -> str:
+    if index >= len(row):
+        return ""
+    return str(row[index] or "").strip()
+
+
 def aggregate_readable_daily_reports_from_steps(
     case_steps_rows: list[list[str]],
     cycles_cases_rows: list[list[str]],
@@ -4431,36 +4454,38 @@ def aggregate_readable_daily_reports_from_steps(
     case_merge: dict[tuple[str, str, str, str], dict[str, Any]] = {}
 
     for row in case_steps_rows:
-        if len(row) < 20:
+        if len(row) < _CASE_STEPS_MIN_ROW_LEN:
             continue
-        folder_id = row[0]
-        folder_name = row[1]
-        cycle_key_disp = row[3]
-        cycle_name_disp = row[4]
-        test_run_id = str(row[5]).strip() if row[5] else ""
-        test_case_key = row[7]
-        test_case_name = row[8]
-        step_comment = row[14] if len(row) > 14 else ""
-        step_status_name = row[16] if len(row) > 16 else ""
-        step_execution_date = row[17] if len(row) > 17 else ""
-        test_result_status_name = row[19] if len(row) > 19 else ""
-        cycle_objective = row[20] if len(row) > 20 else ""
-        objective = row[21] if len(row) > 21 else ""
-        task_links = row[22] if len(row) > 22 else ""
-        cycle_actual_start_date = row[23] if len(row) > 23 else ""
-        case_iteration_key = row[24] if len(row) > 24 else ""
+        folder_id = _case_step_cell(row, 0)
+        folder_name = _case_step_cell(row, 1)
+        cycle_key_disp = _case_step_cell(row, 3)
+        cycle_name_disp = _case_step_cell(row, 4)
+        test_run_id = _case_step_cell(row, 5)
+        test_case_id = _case_step_cell(row, 6)
+        test_case_key = _case_step_cell(row, 7)
+        test_case_name = _case_step_cell(row, 8)
+        step_comment = _case_step_cell(row, 14)
+        step_status_name = _case_step_cell(row, 16)
+        step_execution_date = _case_step_cell(row, 17)
+        test_result_status_name = _case_step_cell(row, 19)
+        cycle_objective = _case_step_cell(row, 20)
+        objective = _case_step_cell(row, 21)
+        task_links = _case_step_cell(row, 22)
+        cycle_actual_start_date = _case_step_cell(row, 23)
+        case_iteration_key = _case_step_cell(row, 24)
+        case_lookup_key = test_case_key or test_case_id
         if not case_iteration_key:
             case_iteration_key = (
                 fallback_iteration.get((folder_id, test_case_key))
-                or fallback_iteration.get((folder_id, row[6] if len(row) > 6 else ""))
+                or fallback_iteration.get((folder_id, test_case_id))
                 or fallback_iteration.get((folder_id, cycle_key_disp))
                 or ""
             )
 
-        if not folder_id or not folder_name or not test_run_id or not test_case_key:
+        if not folder_id or not folder_name or not test_run_id or not case_lookup_key:
             continue
 
-        mkey = (folder_id, folder_name, test_run_id, test_case_key)
+        mkey = (folder_id, folder_name, test_run_id, case_lookup_key)
         if mkey not in case_merge:
             parts_init: list[str] = []
             sc0 = step_comment.strip() if step_comment else ""
@@ -4493,7 +4518,7 @@ def aggregate_readable_daily_reports_from_steps(
                 m["cycle_objective"] = cycle_objective
             if step_status_name and not m["step_status_name"]:
                 m["step_status_name"] = step_status_name
-            if test_result_status_name and not m["test_result_status_name"]:
+            if test_result_status_name:
                 m["test_result_status_name"] = test_result_status_name
             sc = step_comment.strip() if step_comment else ""
             if sc and sc not in m.setdefault("logs_comment_parts", []):
@@ -4515,7 +4540,7 @@ def aggregate_readable_daily_reports_from_steps(
                 m["task_links"] = merged_links
 
     reports: dict[tuple[str, str], dict[str, Any]] = {}
-    for (folder_id, folder_name, test_run_id, test_case_key), m in case_merge.items():
+    for (folder_id, folder_name, test_run_id, case_lookup_key), m in case_merge.items():
         report_key = (folder_id, folder_name)
         report = reports.setdefault(report_key, {"cycles": {}})
         cycle_bucket = report["cycles"].setdefault(
@@ -4544,14 +4569,15 @@ def aggregate_readable_daily_reports_from_steps(
         )
         parts = m.get("logs_comment_parts") or []
         logs_source = "\n".join(dict.fromkeys(parts)) if parts else (m.get("step_comment") or "")
-        cycle_bucket["cases"][test_case_key] = {
-            "test_case_key": test_case_key,
+        display_comment = (m.get("step_comment") or "").strip() or logs_source
+        cycle_bucket["cases"][case_lookup_key] = {
+            "test_case_key": case_lookup_key,
             "test_case_name": m["test_case_name"],
             "result": result,
             "execution_date": _resolve_display_date(m["actual_start_date"], m["step_execution_date"]),
             "actual_start_date": _normalize_display_date(m["actual_start_date"]),
             "case_iteration_key": m["case_iteration_key"],
-            "comment": m["step_comment"],
+            "comment": display_comment,
             "objective": m["objective"],
             "tasks": m["task_links"],
             "logs_source_text": logs_source,
@@ -11962,9 +11988,13 @@ def _list_weekly_readable_html_paths(output_dir: str) -> list[str]:
 
 
 def _merge_confluence_publish_paths(
-    expected_paths: list[str], output_dir: str, *, list_on_disk
+    expected_paths: list[str],
+    output_dir: str,
+    *,
+    list_on_disk,
+    union_disk: bool = True,
 ) -> list[str]:
-    on_disk = list_on_disk(output_dir)
+    on_disk = list_on_disk(output_dir) if union_disk else []
     merged = sorted({p for p in expected_paths if p} | {p for p in on_disk if p})
     if on_disk and not expected_paths:
         print(
@@ -11972,6 +12002,28 @@ def _merge_confluence_publish_paths(
             f"under {output_dir}."
         )
     return merged
+
+
+def _prune_orphan_daily_html(output_dir: str, keep_paths: Iterable[str]) -> int:
+    """Remove stale daily HTML files not produced in the current run."""
+    if not os.path.isdir(output_dir):
+        return 0
+    keep_abs = {os.path.normpath(p) for p in keep_paths if p}
+    removed = 0
+    for name in os.listdir(output_dir):
+        if not name.endswith(".html") or name.startswith("weekly_cycle_matrix"):
+            continue
+        path = os.path.normpath(os.path.join(output_dir, name))
+        if path in keep_abs:
+            continue
+        try:
+            os.remove(path)
+            removed += 1
+        except OSError:
+            pass
+    if removed:
+        print(f"Removed {removed} stale daily HTML file(s) from {output_dir}")
+    return removed
 
 
 def _expected_daily_readable_html_paths(
@@ -12781,8 +12833,22 @@ def run_once(args: argparse.Namespace) -> int:
                         report_data = aggregate_readable_daily_reports_from_steps(
                             case_steps_rows, cycles_cases_rows
                         )
+                        print(
+                            f"Readable report data: case_steps_rows={len(case_steps_rows)}, "
+                            f"folders={len(report_data)}, source=case_steps"
+                        )
                     else:
                         report_data = aggregate_readable_daily_reports_legacy(cycles_cases_rows)
+                        print(
+                            f"Readable report data: folders={len(report_data)}, "
+                            "source=legacy_cycles_cases (no case steps)"
+                        )
+                        if args.export_daily_readable:
+                            print(
+                                "Warning: daily readable without case_steps — "
+                                "Комментарий/Задачи columns will be empty.",
+                                file=sys.stderr,
+                            )
             if (
                 effective_rolling_days > 0
                 and from_date is not None
@@ -12823,6 +12889,10 @@ def run_once(args: argparse.Namespace) -> int:
                         daily_html_publish_paths = _expected_daily_readable_html_paths(
                             args.daily_readable_dir, report_data
                         )
+                        if daily_html_publish_paths:
+                            _prune_orphan_daily_html(
+                                args.daily_readable_dir, daily_html_publish_paths
+                            )
             if args.export_build_log_report:
                 if not report_data:
                     print(
@@ -13169,6 +13239,7 @@ def run_once(args: argparse.Namespace) -> int:
                     daily_html_publish_paths,
                     args.daily_readable_dir,
                     list_on_disk=_list_daily_readable_html_paths,
+                    union_disk=False,
                 )
             if confluence_cfg and publish_confluence_weekly and args.export_weekly_readable:
                 weekly_html_publish_paths = _merge_confluence_publish_paths(
