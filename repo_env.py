@@ -54,14 +54,13 @@ def get_repo_dotenv_local_parsed() -> dict[str, str]:
 
 
 def load_repo_env(*, overlay_local: bool = False) -> None:
-    """Fill os.environ from .env; optional .env.local overwrites unset keys only."""
+    """Fill os.environ from .env; with overlay_local, .env.local wins (like run_zephyr.ps1)."""
     for name, value in get_repo_dotenv_parsed().items():
         if name not in os.environ:
             os.environ[name] = value
     if overlay_local:
         for name, value in get_repo_dotenv_local_parsed().items():
-            if name not in os.environ:
-                os.environ[name] = value
+            os.environ[name] = value
 
 
 def use_local_env_requested() -> bool:
