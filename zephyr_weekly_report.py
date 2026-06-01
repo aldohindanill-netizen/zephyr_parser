@@ -1478,9 +1478,27 @@ def _confluence_page_title_for_file(path: str, cfg: ConfluencePublishConfig) -> 
     base = os.path.basename(path)
     name, _ext = os.path.splitext(base)
     title = name.replace("_", " ")
-    if cfg.title_prefix:
-        return f"{cfg.title_prefix} {title}".strip()
+    return _confluence_publish_title(title, cfg)
+
+
+def _confluence_publish_title(raw_title: str, cfg: ConfluencePublishConfig) -> str:
+    """Apply ZEPHYR_CONFLUENCE_TITLE_PREFIX so HTML <title> cannot bypass the prefix."""
+    title = (raw_title or "").strip()
+    if not title:
+        return title
+    prefix = (cfg.title_prefix or "").strip()
+    if prefix and not title.startswith(prefix):
+        return f"{prefix} {title}"
     return title
+
+
+def _confluence_space_wide_title_lookup(cfg: ConfluencePublishConfig) -> bool:
+    """When false, only match pages that are direct children of the target parent."""
+    raw = os.getenv("ZEPHYR_CONFLUENCE_SPACE_WIDE_TITLE_LOOKUP")
+    if raw is not None and str(raw).strip():
+        return _parse_bool_env(raw)
+    # Local/sandbox runs use a title prefix; never hijack production pages by title.
+    return not bool((cfg.title_prefix or "").strip())
 
 
 def _extract_html_title(raw_html: str) -> str:
@@ -1691,14 +1709,14 @@ def _append_confluence_attachment_image(storage_html: str, file_name: str) -> st
     return f"{storage_html}\n{image_macro}" if storage_html else image_macro
 
 
-def _confluence_find_page_by_title(
-    cfg: ConfluencePublishConfig, title: str
+def _confluence_find_page_by_title_in_space(
+    cfg: ConfluencePublishConfig, space_key: str, title: str
 ) -> tuple[str, int] | None:
     payload = _confluence_request_json(
         cfg,
         f"{cfg.api_prefix}/content",
         params={
-            "spaceKey": cfg.space_key,
+            "spaceKey": space_key,
             "title": title,
             "status": "current",
             "expand": "version",
@@ -1713,6 +1731,14 @@ def _confluence_find_page_by_title(
     if not page_id:
         return None
     return (page_id, version)
+
+
+def _confluence_find_page_by_title(
+    cfg: ConfluencePublishConfig, title: str, *, space_key: str | None = None
+) -> tuple[str, int] | None:
+    return _confluence_find_page_by_title_in_space(
+        cfg, space_key or cfg.space_key, title
+    )
 
 
 def _confluence_find_child_page_by_title(
@@ -1752,10 +1778,11 @@ def _confluence_create_child_page(
     *,
     storage_html: str = "<p></p>",
 ) -> str:
+    space_key = _confluence_get_page_space_key(cfg, parent_page_id)
     create_body: dict[str, Any] = {
         "type": "page",
         "title": title,
-        "space": {"key": cfg.space_key},
+        "space": {"key": space_key},
         "ancestors": [{"id": parent_page_id}],
         "body": {"storage": {"value": storage_html, "representation": "storage"}},
     }
@@ -1901,6 +1928,37 @@ def _is_bugs_rollup_html_path(path: str) -> bool:
     return os.path.basename(path) == "bugs_index.html"
 
 
+_confluence_page_space_cache: dict[str, str] = {}
+
+
+def _confluence_get_page_space_key(cfg: ConfluencePublishConfig, page_id: str) -> str:
+    """Space key of an existing page (cached). Falls back to cfg.space_key."""
+    cached = _confluence_page_space_cache.get(page_id)
+    if cached:
+        return cached
+    payload = _confluence_request_json(
+        cfg,
+        f"{cfg.api_prefix}/content/{page_id}",
+        params={"expand": "space"},
+    )
+    space = payload.get("space") if isinstance(payload, dict) else None
+    key = ""
+    if isinstance(space, dict):
+        key = str(space.get("key") or "").strip()
+    if not key:
+        key = cfg.space_key
+    _confluence_page_space_cache[page_id] = key
+    return key
+
+
+def _confluence_space_key_for_parent(
+    cfg: ConfluencePublishConfig, parent_page_id: str | None
+) -> str:
+    if parent_page_id:
+        return _confluence_get_page_space_key(cfg, parent_page_id)
+    return cfg.space_key
+
+
 def _confluence_get_page_parent_id(cfg: ConfluencePublishConfig, page_id: str) -> str | None:
     payload = _confluence_request_json(
         cfg,
@@ -1935,21 +1993,57 @@ def _confluence_lookup_page_for_upsert(
             hit = _confluence_find_child_page_by_title(cfg, parent_page_id, legacy_title)
             if hit:
                 return (hit[0], hit[1], parent_page_id)
+        return None
+    if not _confluence_space_wide_title_lookup(cfg):
+        return None
+    lookup_space = (
+        _confluence_get_page_space_key(cfg, parent_page_id)
+        if parent_page_id
+        else cfg.space_key
+    )
     # Titles are unique per space: page may exist under another parent (e.g. before Week folders).
-    hit = _confluence_find_page_by_title(cfg, title)
+    hit = _confluence_find_page_by_title_in_space(cfg, lookup_space, title)
     if hit:
         page_id, version = hit
         if parent_page_id and page_id == parent_page_id:
             return None
         return (page_id, version, _confluence_get_page_parent_id(cfg, page_id))
     if legacy_title and legacy_title != title:
-        hit = _confluence_find_page_by_title(cfg, legacy_title)
+        hit = _confluence_find_page_by_title_in_space(cfg, lookup_space, legacy_title)
         if hit:
             page_id, version = hit
             if parent_page_id and page_id == parent_page_id:
                 return None
             return (page_id, version, _confluence_get_page_parent_id(cfg, page_id))
     return None
+
+
+def _confluence_resolve_existing_on_duplicate_title(
+    cfg: ConfluencePublishConfig,
+    title: str,
+    *,
+    space_key: str,
+    parent_page_id: str | None,
+    legacy_title: str | None,
+) -> tuple[str, int, str | None] | None:
+    """Find an existing page after Confluence rejects create (title unique per space)."""
+    existing = _confluence_lookup_page_for_upsert(
+        cfg,
+        title,
+        parent_page_id=parent_page_id,
+        legacy_title=legacy_title,
+    )
+    if existing:
+        return existing
+    hit = _confluence_find_page_by_title_in_space(cfg, space_key, title)
+    if not hit and legacy_title and legacy_title != title:
+        hit = _confluence_find_page_by_title_in_space(cfg, space_key, legacy_title)
+    if not hit:
+        return None
+    page_id, version = hit
+    if parent_page_id and page_id == parent_page_id:
+        return None
+    return (page_id, version, _confluence_get_page_parent_id(cfg, page_id))
 
 
 def _confluence_upsert_storage_page(
@@ -1961,6 +2055,7 @@ def _confluence_upsert_storage_page(
     parent_page_id: str | None = None,
 ) -> tuple[str, str]:
     effective_parent = parent_page_id if parent_page_id is not None else cfg.parent_page_id
+    space_key = _confluence_space_key_for_parent(cfg, effective_parent)
     existing = _confluence_lookup_page_for_upsert(
         cfg,
         title,
@@ -1973,11 +2068,12 @@ def _confluence_upsert_storage_page(
             effective_parent
             and (not current_parent or current_parent != effective_parent)
         )
+        update_space_key = _confluence_get_page_space_key(cfg, page_id)
         body: dict[str, Any] = {
             "id": page_id,
             "type": "page",
             "title": title,
-            "space": {"key": cfg.space_key},
+            "space": {"key": update_space_key},
             "version": {"number": current_version + 1},
             "body": {"storage": {"value": storage_html, "representation": "storage"}},
         }
@@ -1988,17 +2084,32 @@ def _confluence_upsert_storage_page(
                 cfg, f"{cfg.api_prefix}/content/{page_id}", method="PUT", body=body
             )
         except RuntimeError as exc:
-            if "HTTP 404" not in str(exc):
+            err = str(exc)
+            if "HTTP 404" in err:
+                existing = None
+            elif need_reparent and "HTTP 400" in err:
+                print(
+                    f"Confluence: cannot move page '{title}' (id {page_id}); "
+                    f"creating under parent {effective_parent}",
+                    file=sys.stderr,
+                )
+                existing = None
+            elif "HTTP 500" in err and effective_parent:
+                print(
+                    f"Confluence: update failed (HTTP 500) for '{title}' (id {page_id}); "
+                    "creating a new page under target parent",
+                    file=sys.stderr,
+                )
+                existing = None
+            else:
                 raise
-            # Stale id (deleted/trashed page): create a fresh page under the target parent.
-            existing = None
         else:
             action = "moved+updated" if need_reparent else "updated"
             return page_id, action
     create_body: dict[str, Any] = {
         "type": "page",
         "title": title,
-        "space": {"key": cfg.space_key},
+        "space": {"key": space_key},
         "body": {"storage": {"value": storage_html, "representation": "storage"}},
     }
     if effective_parent:
@@ -2009,26 +2120,31 @@ def _confluence_upsert_storage_page(
         )
     except RuntimeError as exc:
         err = str(exc)
-        if "HTTP 400" not in err or "already exists" not in err.lower():
+        duplicate_title = "HTTP 400" in err and (
+            "already exists" in err.lower() or "title already exists" in err.lower()
+        )
+        if not duplicate_title:
             raise
-        existing = _confluence_lookup_page_for_upsert(
+        resolved = _confluence_resolve_existing_on_duplicate_title(
             cfg,
             title,
+            space_key=space_key,
             parent_page_id=effective_parent,
             legacy_title=legacy_title,
         )
-        if not existing:
+        if not resolved:
             raise
-        page_id, current_version, current_parent = existing
+        page_id, current_version, current_parent = resolved
         need_reparent = bool(
             effective_parent
             and (not current_parent or current_parent != effective_parent)
         )
+        retry_space_key = _confluence_get_page_space_key(cfg, page_id)
         body = {
             "id": page_id,
             "type": "page",
             "title": title,
-            "space": {"key": cfg.space_key},
+            "space": {"key": retry_space_key},
             "version": {"number": current_version + 1},
             "body": {"storage": {"value": storage_html, "representation": "storage"}},
         }
@@ -2292,131 +2408,86 @@ def publish_reports_to_confluence(
 ) -> list[str]:
     outcomes: list[str] = []
     for html_path in html_paths:
-        with open(html_path, encoding="utf-8") as source:
-            raw_html = source.read()
-        base_name = os.path.basename(html_path)
-        is_build_log = _is_build_log_html_path(html_path)
-        is_bugs_rollup = _is_bugs_rollup_html_path(html_path)
-        is_weekly_analytics = base_name == "weekly_analytics.html"
-        is_weekly = base_name.startswith("weekly_cycle_matrix")
-        if is_bugs_rollup:
-            body_html = _normalize_html_for_confluence_storage(raw_html)
-            body_html = _inject_confluence_anchor_macros(body_html)
-            body_html = _convert_fragment_links_to_confluence(body_html)
-            title_from_html = _extract_html_title(raw_html).strip()
-            title_from_file = _confluence_page_title_for_file(html_path, cfg)
-            primary_title = title_from_html or title_from_file or BUGS_ROLLUP_CONFLUENCE_TITLE
-            legacy_title = None
-            if primary_title == BUGS_ROLLUP_CONFLUENCE_TITLE:
-                legacy_title = BUGS_ROLLUP_DISPLAY_TITLE
-            elif title_from_html and title_from_file and title_from_html != title_from_file:
-                legacy_title = title_from_file
-            page_id, action = _confluence_upsert_storage_page(
-                cfg,
-                primary_title,
-                body_html,
-                legacy_title=legacy_title,
-                parent_page_id=parent_page_id,
+        try:
+            outcomes.extend(
+                _publish_single_html_to_confluence(
+                    html_path, cfg, parent_page_id=parent_page_id
+                )
             )
-            outcomes.append(f"{action}: {primary_title} (page id {page_id})")
-            continue
-        if is_build_log:
-            body_html = _normalize_html_for_confluence_storage(raw_html)
-            body_html = _inject_confluence_anchor_macros(body_html)
-            body_html = _convert_fragment_links_to_confluence(body_html)
-            title_from_html = _extract_html_title(raw_html).strip()
-            title_from_file = _confluence_page_title_for_file(html_path, cfg)
-            primary_title = title_from_html or title_from_file
-            legacy_title = (
-                title_from_file
-                if title_from_html and title_from_html != title_from_file
-                else None
-            )
-            page_id, action = _confluence_upsert_storage_page(
-                cfg,
-                primary_title,
-                body_html,
-                legacy_title=legacy_title,
-                parent_page_id=parent_page_id,
-            )
-            outcomes.append(f"{action}: {primary_title} (page id {page_id})")
-            continue
-        if is_weekly_analytics:
-            body_html = _normalize_html_for_confluence_storage(raw_html)
-            body_html = _inject_confluence_anchor_macros(body_html)
-            body_html = _convert_fragment_links_to_confluence(body_html)
-            body_html = _replace_weekly_overall_cells_with_zephyr_macro(body_html)
-            body_html = _replace_weekly_jira_key_spans_with_confluence_macro(body_html)
-            body_html = _replace_legacy_weekly_table_macros_with_excerpt(body_html)
-            analytics_title = (
-                os.getenv("ZEPHYR_CONFLUENCE_WEEKLY_ANALYTICS_TITLE") or "Zephyr Weekly Analytics"
-            ).strip()
-            page_id, action = _confluence_upsert_storage_page(
-                cfg, analytics_title, body_html
-            )
-            outcomes.append(f"{action}: {analytics_title} (page id {page_id})")
-            continue
-        if is_weekly:
-            body_html = _normalize_html_for_confluence_storage(raw_html)
-            body_html = _inject_confluence_anchor_macros(body_html)
-            body_html = _convert_fragment_links_to_confluence(body_html)
-            body_html = _replace_weekly_overall_cells_with_zephyr_macro(body_html)
-            body_html = _replace_weekly_jira_key_spans_with_confluence_macro(body_html)
-            body_html = _replace_legacy_weekly_table_macros_with_excerpt(body_html)
-            body_html = _wrap_weekly_scenario_block_with_excerpt_macro(body_html)
-            title_from_html = _extract_html_title(raw_html).strip()
-            title_from_file = _confluence_page_title_for_file(html_path, cfg)
-            primary_title = title_from_html or title_from_file
-            legacy_title = (
-                title_from_file
-                if title_from_html and title_from_html != title_from_file
-                else None
-            )
-            page_id, action = _confluence_upsert_storage_page(
-                cfg,
-                primary_title,
-                body_html,
-                legacy_title=legacy_title,
-                parent_page_id=parent_page_id,
-            )
-            outcomes.append(f"{action}: {primary_title} (page id {page_id})")
-            continue
-        cycle_objects_raw = _extract_zephyr_cycle_key_objects_from_html(raw_html)
-        cycle_objects: list[dict[str, Any]] = (
-            cycle_objects_raw if cycle_objects_raw is not None else []
-        )
-        zephyr_storage = _daily_zephyr_test_results_summary_storage_macro(cycle_objects)
-        counts = _extract_zephyr_status_counts_from_html(raw_html)
-        chart_storage = _daily_status_chart_storage_macro(counts) if counts else ""
-        use_zephyr_macro = bool(zephyr_storage)
-        use_native_chart = bool(chart_storage) and not use_zephyr_macro
+        except Exception as exc:  # noqa: BLE001
+            msg = f"failed: {os.path.basename(html_path)}: {exc}"
+            print(msg, file=sys.stderr)
+            outcomes.append(msg)
+    return outcomes
 
+
+def _confluence_resolve_publish_titles(
+    html_path: str,
+    raw_html: str,
+    cfg: ConfluencePublishConfig,
+    *,
+    fallback_title: str | None = None,
+) -> tuple[str, str | None]:
+    title_from_html = _extract_html_title(raw_html).strip()
+    title_from_file = _confluence_page_title_for_file(html_path, cfg)
+    raw_primary = title_from_html or title_from_file or (fallback_title or "")
+    primary_title = _confluence_publish_title(raw_primary, cfg)
+    legacy_title: str | None = None
+    if title_from_file and title_from_file != primary_title:
+        legacy_title = title_from_file
+    elif title_from_html:
+        prefixed_html = _confluence_publish_title(title_from_html, cfg)
+        if prefixed_html != primary_title:
+            legacy_title = prefixed_html
+        elif title_from_html != primary_title:
+            legacy_title = title_from_html
+    return primary_title, legacy_title
+
+
+def _publish_single_html_to_confluence(
+    html_path: str,
+    cfg: ConfluencePublishConfig,
+    *,
+    parent_page_id: str | None = None,
+) -> list[str]:
+    outcomes: list[str] = []
+    with open(html_path, encoding="utf-8") as source:
+        raw_html = source.read()
+    base_name = os.path.basename(html_path)
+    is_build_log = _is_build_log_html_path(html_path)
+    is_bugs_rollup = _is_bugs_rollup_html_path(html_path)
+    is_weekly_analytics = base_name == "weekly_analytics.html"
+    is_weekly = base_name.startswith("weekly_cycle_matrix")
+    if is_bugs_rollup:
         body_html = _normalize_html_for_confluence_storage(raw_html)
         body_html = _inject_confluence_anchor_macros(body_html)
         body_html = _convert_fragment_links_to_confluence(body_html)
-        body_html = _replace_scenario_result_cells_with_zephyr_macro(body_html)
-        if use_zephyr_macro or use_native_chart:
-            body_html = _strip_daily_pie_visual_block(body_html)
-            body_html = _strip_zephyr_status_counts_json_div(body_html)
-            body_html = _strip_zephyr_cycle_keys_json_div(body_html)
-            if use_zephyr_macro:
-                chart_block = "<p class='daily-tab'>\t</p>" + zephyr_storage
-            else:
-                chart_block = "<p class='daily-tab'>\t</p>" + chart_storage
-            body_html = _insert_block_after_scenarios_heading(body_html, chart_block)
-
-        chart_path = html_path.replace(".html", "_conclusion_pie.png")
-        chart_name = os.path.basename(chart_path)
-        if os.path.exists(chart_path) and not use_native_chart and not use_zephyr_macro:
-            body_html = _append_confluence_attachment_image(body_html, chart_name)
-        body_html = _wrap_daily_report_with_excerpt_macro(body_html)
-        title_from_html = _extract_html_title(raw_html).strip()
-        title_from_file = _confluence_page_title_for_file(html_path, cfg)
-        primary_title = title_from_html or title_from_file
-        legacy_title = (
-            title_from_file
-            if title_from_html and title_from_html != title_from_file
-            else None
+        primary_title, legacy_title = _confluence_resolve_publish_titles(
+            html_path,
+            raw_html,
+            cfg,
+            fallback_title=BUGS_ROLLUP_CONFLUENCE_TITLE,
+        )
+        if not legacy_title and (
+            primary_title == _confluence_publish_title(BUGS_ROLLUP_CONFLUENCE_TITLE, cfg)
+            or primary_title.endswith(BUGS_ROLLUP_CONFLUENCE_TITLE)
+        ):
+            legacy_title = _confluence_publish_title(BUGS_ROLLUP_DISPLAY_TITLE, cfg)
+        page_id, action = _confluence_upsert_storage_page(
+            cfg,
+            primary_title,
+            body_html,
+            legacy_title=legacy_title,
+            parent_page_id=parent_page_id,
+        )
+        outcomes.append(f"{action}: {primary_title} (page id {page_id})")
+        return outcomes
+    if is_build_log:
+        body_html = _normalize_html_for_confluence_storage(raw_html)
+        body_html = _inject_confluence_anchor_macros(body_html)
+        body_html = _convert_fragment_links_to_confluence(body_html)
+        primary_title, legacy_title = _confluence_resolve_publish_titles(
+            html_path, raw_html, cfg
         )
         page_id, action = _confluence_upsert_storage_page(
             cfg,
@@ -2425,15 +2496,93 @@ def publish_reports_to_confluence(
             legacy_title=legacy_title,
             parent_page_id=parent_page_id,
         )
-        attachment_note = ""
-        if os.path.exists(chart_path) and not use_native_chart and not use_zephyr_macro:
-            attachment_name = _confluence_upload_attachment(cfg, page_id, chart_path)
-            attachment_note = f", attachment: {attachment_name}"
-        elif use_zephyr_macro:
-            attachment_note = ", chart: Zephyr TEST_RESULTS_SUMMARY_BY_STATUS macro"
-        elif use_native_chart:
-            attachment_note = ", chart: native macro"
-        outcomes.append(f"{action}: {primary_title} (page id {page_id}{attachment_note})")
+        outcomes.append(f"{action}: {primary_title} (page id {page_id})")
+        return outcomes
+    if is_weekly_analytics:
+        body_html = _normalize_html_for_confluence_storage(raw_html)
+        body_html = _inject_confluence_anchor_macros(body_html)
+        body_html = _convert_fragment_links_to_confluence(body_html)
+        body_html = _replace_weekly_overall_cells_with_zephyr_macro(body_html)
+        body_html = _replace_weekly_jira_key_spans_with_confluence_macro(body_html)
+        body_html = _replace_legacy_weekly_table_macros_with_excerpt(body_html)
+        analytics_title = _confluence_publish_title(
+            (
+                os.getenv("ZEPHYR_CONFLUENCE_WEEKLY_ANALYTICS_TITLE")
+                or "Zephyr Weekly Analytics"
+            ).strip(),
+            cfg,
+        )
+        page_id, action = _confluence_upsert_storage_page(
+            cfg, analytics_title, body_html, parent_page_id=parent_page_id
+        )
+        outcomes.append(f"{action}: {analytics_title} (page id {page_id})")
+        return outcomes
+    if is_weekly:
+        body_html = _normalize_html_for_confluence_storage(raw_html)
+        body_html = _inject_confluence_anchor_macros(body_html)
+        body_html = _convert_fragment_links_to_confluence(body_html)
+        body_html = _replace_weekly_overall_cells_with_zephyr_macro(body_html)
+        body_html = _replace_weekly_jira_key_spans_with_confluence_macro(body_html)
+        body_html = _replace_legacy_weekly_table_macros_with_excerpt(body_html)
+        body_html = _wrap_weekly_scenario_block_with_excerpt_macro(body_html)
+        primary_title, legacy_title = _confluence_resolve_publish_titles(
+            html_path, raw_html, cfg
+        )
+        page_id, action = _confluence_upsert_storage_page(
+            cfg,
+            primary_title,
+            body_html,
+            legacy_title=legacy_title,
+            parent_page_id=parent_page_id,
+        )
+        outcomes.append(f"{action}: {primary_title} (page id {page_id})")
+        return outcomes
+    cycle_objects_raw = _extract_zephyr_cycle_key_objects_from_html(raw_html)
+    cycle_objects: list[dict[str, Any]] = (
+        cycle_objects_raw if cycle_objects_raw is not None else []
+    )
+    zephyr_storage = _daily_zephyr_test_results_summary_storage_macro(cycle_objects)
+    counts = _extract_zephyr_status_counts_from_html(raw_html)
+    chart_storage = _daily_status_chart_storage_macro(counts) if counts else ""
+    use_zephyr_macro = bool(zephyr_storage)
+    use_native_chart = bool(chart_storage) and not use_zephyr_macro
+
+    body_html = _normalize_html_for_confluence_storage(raw_html)
+    body_html = _inject_confluence_anchor_macros(body_html)
+    body_html = _convert_fragment_links_to_confluence(body_html)
+    body_html = _replace_scenario_result_cells_with_zephyr_macro(body_html)
+    if use_zephyr_macro or use_native_chart:
+        body_html = _strip_daily_pie_visual_block(body_html)
+        body_html = _strip_zephyr_status_counts_json_div(body_html)
+        body_html = _strip_zephyr_cycle_keys_json_div(body_html)
+        if use_zephyr_macro:
+            chart_block = "<p class='daily-tab'>\t</p>" + zephyr_storage
+        else:
+            chart_block = "<p class='daily-tab'>\t</p>" + chart_storage
+        body_html = _insert_block_after_scenarios_heading(body_html, chart_block)
+
+    chart_path = html_path.replace(".html", "_conclusion_pie.png")
+    chart_name = os.path.basename(chart_path)
+    if os.path.exists(chart_path) and not use_native_chart and not use_zephyr_macro:
+        body_html = _append_confluence_attachment_image(body_html, chart_name)
+    body_html = _wrap_daily_report_with_excerpt_macro(body_html)
+    primary_title, legacy_title = _confluence_resolve_publish_titles(html_path, raw_html, cfg)
+    page_id, action = _confluence_upsert_storage_page(
+        cfg,
+        primary_title,
+        body_html,
+        legacy_title=legacy_title,
+        parent_page_id=parent_page_id,
+    )
+    attachment_note = ""
+    if os.path.exists(chart_path) and not use_native_chart and not use_zephyr_macro:
+        attachment_name = _confluence_upload_attachment(cfg, page_id, chart_path)
+        attachment_note = f", attachment: {attachment_name}"
+    elif use_zephyr_macro:
+        attachment_note = ", chart: Zephyr TEST_RESULTS_SUMMARY_BY_STATUS macro"
+    elif use_native_chart:
+        attachment_note = ", chart: native macro"
+    outcomes.append(f"{action}: {primary_title} (page id {page_id}{attachment_note})")
     return outcomes
 
 
