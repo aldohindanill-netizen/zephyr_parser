@@ -234,9 +234,12 @@ class PipelineHealthTests(unittest.TestCase):
             self.assertEqual(scanned["finish"]["operation"], "embeddings_finish")
 
     def test_embeddings_running_when_start_newer_than_finish(self) -> None:
+        recent_start = (datetime.now(UTC) - timedelta(minutes=30)).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
         emb = {
             "start": {
-                "timestamp_utc": "2026-06-02T02:00:00Z",
+                "timestamp_utc": recent_start,
                 "operation": "embeddings_start",
                 "result": "success",
             },
