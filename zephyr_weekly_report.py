@@ -1271,43 +1271,11 @@ def _parse_bool_env(value: str | None) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
-# Parsed ``.env`` next to this script (lazy). Empty dict = file missing or no assignments.
-_repo_dotenv_cache: dict[str, str] | None = None
-
-
 def _get_repo_dotenv_parsed() -> dict[str, str]:
     """Return key/value pairs from repo ``.env`` (last assignment per key wins)."""
-    global _repo_dotenv_cache
-    if _repo_dotenv_cache is not None:
-        return _repo_dotenv_cache
-    from_file: dict[str, str] = {}
-    env_path = Path(__file__).resolve().parent / ".env"
-    if env_path.is_file():
-        try:
-            text = env_path.read_text(encoding="utf-8-sig")
-        except OSError:
-            _repo_dotenv_cache = from_file
-            return from_file
-        for raw_line in text.splitlines():
-            line = raw_line.strip().replace("\r", "")
-            if not line or line.startswith("#"):
-                continue
-            if line.lower().startswith("export "):
-                line = line[7:].strip()
-                if not line:
-                    continue
-            if "=" not in line:
-                continue
-            name, _, value = line.partition("=")
-            name = name.strip()
-            if not name:
-                continue
-            value = value.strip()
-            if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
-                value = value[1:-1]
-            from_file[name] = value
-    _repo_dotenv_cache = from_file
-    return from_file
+    import repo_env
+
+    return repo_env.get_repo_dotenv_parsed()
 
 
 def _env_prefers_repo_dotenv(name: str, default: str = "") -> str:
@@ -1316,13 +1284,10 @@ def _env_prefers_repo_dotenv(name: str, default: str = "") -> str:
     PowerShell loaders on Windows may mis-decode Cyrillic in ``.env`` into the
     process environment; Confluence section titles must come from the file.
     """
-    parsed = dict(_get_repo_dotenv_parsed())
-    try:
-        import repo_env as re
+    import repo_env
 
-        parsed.update(re.get_repo_dotenv_local_parsed())
-    except ImportError:
-        pass
+    parsed = dict(repo_env.get_repo_dotenv_parsed())
+    parsed.update(repo_env.get_repo_dotenv_local_parsed())
     if name in parsed:
         value = str(parsed[name]).strip()
         if value:
@@ -1338,9 +1303,9 @@ def _load_repo_dotenv_if_absent() -> None:
     use :func:`_weekly_defect_extended_analytics_enabled` for flags where the repo
     ``.env`` must override a stale user/system variable.
     """
-    for name, value in _get_repo_dotenv_parsed().items():
-        if name not in os.environ:
-            os.environ[name] = value
+    import repo_env
+
+    repo_env.load_repo_env(overlay_local=False)
 
 
 def _load_confluence_publish_config() -> ConfluencePublishConfig | None:

@@ -137,6 +137,14 @@ py -3 scripts/compute_bug_embeddings.py --from-rollup-dir reports_local/bugs_rol
 
 Частичная отладка: `py -3 scripts/debug_jira_description.py CSD-12345 --use-local-env`, `py -3 -m unittest discover -s tests`.
 
+### Ревизия скриптов
+
+Актуальная классификация скриптов хранится в `docs/script_registry.md` (`keep-prod`, `keep-manual`, `deprecate-candidate`).
+
+Экспериментальный калибровочный скрипт перенесен в архив:
+
+- `scripts/deprecated/calibrate_bug_duplicates.py`
+
 ### Разработка (feature-ветка)
 
 ```powershell
