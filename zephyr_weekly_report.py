@@ -38,6 +38,7 @@ from typing import Any, Callable, Iterable, TextIO, cast
 
 from bug_duplicate_detection import (
     DuplicateCandidate,
+    bugs_duplicate_publish_min_confidence,
     find_duplicate_candidates,
     load_duplicate_overrides,
     load_embedding_cache,
@@ -5550,6 +5551,7 @@ def _fetch_jira_issue_summaries(
         chunk = pending[start : start + chunk_size]
         jql = "key in (" + ",".join(chunk) + ")"
         issues: list[dict[str, Any]] | None = None
+        unresolved_upper = {req.upper() for req in chunk}
         for endpoint, call_kw in (
             (
                 "/rest/api/2/search",
@@ -5595,10 +5597,44 @@ def _fetch_jira_issue_summaries(
                 summary = str(fields.get("summary") or "").strip()
             _JIRA_SUMMARY_CACHE[key] = summary
             out[key] = summary
+            unresolved_upper.discard(key.upper())
             for req in chunk:
                 if req.upper() == key.upper():
                     _JIRA_SUMMARY_CACHE[req] = summary
                     out[req] = summary
+                    unresolved_upper.discard(req.upper())
+
+        if unresolved_upper:
+            for req in chunk:
+                req_clean = str(req or "").strip()
+                if not req_clean or req_clean.upper() not in unresolved_upper:
+                    continue
+                path_key = urllib.parse.quote(req_clean, safe="")
+                single_summary = ""
+                for prefix in ("/rest/api/2/issue/", "/rest/api/3/issue/"):
+                    try:
+                        payload = request_json(
+                            base_url,
+                            f"{prefix}{path_key}",
+                            eff,
+                            params={"fields": "summary"},
+                        )
+                    except Exception:  # noqa: BLE001
+                        continue
+                    if not isinstance(payload, dict):
+                        continue
+                    fields = payload.get("fields")
+                    if not isinstance(fields, dict):
+                        continue
+                    single_summary = str(fields.get("summary") or "").strip()
+                    returned_key = str(payload.get("key") or req_clean).strip() or req_clean
+                    _JIRA_SUMMARY_CACHE[returned_key] = single_summary
+                    out[returned_key] = single_summary
+                    _JIRA_SUMMARY_CACHE[req_clean] = single_summary
+                    out[req_clean] = single_summary
+                    unresolved_upper.discard(req_clean.upper())
+                    unresolved_upper.discard(returned_key.upper())
+                    break
     return out
 
 
@@ -8236,6 +8272,15 @@ def _weekly_jira_key_wiki(issue_key: str) -> str:
     return f"{{jira:key={_wiki_escape(key)}}}"
 
 
+def _duplicate_confidence_rank(level: str) -> int:
+    return {"low": 0, "medium": 1, "high": 2}.get(str(level or "").lower(), 0)
+
+
+def _is_duplicate_publishable(cand: DuplicateCandidate) -> bool:
+    min_conf = bugs_duplicate_publish_min_confidence()
+    return _duplicate_confidence_rank(cand.confidence) >= _duplicate_confidence_rank(min_conf)
+
+
 def _duplicate_candidate_cell_html(
     key: str,
     duplicate_candidates: dict[str, DuplicateCandidate | None] | None,
@@ -8243,9 +8288,9 @@ def _duplicate_candidate_cell_html(
     if duplicate_candidates is None:
         return ""
     cand = duplicate_candidates.get(key)
-    if cand is None:
+    if cand is None or not _is_duplicate_publishable(cand):
         return "<td class='bugs-dup-cell'>—</td>"
-    title = html.escape(f"{cand.method}, {cand.score:.2f}")
+    title = html.escape(f"{cand.method}, {cand.score:.2f}, {cand.confidence}")
     link = _weekly_jira_key_span_html(cand.other_key)
     return (
         f"<td class='bugs-dup-cell' title='{title}'>"
@@ -8260,7 +8305,7 @@ def _duplicate_candidate_cell_wiki(
     if duplicate_candidates is None:
         return ""
     cand = duplicate_candidates.get(key)
-    if cand is None:
+    if cand is None or not _is_duplicate_publishable(cand):
         return "—"
     return f"возможно дубль {_weekly_jira_key_wiki(cand.other_key)}"
 
@@ -13247,7 +13292,7 @@ def run_once(args: argparse.Namespace) -> int:
                     )
                     for key in analytics.get("keys_ordered") or []:
                         k = str(key).strip()
-                        if k and k not in seen_rollup_keys:
+                        if k and _DEFECT_KEY_PATTERN.search(k) and k not in seen_rollup_keys:
                             seen_rollup_keys.add(k)
                             rollup_keys.append(k)
                 jira_meta_base = _resolve_weekly_jira_metadata_base(args.base_url)
@@ -13362,12 +13407,14 @@ def run_once(args: argparse.Namespace) -> int:
                 for matrix_entry in weekly_cycle_matrices:
                     analytics = matrix_entry[8] or {}
                     for key in analytics.get("keys_ordered", []) or []:
-                        if key not in seen_defect_keys:
-                            seen_defect_keys.add(key)
-                            all_defect_keys.append(key)
-                    for key in matrix_entry[7] or []:
                         k = str(key).strip()
-                        if k and k not in seen_defect_keys:
+                        if k and _DEFECT_KEY_PATTERN.search(k) and k not in seen_defect_keys:
+                            seen_defect_keys.add(k)
+                            all_defect_keys.append(k)
+                    defect_keys_for_week = matrix_entry[6] or []
+                    for key in defect_keys_for_week:
+                        k = str(key).strip()
+                        if k and _DEFECT_KEY_PATTERN.search(k) and k not in seen_defect_keys:
                             seen_defect_keys.add(k)
                             all_defect_keys.append(k)
                 defect_meta = _fetch_jira_bug_metadata(
@@ -13574,12 +13621,22 @@ def run_once(args: argparse.Namespace) -> int:
                     for matrix_entry in weekly_cycle_matrices:
                         analytics_payload = matrix_entry[8] or {}
                         for key in analytics_payload.get("keys_ordered", []) or []:
-                            if key not in seen_analytics_keys:
-                                seen_analytics_keys.add(key)
-                                analytics_defect_keys.append(key)
-                        for key in matrix_entry[7] or []:
                             k = str(key).strip()
-                            if k and k not in seen_analytics_keys:
+                            if (
+                                k
+                                and _DEFECT_KEY_PATTERN.search(k)
+                                and k not in seen_analytics_keys
+                            ):
+                                seen_analytics_keys.add(k)
+                                analytics_defect_keys.append(k)
+                        defect_keys_for_week = matrix_entry[6] or []
+                        for key in defect_keys_for_week:
+                            k = str(key).strip()
+                            if (
+                                k
+                                and _DEFECT_KEY_PATTERN.search(k)
+                                and k not in seen_analytics_keys
+                            ):
                                 seen_analytics_keys.add(k)
                                 analytics_defect_keys.append(k)
                     rolling_matrix = _weekly_cycle_matrix_data_rolling(report_data_for_matrix)

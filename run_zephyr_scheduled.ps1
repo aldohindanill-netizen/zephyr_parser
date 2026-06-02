@@ -10,11 +10,13 @@ $LogDir = Join-Path $RepoRoot "reports\logs"
 $LockFile = Join-Path $RepoRoot "reports\.zephyr_scheduled.lock"
 $Runner = Join-Path $RepoRoot "run_zephyr.ps1"
 $EnvFile = Join-Path $RepoRoot ".env"
+$EnvSecretsFile = Join-Path $RepoRoot ".env.secrets"
 $LogFile = Join-Path $LogDir ("scheduled_{0:yyyy-MM-dd}.log" -f (Get-Date))
 
 function Import-RepoDotEnv {
-    if (-not (Test-Path -LiteralPath $EnvFile)) { return }
-    Get-Content -LiteralPath $EnvFile -Encoding utf8 | ForEach-Object {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    if (-not (Test-Path -LiteralPath $Path)) { return }
+    Get-Content -LiteralPath $Path -Encoding utf8 | ForEach-Object {
         $line = $_.Trim()
         if (-not $line -or $line.StartsWith('#') -or -not $line.Contains('=')) { return }
         $parts = $line -split '=', 2
@@ -40,7 +42,8 @@ function Get-RunTimeoutMinutes {
     return $minutes
 }
 
-Import-RepoDotEnv
+Import-RepoDotEnv -Path $EnvFile
+Import-RepoDotEnv -Path $EnvSecretsFile
 
 New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
 

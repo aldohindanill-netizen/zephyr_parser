@@ -45,9 +45,9 @@
 
 **Вне scope:**
 
-- zephyr-bot, n8n, NocoDB, Google Sheets;
+- zephyr-bot и другие внешние операторские системы;
 - email/Telegram/корпоративные алерты при сбоях;
-- перенос production на Docker/Amvera (Dockerfile — для CI, dev parity и будущего запасного деплоя);
+- перенос production runtime на Docker вместо Windows Scheduler;
 - веб-UI для просмотра отчётов;
 - публикация health dashboard в Confluence;
 - SIEM-forward audit;
@@ -201,14 +201,14 @@
 
 - Проверка в CI: `docker build` проходит в GitHub Actions.
 - Локальная разработка на Linux/macOS с тем же entrypoint, что prod-скрипты.
-- Запасной деплой на Amvera по `amvera.yaml` при необходимости.
+- Запасной контейнерный деплой (платформа выбирается отдельно) при необходимости.
 
 **Требования к образу:**
 
 - Базовый образ: `python:3.12-slim`.
 - Пользователь в контейнере: non-root `zephyr`.
 - Основной parser: **только stdlib** (без pip-зависимостей в образе по умолчанию).
-- Точка монтирования данных: `/data` → в контейнере `reports/` и `logs/` лежат под `/data` (соответствие `amvera.yaml` `persistenceMount: /data`).
+- Точка монтирования данных: `/data` → в контейнере `reports/` и `logs/` лежат под `/data`.
 - Entrypoint: эквивалент `python -u zephyr_weekly_report.py` с подгрузкой env из смонтированного секрета/файла.
 
 **Embeddings в Docker:** отдельный образ или documented optional stage с `requirements-embeddings.txt`; основной slim-образ embeddings **не** включает. Production embeddings остаются на Windows venv (раздел 9).
@@ -323,7 +323,7 @@ Confluence-URL, space, parent page id, токены Zephyr/Jira/Confluence — p
 - Веб-интерфейс для reports.
 - Health dashboard в Confluence.
 - `ZEPHYR_REPORTS_RETENTION_DAYS > 0` (автоудаление старых отчётов).
-- Production runtime на Docker/Amvera вместо Windows Scheduler.
+- Production runtime на Docker вместо Windows Scheduler.
 - SIEM-forward `audit.jsonl`.
 - Семантические embeddings без nightly job (только ручной прогон) — **не** допускается в prod; embeddings обязательны по расписанию.
 - Windows service account без интерактивного логона для Task Scheduler (отдельный runbook при необходимости).

@@ -1,4 +1,4 @@
-"""Load repo .env and optional .env.local overrides (shared by main script and tools)."""
+"""Load repo env layers shared by launchers and scripts."""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ from pathlib import Path
 
 _REPO_ROOT = Path(__file__).resolve().parent
 _dotenv_cache: dict[str, str] | None = None
+_dotenv_secrets_cache: dict[str, str] | None = None
 _dotenv_local_cache: dict[str, str] | None = None
 
 
@@ -46,6 +47,13 @@ def get_repo_dotenv_parsed() -> dict[str, str]:
     return _dotenv_cache
 
 
+def get_repo_dotenv_secrets_parsed() -> dict[str, str]:
+    global _dotenv_secrets_cache
+    if _dotenv_secrets_cache is None:
+        _dotenv_secrets_cache = _parse_dotenv_file(_REPO_ROOT / ".env.secrets")
+    return _dotenv_secrets_cache
+
+
 def get_repo_dotenv_local_parsed() -> dict[str, str]:
     global _dotenv_local_cache
     if _dotenv_local_cache is None:
@@ -54,9 +62,13 @@ def get_repo_dotenv_local_parsed() -> dict[str, str]:
 
 
 def load_repo_env(*, overlay_local: bool = False) -> None:
-    """Fill os.environ from .env; with overlay_local, .env.local wins (like run_zephyr.ps1)."""
+    """Fill os.environ from .env layers with optional local overrides."""
+    preexisting = set(os.environ.keys())
     for name, value in get_repo_dotenv_parsed().items():
         if name not in os.environ:
+            os.environ[name] = value
+    for name, value in get_repo_dotenv_secrets_parsed().items():
+        if name not in preexisting:
             os.environ[name] = value
     if overlay_local:
         for name, value in get_repo_dotenv_local_parsed().items():

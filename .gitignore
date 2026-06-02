@@ -1,7 +1,12 @@
 .env
+.env.secrets
+.env.secrets.*
 .env.local
 !.env.example
-infra/.env.nocodb-n8n
+!.env.secrets.example
+.venv-embeddings/
+_analytics_source_report.py
+run_zephyr*.lnk
 infra/.zephyr_writeback_15m.runtime.json
 infra/.zephyr_ingest_15m.runtime.json
 weekly_zephyr_report.csv

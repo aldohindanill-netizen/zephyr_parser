@@ -85,9 +85,15 @@ _FIELD_LABEL_PATTERNS: dict[str, tuple[str, ...]] = {
 class DuplicateCandidate:
     other_key: str
     score: float
-    method: str  # text_expected_actual | text_summary | embedding_results | override
+    method: str  # text_expected_actual | text_summary | embedding_candidate | override
+    confidence: str = "high"  # high | medium | low
     expected_sim: float | None = None
     actual_sim: float | None = None
+    embed_sim: float | None = None
+    domain_match: bool | None = None
+    domain_conflict: bool | None = None
+    domain_tags: tuple[str, ...] = ()
+    reasons: tuple[str, ...] = ()
 
 
 def _parse_bool_env(raw: str | None, default: bool = False) -> bool:
@@ -113,12 +119,43 @@ def bugs_duplicate_text_threshold() -> float:
     return _parse_float_env(os.getenv("ZEPHYR_BUGS_DUPLICATE_TEXT_THRESHOLD"), 0.78)
 
 
+def bugs_duplicate_text_soft_expected_threshold() -> float:
+    return _parse_float_env(os.getenv("ZEPHYR_BUGS_DUPLICATE_TEXT_SOFT_EXPECTED_THRESHOLD"), 0.60)
+
+
+def bugs_duplicate_text_soft_actual_threshold() -> float:
+    return _parse_float_env(os.getenv("ZEPHYR_BUGS_DUPLICATE_TEXT_SOFT_ACTUAL_THRESHOLD"), 0.74)
+
+
 def bugs_duplicate_embed_threshold() -> float:
     return _parse_float_env(os.getenv("ZEPHYR_BUGS_DUPLICATE_EMBED_THRESHOLD"), 0.85)
 
 
 def bugs_duplicate_embeddings_enabled() -> bool:
     return _parse_bool_env(os.getenv("ZEPHYR_BUGS_DUPLICATE_EMBEDDINGS"), default=False)
+
+
+def bugs_duplicate_publish_min_confidence() -> str:
+    raw = (os.getenv("ZEPHYR_BUGS_DUPLICATE_PUBLISH_MIN_CONFIDENCE") or "high").strip().lower()
+    return raw if raw in {"high", "medium", "low"} else "high"
+
+
+def bugs_duplicate_summary_text_allows_high() -> bool:
+    return _parse_bool_env(os.getenv("ZEPHYR_BUGS_DUPLICATE_SUMMARY_HIGH"), default=False)
+
+
+def bugs_duplicate_domain_gate_enabled() -> bool:
+    return _parse_bool_env(os.getenv("ZEPHYR_BUGS_DUPLICATE_DOMAIN_GATE"), default=True)
+
+
+_DOMAIN_PATTERNS: dict[str, tuple[str, ...]] = {
+    "cones": (r"\bконус", r"\bcone"),
+    "pedestrian": (r"\bпешеход", r"\bpedestrian"),
+    "traffic_light": (r"светофор", r"traffic[_\s-]?light", r"стоп[ -]?лини"),
+    "localization": (r"локализац", r"\blocalization\b"),
+    "mrm": (r"\bмрм", r"\bmrm\b"),
+    "obstacle_avoidance": (r"объез", r"препятств", r"\bobstacle\b", r"\bavoid"),
+}
 
 
 def _default_cache_path(rollup_dir: str) -> str:
@@ -337,6 +374,23 @@ def text_similarity(text_a: str, text_b: str) -> float:
     return max(jaccard, ratio)
 
 
+def _extract_domain_tags(*parts: str) -> set[str]:
+    text = " ".join(str(p or "") for p in parts).lower()
+    tags: set[str] = set()
+    for tag, patterns in _DOMAIN_PATTERNS.items():
+        if any(re.search(p, text, re.IGNORECASE | re.UNICODE) for p in patterns):
+            tags.add(tag)
+    return tags
+
+
+def _confidence_rank(level: str) -> int:
+    return {"low": 0, "medium": 1, "high": 2}.get(str(level or "").lower(), 0)
+
+
+def _candidate_rank(cand: DuplicateCandidate) -> tuple[int, float]:
+    return (_confidence_rank(cand.confidence), cand.score)
+
+
 def _cosine_similarity(vec_a: list[float], vec_b: list[float]) -> float:
     if len(vec_a) != len(vec_b) or not vec_a:
         return 0.0
@@ -496,6 +550,8 @@ def find_duplicate_candidates(
         return {k: None for k in keys}
 
     text_thr = text_threshold if text_threshold is not None else bugs_duplicate_text_threshold()
+    soft_exp_thr = bugs_duplicate_text_soft_expected_threshold()
+    soft_act_thr = bugs_duplicate_text_soft_actual_threshold()
     embed_thr = embed_threshold if embed_threshold is not None else bugs_duplicate_embed_threshold()
     embeddings_on = (
         use_embeddings
@@ -503,6 +559,8 @@ def find_duplicate_candidates(
         else bugs_duplicate_embeddings_enabled()
     )
 
+    allow_summary_high = bugs_duplicate_summary_text_allows_high()
+    domain_gate = bugs_duplicate_domain_gate_enabled()
     clean_keys = [str(k).strip() for k in keys if str(k).strip()]
     split_pairs, merge_map = _load_overrides_from_dict(overrides)
 
@@ -513,9 +571,15 @@ def find_duplicate_candidates(
             other = merge_map[key]
             if other and other != key and other in clean_keys:
                 if not _is_split(key, other, split_pairs):
-                    result[key] = DuplicateCandidate(other, 1.0, "override")
+                    result[key] = DuplicateCandidate(
+                        other,
+                        1.0,
+                        "override",
+                        confidence="high",
+                        reasons=("override_merge",),
+                    )
 
-    for i, key_a in enumerate(clean_keys):
+    for key_a in clean_keys:
         if result.get(key_a) is not None:
             continue
         best: DuplicateCandidate | None = None
@@ -532,23 +596,91 @@ def find_duplicate_candidates(
                     key_b, meta
                 ):
                     embed_score = embedding_similarity(key_a, key_b, embedding_cache)
-
-            candidates_scores: list[tuple[float, str, float | None, float | None]] = []
-            if text_score >= text_thr:
-                candidates_scores.append((text_score, text_method, exp_sim, act_sim))
-            if embed_score is not None and embed_score >= embed_thr:
-                candidates_scores.append(
-                    (embed_score, "embedding_results", exp_sim, act_sim)
-                )
-
-            if not candidates_scores:
+            tags_a = _extract_domain_tags(
+                _summary_for_key(key_a, meta),
+                _expected_for_key(key_a, meta),
+                _actual_for_key(key_a, meta),
+            )
+            tags_b = _extract_domain_tags(
+                _summary_for_key(key_b, meta),
+                _expected_for_key(key_b, meta),
+                _actual_for_key(key_b, meta),
+            )
+            shared_tags = tags_a & tags_b
+            domain_match = bool(shared_tags)
+            domain_conflict = bool(tags_a and tags_b and not shared_tags)
+            domain_unknown = not tags_a and not tags_b
+            if domain_gate and domain_conflict:
                 continue
 
-            score, method, e_sim, a_sim = max(candidates_scores, key=lambda x: x[0])
-            cand = DuplicateCandidate(
-                key_b, score, method, expected_sim=e_sim, actual_sim=a_sim
-            )
-            if best is None or cand.score > best.score:
+            reasons: list[str] = []
+            cand: DuplicateCandidate | None = None
+            if text_score >= text_thr:
+                if text_method == "text_expected_actual":
+                    conf = "high"
+                elif text_method == "text_summary" and allow_summary_high:
+                    conf = "high"
+                else:
+                    conf = "medium"
+                reasons.append(f"text_pass:{text_method}")
+                cand = DuplicateCandidate(
+                    key_b,
+                    text_score,
+                    text_method,
+                    confidence=conf,
+                    expected_sim=exp_sim,
+                    actual_sim=act_sim,
+                    embed_sim=embed_score,
+                    domain_match=domain_match,
+                    domain_conflict=domain_conflict,
+                    domain_tags=tuple(sorted(shared_tags)),
+                    reasons=tuple(reasons),
+                )
+            elif (
+                text_method == "text_expected_actual"
+                and exp_sim is not None
+                and act_sim is not None
+                and domain_match
+                and exp_sim >= soft_exp_thr
+                and act_sim >= soft_act_thr
+            ):
+                reasons.extend(("text_soft_pass", "domain_match"))
+                cand = DuplicateCandidate(
+                    key_b,
+                    min(exp_sim, act_sim),
+                    "text_expected_actual_soft",
+                    confidence="high",
+                    expected_sim=exp_sim,
+                    actual_sim=act_sim,
+                    embed_sim=embed_score,
+                    domain_match=domain_match,
+                    domain_conflict=domain_conflict,
+                    domain_tags=tuple(sorted(shared_tags)),
+                    reasons=tuple(reasons),
+                )
+            elif (
+                embed_score is not None
+                and embed_score >= embed_thr
+                and (domain_match or domain_unknown)
+            ):
+                reasons.extend(("embedding_pass", "candidate_only"))
+                cand = DuplicateCandidate(
+                    key_b,
+                    embed_score,
+                    "embedding_candidate",
+                    confidence="medium",
+                    expected_sim=exp_sim,
+                    actual_sim=act_sim,
+                    embed_sim=embed_score,
+                    domain_match=domain_match,
+                    domain_conflict=domain_conflict,
+                    domain_tags=tuple(sorted(shared_tags)),
+                    reasons=tuple(reasons),
+                )
+
+            if cand is None:
+                continue
+            if best is None or _candidate_rank(cand) > _candidate_rank(best):
                 best = cand
 
         result[key_a] = best
@@ -569,11 +701,22 @@ def write_duplicate_candidates_debug(
                 "other_key": cand.other_key,
                 "score": round(cand.score, 4),
                 "method": cand.method,
+                "confidence": cand.confidence,
             }
             if cand.expected_sim is not None:
                 entry["expected_sim"] = round(cand.expected_sim, 4)
             if cand.actual_sim is not None:
                 entry["actual_sim"] = round(cand.actual_sim, 4)
+            if cand.embed_sim is not None:
+                entry["embed_sim"] = round(cand.embed_sim, 4)
+            if cand.domain_match is not None:
+                entry["domain_match"] = cand.domain_match
+            if cand.domain_conflict is not None:
+                entry["domain_conflict"] = cand.domain_conflict
+            if cand.domain_tags:
+                entry["domain_tags"] = list(cand.domain_tags)
+            if cand.reasons:
+                entry["reasons"] = list(cand.reasons)
             payload[key] = entry
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     with open(path, "w", encoding="utf-8") as fh:

@@ -275,7 +275,77 @@ class FindDuplicateCandidatesTests(unittest.TestCase):
         )
         self.assertIsNotNone(result["CSD-X"])
         assert result["CSD-X"] is not None
-        self.assertEqual(result["CSD-X"].method, "embedding_results")
+        self.assertEqual(result["CSD-X"].method, "embedding_candidate")
+        self.assertEqual(result["CSD-X"].confidence, "medium")
+
+    def test_domain_gate_blocks_conflicting_embedding(self) -> None:
+        meta = self._meta(
+            [
+                (
+                    "CSD-A",
+                    {
+                        "summary": "ВАТС не тормозит перед пешеходом",
+                        "expected_result": "ВАТС тормозит перед пешеходом",
+                        "actual_result": "ВАТС едет в пешехода",
+                    },
+                ),
+                (
+                    "CSD-B",
+                    {
+                        "summary": "Самопроизвольное отключение АП валидатором локализации",
+                        "expected_result": "АП не отключается",
+                        "actual_result": "Локализация валится и АП выключается",
+                    },
+                ),
+            ]
+        )
+        cache = {
+            "vectors": {
+                "CSD-A": [1.0, 0.0, 0.0],
+                "CSD-B": [0.99, 0.01, 0.0],
+            }
+        }
+        result = find_duplicate_candidates(
+            ["CSD-A", "CSD-B"],
+            meta,
+            embedding_cache=cache,
+            text_threshold=0.99,
+            embed_threshold=0.85,
+            use_embeddings=True,
+        )
+        self.assertIsNone(result["CSD-A"])
+
+    def test_soft_expected_actual_rule_promotes_high(self) -> None:
+        meta = self._meta(
+            [
+                (
+                    "CSD-47279",
+                    {
+                        "summary": "ВАТС врезается в конусы при возможности их объезда",
+                        "expected_result": "При приближении к ремонтным работам ВАТС перестраивается с безопасным интервалом",
+                        "actual_result": "ВАТС врезается в конусы",
+                    },
+                ),
+                (
+                    "CSD-46923",
+                    {
+                        "summary": "ВАТС едет в конусы",
+                        "expected_result": "При приближении к ремонтным работам ВАТС останавливается или объезжает конусы с интервалом",
+                        "actual_result": "ВАТС едет в конусы",
+                    },
+                ),
+            ]
+        )
+        result = find_duplicate_candidates(
+            ["CSD-47279", "CSD-46923"],
+            meta,
+            text_threshold=0.78,
+            use_embeddings=False,
+        )
+        self.assertIsNotNone(result["CSD-47279"])
+        assert result["CSD-47279"] is not None
+        self.assertEqual(result["CSD-47279"].method, "text_expected_actual_soft")
+        self.assertEqual(result["CSD-47279"].confidence, "high")
 
 
 class CacheAndDebugTests(unittest.TestCase):
@@ -297,6 +367,7 @@ class CacheAndDebugTests(unittest.TestCase):
                 content = fh.read()
             self.assertIn("expected_sim", content)
             self.assertIn("actual_sim", content)
+            self.assertIn("confidence", content)
 
 
 class ResultsEmbeddingTextTests(unittest.TestCase):

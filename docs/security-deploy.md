@@ -3,8 +3,8 @@
 ## Windows Task Scheduler
 
 - Запуск от **выделенной service account** (не интерактивного пользователя).
-- `.env` в корне репо: ACL **только** для service account и администраторов.
-- Не передавать `ZEPHYR_API_TOKEN` в аргументах задачи — только через `.env`.
+- `.env` и `.env.secrets` в корне репо: ACL **только** для service account и администраторов.
+- Не передавать `ZEPHYR_API_TOKEN` в аргументах задачи — только через `.env.secrets`.
 - Уже есть: lock file (`ZEPHYR_RUN_LOCK_FILE`), timeout (`ZEPHYR_RUN_TIMEOUT_MINUTES`).
 
 ## Linux systemd
@@ -26,16 +26,16 @@ PrivateTmp=true
 4. Логи: `journalctl -u zephyr-weekly-report -f`
 5. Audit: forward `reports/audit/audit.jsonl` в SIEM (optional).
 
-## Amvera / Docker
+## Docker
 
 - Образ: корневой `Dockerfile` (Python 3.12-slim, non-root user `zephyr`).
 - Секреты: platform secrets → env, не в git.
-- Persistence: mount `/data` для `reports/` и `logs/` (см. `amvera.yaml`).
+- Persistence: mount `/data` для `reports/` и `logs/`.
 
 ## Backup
 
 - `reports/` (включая audit) — по политике RPO/RTO владельца ИС.
-- `.env` — отдельно, зашифрованное хранилище секретов.
+- `.env.secrets` — отдельно, зашифрованное хранилище секретов.
 
 ## Host ACL
 

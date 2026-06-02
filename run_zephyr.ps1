@@ -53,6 +53,8 @@ if (Test-Path -LiteralPath $pipelineVersionPath) {
 }
 $envPath = Join-Path $RepoRoot ".env"
 $envExamplePath = Join-Path $RepoRoot ".env.example"
+$envSecretsPath = Join-Path $RepoRoot ".env.secrets"
+$envSecretsExamplePath = Join-Path $RepoRoot ".env.secrets.example"
 $envLocalPath = Join-Path $RepoRoot ".env.local"
 $envLocalExamplePath = Join-Path $RepoRoot ".env.local.example"
 
@@ -69,6 +71,19 @@ Or copy .env.example to .env in File Explorer, then edit .env.
 }
 
 Import-RepoDotEnv -Path $envPath
+if (Test-Path -LiteralPath $envSecretsPath) {
+    Import-RepoDotEnv -Path $envSecretsPath
+}
+else {
+    Write-Host @"
+
+Missing secrets file: $envSecretsPath
+
+Copy the template and fill in secret values:
+  Copy-Item -LiteralPath '$envSecretsExamplePath' -Destination '$envSecretsPath'
+"@ -ForegroundColor Yellow
+    exit 1
+}
 
 $useLocalOverlay = $UseLocalEnv.IsPresent -or (Test-EnvEnabled $env:ZEPHYR_USE_LOCAL_ENV $false)
 if ($useLocalOverlay) {

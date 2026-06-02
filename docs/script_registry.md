@@ -31,6 +31,7 @@ This registry classifies project scripts (excluding `.venv*` and third-party pac
 - `scripts/confluence_delete_children.py`
 - `scripts/debug_jira_description.py`
 - `scripts/publish_local_confluence.py`
+- `scripts/calibrate_bug_duplicates.py`
 - `reports_local/logs/run_main_verify.ps1`
 - `reports_local/logs/run_embeddings_verify.ps1`
 - `tests/test_bug_duplicate_detection.py`

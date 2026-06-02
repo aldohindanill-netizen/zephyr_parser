@@ -242,9 +242,9 @@
 
 По PRD §2, §14:
 
-- zephyr-bot, n8n, NocoDB, Google Sheets
+- zephyr-bot и другие внешние операторские системы
 - Email/Telegram/корпоративные алерты при сбоях
-- Production на Docker/Amvera вместо Windows Scheduler
+- Production на Docker вместо Windows Scheduler
 - Веб-UI отчётов; health в Confluence
 - SIEM-forward audit; автоочистка `reports/` по возрасту
 - Windows service account без интерактивного логона

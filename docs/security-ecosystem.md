@@ -8,14 +8,9 @@
 - Секреты: `TELEGRAM_BOT_TOKEN`, webhook secret
 - Требования: ограничение `TELEGRAM_ALLOWED_CHAT_IDS`, HTTPS webhook, ротация токенов, audit writeback в Zephyr
 
-## Бывший стек (удалён из zephyr_parser)
+## Внешние системы
 
-Если в production ещё используются:
-
-- n8n / NocoDB / Postgres sync
-- Google Sheets + Apps Script
-
-— оформить отдельные паспорта: AD/сессии для UI, Redis/Postgres hardening, audit выгрузок ПДн.
+Если в production используются внешние инструменты поверх `zephyr_parser`, для них нужны отдельные паспорта ИС и операционные требования (доступы, аудит, хранение секретов, сетевые ограничения).
 
 ## Разделение ответственности
 

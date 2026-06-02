@@ -97,13 +97,16 @@ else {
 }
 
 $envPath = Join-Path $TargetPath ".env"
+$envSecretsPath = Join-Path $TargetPath ".env.secrets"
 $envExamplePath = Join-Path $TargetPath ".env.example"
+$envSecretsExamplePath = Join-Path $TargetPath ".env.secrets.example"
 $envLocalExamplePath = Join-Path $TargetPath ".env.local.example"
 $envLocalPath = Join-Path $TargetPath ".env.local"
 $prodEnvPath = Join-Path $ProdRoot ".env"
+$prodEnvSecretsPath = Join-Path $ProdRoot ".env.secrets"
 
 if ($CopyEnv -and (Test-Path -LiteralPath $prodEnvPath)) {
-    Write-Host "Copying secrets from production .env"
+    Write-Host "Copying config from production .env"
     Copy-Item -LiteralPath $prodEnvPath -Destination $envPath -Force
 }
 elseif (-not (Test-Path -LiteralPath $envPath)) {
@@ -112,6 +115,18 @@ elseif (-not (Test-Path -LiteralPath $envPath)) {
     }
     Copy-Item -LiteralPath $envExamplePath -Destination $envPath
     Write-Host "Created .env from .env.example (fill ZEPHYR_API_TOKEN)"
+}
+
+if ($CopyEnv -and (Test-Path -LiteralPath $prodEnvSecretsPath)) {
+    Write-Host "Copying secrets from production .env.secrets"
+    Copy-Item -LiteralPath $prodEnvSecretsPath -Destination $envSecretsPath -Force
+}
+elseif (-not (Test-Path -LiteralPath $envSecretsPath)) {
+    if (-not (Test-Path -LiteralPath $envSecretsExamplePath)) {
+        throw "Missing $envSecretsExamplePath in dev clone"
+    }
+    Copy-Item -LiteralPath $envSecretsExamplePath -Destination $envSecretsPath
+    Write-Host "Created .env.secrets from .env.secrets.example (fill secret values)"
 }
 
 if (Test-Path -LiteralPath $envLocalExamplePath) {
@@ -163,7 +178,7 @@ Write-Host ""
 Write-Host "Next steps:"
 Write-Host "  cd `"$TargetPath`""
 if (-not (Test-Path -LiteralPath $prodEnvPath) -or -not $CopyEnv) {
-    Write-Host "  # Ensure .env has ZEPHYR_API_TOKEN (copy from production or edit)"
+    Write-Host "  # Ensure .env.secrets has required tokens/passwords"
 }
 Write-Host "  # Edit .env.local -> ZEPHYR_CONFLUENCE_PARENT_PAGE_ID (sandbox)"
 Write-Host "  .\run_zephyr_local.ps1"

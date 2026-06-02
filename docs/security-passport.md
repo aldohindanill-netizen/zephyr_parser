@@ -9,7 +9,7 @@
 | В scope | Вне scope (другие системы) |
 |---------|---------------------------|
 | `zephyr_weekly_report.py`, `run_zephyr.*` | [zephyr-bot](https://github.com/aldohindanill-netizen/zephyr-bot) (Telegram) |
-| Read Zephyr/Jira, write `reports/` | Бывшие n8n/NocoDB/Sheets (удалены из репо) |
+| Read Zephyr/Jira, write `reports/` | Внешние интеграции вне данного репозитория |
 | Confluence REST publish | AD-логин пользователей в Jira/Confluence |
 
 ## Категория данных
@@ -30,7 +30,7 @@
 
 ## N/A по корпоративному PDF
 
-- AD-интеграция CLI, сессии web, SQLi в СУБД приложения, Redis/n8n — не применимо к slim-стеку.
+- AD-интеграция CLI, сессии web, SQLi в СУБД приложения, Redis — не применимо к slim-стеку.
 
 ## Хранение и retention
 

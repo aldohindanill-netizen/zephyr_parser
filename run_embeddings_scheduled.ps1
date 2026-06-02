@@ -3,6 +3,7 @@ param([switch]$UseLocalEnv)
 $ErrorActionPreference = "Stop"
 $RepoRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $EnvFile = Join-Path $RepoRoot ".env"
+$EnvSecretsFile = Join-Path $RepoRoot ".env.secrets"
 $EnvLocalFile = Join-Path $RepoRoot ".env.local"
 $VenvDir = Join-Path $RepoRoot ".venv-embeddings"
 $Requirements = Join-Path $RepoRoot "requirements-embeddings.txt"
@@ -102,6 +103,8 @@ function Assert-TorchLoads { param([string]$VenvPython)
 }
 if (-not (Test-Path -LiteralPath $EnvFile)) { throw "Missing $EnvFile" }
 Import-RepoDotEnv -Path $EnvFile
+if (-not (Test-Path -LiteralPath $EnvSecretsFile)) { throw "Missing $EnvSecretsFile" }
+Import-RepoDotEnv -Path $EnvSecretsFile
 $useLocalOverlay = $UseLocalEnv.IsPresent -or (Test-EnvEnabled $env:ZEPHYR_USE_LOCAL_ENV $false)
 if ($useLocalOverlay) {
     if (Test-Path -LiteralPath $EnvLocalFile) { Import-RepoDotEnv -Path $EnvLocalFile; Write-Host "Loaded local overrides: $EnvLocalFile" }

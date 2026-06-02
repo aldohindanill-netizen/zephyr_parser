@@ -16,6 +16,7 @@ import argparse
 from repo_env import load_repo_env_for_scripts  # noqa: E402
 
 from bug_duplicate_detection import (  # noqa: E402
+    bugs_duplicate_publish_min_confidence,
     find_duplicate_candidates,
     load_duplicate_overrides,
     load_embedding_cache,
@@ -105,7 +106,15 @@ def main() -> int:
     )
 
     matches = sum(1 for v in duplicates.values() if v is not None)
-    print(f"Duplicate candidates: {matches}/{len(keys)}")
+    high_matches = sum(1 for v in duplicates.values() if v is not None and v.confidence == "high")
+    medium_matches = sum(
+        1 for v in duplicates.values() if v is not None and v.confidence == "medium"
+    )
+    min_conf = bugs_duplicate_publish_min_confidence()
+    print(
+        f"Duplicate candidates: {matches}/{len(keys)} "
+        f"(high={high_matches}, medium={medium_matches}, publish_min={min_conf})"
+    )
     for k in keys:
         c = duplicates.get(k)
         if c:
@@ -114,7 +123,10 @@ def main() -> int:
                 extra += f" exp={c.expected_sim:.2f}"
             if c.actual_sim is not None:
                 extra += f" act={c.actual_sim:.2f}"
-            print(f"  {k} -> {c.other_key} ({c.method}, {c.score:.3f}{extra})")
+            print(
+                f"  {k} -> {c.other_key} "
+                f"({c.method}, {c.score:.3f}, {c.confidence}{extra})"
+            )
 
     print("\nRe-run run_zephyr.ps1 to refresh bugs_index.html duplicate column.")
     return 0

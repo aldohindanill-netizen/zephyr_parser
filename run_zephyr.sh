@@ -12,6 +12,8 @@ if [[ -f "$SCRIPT_DIR/PIPELINE_VERSION" ]]; then
 fi
 ENV_FILE="$SCRIPT_DIR/.env"
 ENV_EXAMPLE="$SCRIPT_DIR/.env.example"
+ENV_SECRETS_FILE="$SCRIPT_DIR/.env.secrets"
+ENV_SECRETS_EXAMPLE="$SCRIPT_DIR/.env.secrets.example"
 
 env_enabled() {
   local raw="${1:-}"
@@ -62,6 +64,16 @@ if [[ ! -f "$ENV_FILE" ]]; then
 fi
 
 load_env_file "$ENV_FILE"
+if [[ ! -f "$ENV_SECRETS_FILE" ]]; then
+  printf '%s\n' \
+    "Missing secrets file: $ENV_SECRETS_FILE" \
+    "" \
+    "Copy the template and fill in secret values:" \
+    "  cp \"$ENV_SECRETS_EXAMPLE\" \"$ENV_SECRETS_FILE\"" \
+    >&2
+  exit 1
+fi
+load_env_file "$ENV_SECRETS_FILE"
 export ZEPHYR_CONFLUENCE_AUTH_SCHEME="${ZEPHYR_CONFLUENCE_AUTH_SCHEME:-bearer}"
 export PYTHONUNBUFFERED="${PYTHONUNBUFFERED:-1}"
 export ZEPHYR_RUN_LOCK_FILE="${ZEPHYR_RUN_LOCK_FILE:-$SCRIPT_DIR/reports/.zephyr_weekly_report.lock}"
