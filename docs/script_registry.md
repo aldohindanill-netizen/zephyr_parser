@@ -32,6 +32,7 @@ This registry classifies project scripts (excluding `.venv*` and third-party pac
 - `scripts/debug_jira_description.py`
 - `scripts/publish_local_confluence.py`
 - `scripts/calibrate_bug_duplicates.py`
+- `scripts/backfill_bugs_rollup_snapshot.py`
 - `reports_local/logs/run_main_verify.ps1`
 - `reports_local/logs/run_embeddings_verify.ps1`
 - `tests/test_bug_duplicate_detection.py`
@@ -39,6 +40,7 @@ This registry classifies project scripts (excluding `.venv*` and third-party pac
 - `tests/test_daily_aggregate.py`
 - `tests/test_daily_confluence_week.py`
 - `tests/test_pipeline_health.py`
+- `tests/test_bugs_rollup_snapshot.py`
 - `tests/test_repo_env.py`
 - `tests/test_zephyr_security_audit.py`
 

@@ -153,6 +153,8 @@
 - Каталог rollup: `reports/bugs_rollup/`.
 - Источник: Jira issues типа Bug (фильтр `ZEPHYR_DEFECT_TYPE_FILTER`), поля из description (Expected/Actual в таблице).
 - В Confluence публикуется `bugs_index.html` и связанные build-log.
+- Секция **«последние N недель»** — rolling-окно (`ZEPHYR_REGENERATE_LAST_N_DAYS`, `ZEPHYR_BUGS_ROLLUP_LAST_WEEKS`).
+- Секция **«Все заведённые баги»** — `defect_analytics_snapshot.json` (merge каждого прогона; bootstrap из `build_log_reports/` при пустом snapshot). Backfill: `scripts/backfill_bugs_rollup_snapshot.py`.
 
 **Колонка «Возможно дубль»**
 

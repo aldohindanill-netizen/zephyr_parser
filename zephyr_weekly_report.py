@@ -8622,7 +8622,6 @@ def _weekly_defect_analytics_wiki(
 # Confluence page title must differ from ZEPHYR_CONFLUENCE_BUGS_PARENT_TITLE («Баги» folder).
 BUGS_ROLLUP_CONFLUENCE_TITLE = "Сводка багов"
 BUGS_ROLLUP_DISPLAY_TITLE = "Баги"
-BUGS_ROLLUP_SECTION_LAST_WEEKS = "Баги за последние 2 недели"
 BUGS_ROLLUP_SECTION_ALL = "Все заведённые баги"
 
 _WEEKLY_HTML_DEFECT_STYLES = (
@@ -8658,6 +8657,423 @@ def _bugs_rollup_last_weeks_count() -> int:
         return max(1, int(raw))
     except ValueError:
         return 2
+
+
+def _bugs_rollup_section_last_weeks_title() -> str:
+    n = _bugs_rollup_last_weeks_count()
+    return f"Баги за последние {n} нед."
+
+
+def _bugs_rollup_snapshot_bootstrap_build_logs_enabled() -> bool:
+    raw = os.getenv("ZEPHYR_BUGS_ROLLUP_SNAPSHOT_BOOTSTRAP_BUILD_LOGS")
+    if raw is None or not str(raw).strip():
+        return True
+    return _parse_bool_env(raw)
+
+
+def _default_build_log_report_dir() -> str:
+    return (
+        os.getenv("ZEPHYR_BUILD_LOG_REPORT_DIR", "reports/build_log_reports").strip()
+        or "reports/build_log_reports"
+    )
+
+
+def _append_jira_defect_keys(
+    keys_ordered: list[str],
+    seen: set[str],
+    keys: Iterable[Any],
+) -> None:
+    for key in keys:
+        k = str(key).strip()
+        if k and _DEFECT_KEY_PATTERN.search(k) and k not in seen:
+            seen.add(k)
+            keys_ordered.append(k)
+
+
+def _bootstrap_snapshot_base_if_empty(
+    base_analytics: dict[str, Any],
+    base_labels: list[str],
+    base_week_keys: list[date],
+    output_dir: str,
+) -> tuple[dict[str, Any], list[str], list[date]]:
+    """When snapshot has no keys, seed base state from on-disk build logs."""
+    if base_analytics.get("keys_ordered") or not _bugs_rollup_snapshot_bootstrap_build_logs_enabled():
+        return base_analytics, base_labels, base_week_keys
+    boot_analytics, boot_labels, boot_week_keys = _bootstrap_snapshot_from_disk(
+        _default_build_log_report_dir(), output_dir
+    )
+    if not boot_analytics.get("keys_ordered"):
+        return base_analytics, base_labels, base_week_keys
+    merged_analytics, merged_labels = _merge_defect_analytics(
+        base_analytics, boot_analytics, base_labels, boot_labels
+    )
+    return merged_analytics, merged_labels, sorted(set(base_week_keys) | set(boot_week_keys))
+
+
+def _bugs_rollup_snapshot_path(output_dir: str) -> str:
+    explicit = (os.getenv("ZEPHYR_BUGS_ROLLUP_SNAPSHOT") or "").strip()
+    if explicit:
+        return explicit
+    return os.path.join(output_dir, "defect_analytics_snapshot.json")
+
+
+def _load_bugs_rollup_snapshot(path: str) -> dict[str, Any]:
+    """Load persisted rollup snapshot or return an empty payload."""
+    empty: dict[str, Any] = {
+        "version": 1,
+        "column_labels": [],
+        "week_keys_iso": [],
+        "analytics": _empty_defect_analytics(),
+    }
+    if not path or not os.path.isfile(path):
+        return empty
+    try:
+        with open(path, encoding="utf-8") as fh:
+            raw = json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return empty
+    if not isinstance(raw, dict):
+        return empty
+    analytics = raw.get("analytics")
+    if not isinstance(analytics, dict):
+        analytics = _empty_defect_analytics()
+    column_labels = [
+        str(label).strip()
+        for label in (raw.get("column_labels") or [])
+        if str(label).strip()
+    ]
+    week_keys_iso = [
+        str(day).strip()
+        for day in (raw.get("week_keys_iso") or [])
+        if str(day).strip()
+    ]
+    return {
+        "version": int(raw.get("version") or 1),
+        "column_labels": column_labels,
+        "week_keys_iso": week_keys_iso,
+        "analytics": analytics,
+    }
+
+
+def _week_keys_from_snapshot_iso(week_keys_iso: list[str]) -> list[date]:
+    out: list[date] = []
+    for raw in week_keys_iso:
+        try:
+            out.append(date.fromisoformat(raw))
+        except ValueError:
+            continue
+    return sorted(set(out))
+
+
+def _issue_key_from_build_log_filename(name: str) -> str | None:
+    if not name.endswith("_build_log.html"):
+        return None
+    stem = name[: -len("_build_log.html")]
+    match = _DEFECT_KEY_PATTERN.search(stem.replace("_", "-"))
+    return match.group(0) if match else None
+
+
+def _bootstrap_snapshot_from_disk(
+    build_log_dir: str,
+    rollup_dir: str,
+) -> tuple[dict[str, Any], list[str], list[date]]:
+    """Seed snapshot keys from on-disk build logs and duplicate_rollup_keys.json."""
+    keys_seen: set[str] = set()
+    keys_ordered: list[str] = []
+
+    def _add_key(raw: str) -> None:
+        key = str(raw).strip()
+        if not key or not _DEFECT_KEY_PATTERN.search(key) or key in keys_seen:
+            return
+        keys_seen.add(key)
+        keys_ordered.append(key)
+
+    if os.path.isdir(build_log_dir):
+        for name in sorted(os.listdir(build_log_dir)):
+            parsed = _issue_key_from_build_log_filename(name)
+            if parsed:
+                _add_key(parsed)
+
+    keys_path = os.path.join(rollup_dir, "duplicate_rollup_keys.json")
+    if os.path.isfile(keys_path):
+        try:
+            with open(keys_path, encoding="utf-8") as fh:
+                stored = json.load(fh)
+            for raw in stored.get("keys") or []:
+                _add_key(str(raw))
+        except (OSError, json.JSONDecodeError):
+            pass
+
+    analytics = _empty_defect_analytics()
+    analytics["keys_ordered"] = keys_ordered
+    return analytics, [], []
+
+
+def _parse_build_column_label_day(label: str) -> date | None:
+    raw = str(label or "").strip()
+    match = re.match(
+        r"^nightly-dev-(\d{4})[._-](\d{2})[._-](\d{2})\b",
+        raw,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return None
+    try:
+        return date(int(match.group(1)), int(match.group(2)), int(match.group(3)))
+    except ValueError:
+        return None
+
+
+def _sort_build_column_labels_chronologically(labels: list[str]) -> list[str]:
+    """Order build columns by calendar day so backfills do not scramble matrix/hot-bugs."""
+    known: list[tuple[date, int, str]] = []
+    unknown: list[tuple[int, str]] = []
+    for idx, label in enumerate(labels):
+        day = _parse_build_column_label_day(label)
+        if day is not None:
+            known.append((day, idx, label))
+        else:
+            unknown.append((idx, label))
+    known.sort(key=lambda item: (item[0], item[1]))
+    unknown.sort(key=lambda item: item[0])
+    return [item[2] for item in known] + [item[1] for item in unknown]
+
+
+def _bugs_rollup_all_time_max_build_columns() -> int:
+    raw = (os.getenv("ZEPHYR_BUGS_ROLLUP_ALL_MAX_BUILD_COLUMNS") or "52").strip()
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return 52
+
+
+def _display_build_column_labels(labels: list[str], max_columns: int) -> list[str]:
+    ordered = _sort_build_column_labels_chronologically(labels)
+    if len(ordered) <= max_columns:
+        return ordered
+    return ordered[-max_columns:]
+
+
+def _merge_column_labels_ordered(
+    base_labels: list[str], incoming_labels: list[str]
+) -> list[str]:
+    merged = list(base_labels)
+    seen = set(merged)
+    for label in incoming_labels:
+        if label not in seen:
+            merged.append(label)
+            seen.add(label)
+    return _sort_build_column_labels_chronologically(merged)
+
+
+def _merge_int_maps_max(
+    base: dict[str, int],
+    incoming: dict[str, int],
+    labels: list[str],
+) -> dict[str, int]:
+    out: dict[str, int] = {}
+    for label in labels:
+        out[label] = max(int(base.get(label, 0)), int(incoming.get(label, 0)))
+    return out
+
+
+def _merge_defect_analytics(
+    base: dict[str, Any],
+    incoming: dict[str, Any],
+    base_labels: list[str],
+    incoming_labels: list[str],
+) -> tuple[dict[str, Any], list[str]]:
+    """Merge two analytics dicts; per bug×build cell counts use max (idempotent re-runs)."""
+    merged_labels = _merge_column_labels_ordered(base_labels, incoming_labels)
+    base_matrix = dict(base.get("matrix") or {})
+    incoming_matrix = dict(incoming.get("matrix") or {})
+    keys_seen: set[str] = set()
+    keys_ordered: list[str] = []
+    for key in list(base.get("keys_ordered") or []) + list(incoming.get("keys_ordered") or []):
+        k = str(key).strip()
+        if not k or k in keys_seen:
+            continue
+        keys_seen.add(k)
+        keys_ordered.append(k)
+
+    matrix: dict[str, dict[str, int]] = {}
+    bug_total_cases: dict[str, int] = {}
+    bug_builds_count: dict[str, int] = {}
+    for key in keys_ordered:
+        row_base = dict(base_matrix.get(key) or {})
+        row_in = dict(incoming_matrix.get(key) or {})
+        row: dict[str, int] = {}
+        for label in merged_labels:
+            row[label] = max(int(row_base.get(label, 0)), int(row_in.get(label, 0)))
+        matrix[key] = row
+        bug_total_cases[key] = max(
+            int((base.get("bug_total_cases") or {}).get(key, 0)),
+            int((incoming.get("bug_total_cases") or {}).get(key, 0)),
+            sum(row.values()),
+        )
+        appears = sum(1 for count in row.values() if count > 0)
+        bug_builds_count[key] = max(
+            int((base.get("bug_builds_count") or {}).get(key, 0)),
+            int((incoming.get("bug_builds_count") or {}).get(key, 0)),
+            appears,
+        )
+
+    per_label_fields = (
+        "totals_by_build",
+        "cases_with_bug_by_build",
+        "cases_without_bug_by_build",
+        "failed_cases_with_bug_by_build",
+        "failed_cases_without_bug_by_build",
+    )
+    merged: dict[str, Any] = {
+        "keys_ordered": keys_ordered,
+        "matrix": matrix,
+        "bug_total_cases": bug_total_cases,
+        "bug_builds_count": bug_builds_count,
+    }
+    for field in per_label_fields:
+        merged[field] = _merge_int_maps_max(
+            dict(base.get(field) or {}),
+            dict(incoming.get(field) or {}),
+            merged_labels,
+        )
+
+    hot_seen: set[str] = set()
+    hot_bugs: list[str] = []
+    for key in list(base.get("hot_bugs") or []) + list(incoming.get("hot_bugs") or []):
+        k = str(key).strip()
+        if k and k not in hot_seen:
+            hot_seen.add(k)
+            hot_bugs.append(k)
+    merged["hot_bugs"] = hot_bugs
+    merged["keys_ordered"] = _recompute_defect_keys_order(merged)
+    return merged, merged_labels
+
+
+def _recompute_defect_keys_order(analytics: dict[str, Any]) -> list[str]:
+    bug_total_cases = dict(analytics.get("bug_total_cases") or {})
+    bug_builds_count = dict(analytics.get("bug_builds_count") or {})
+    keys = list(analytics.get("keys_ordered") or [])
+    return sorted(
+        keys,
+        key=lambda k: (
+            -int(bug_total_cases.get(k, 0)),
+            -int(bug_builds_count.get(k, 0)),
+            str(k),
+        ),
+    )
+
+
+def _recompute_defect_analytics_derived(
+    analytics: dict[str, Any], column_labels: list[str]
+) -> dict[str, Any]:
+    """Refresh totals_by_build and hot_bugs from matrix after a merge."""
+    matrix = dict(analytics.get("matrix") or {})
+    label_index = {label: idx for idx, label in enumerate(column_labels)}
+    totals_by_build = {
+        label: sum(1 for key in matrix if int(matrix.get(key, {}).get(label, 0)) > 0)
+        for label in column_labels
+    }
+    hot_bugs: list[str] = []
+    for key in analytics.get("keys_ordered") or []:
+        present_indexes = sorted(
+            label_index[label]
+            for label in column_labels
+            if int(matrix.get(key, {}).get(label, 0)) > 0
+            and label in label_index
+        )
+        if len(present_indexes) < 2:
+            continue
+        for a, b in zip(present_indexes, present_indexes[1:]):
+            if b - a == 1:
+                hot_bugs.append(str(key))
+                break
+    out = dict(analytics)
+    out["totals_by_build"] = totals_by_build
+    out["hot_bugs"] = hot_bugs
+    out["keys_ordered"] = _recompute_defect_keys_order(out)
+    return out
+
+
+def _save_bugs_rollup_snapshot(
+    path: str,
+    analytics: dict[str, Any],
+    column_labels: list[str],
+    week_keys: list[date],
+) -> None:
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    payload = {
+        "version": 1,
+        "updated_at": datetime.now(UTC).isoformat(),
+        "column_labels": column_labels,
+        "week_keys_iso": [day.isoformat() for day in sorted(set(week_keys))],
+        "analytics": analytics,
+    }
+    tmp_path = f"{path}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, ensure_ascii=False, indent=2)
+    os.replace(tmp_path, path)
+
+
+def _refresh_bugs_rollup_all_time_snapshot(
+    output_dir: str,
+    run_analytics: dict[str, Any],
+    run_labels: list[str],
+    run_week_keys: list[date],
+) -> tuple[dict[str, Any], list[str], list[date]]:
+    """Merge current run analytics into the persisted all-time snapshot."""
+    snapshot_path = _bugs_rollup_snapshot_path(output_dir)
+    stored = _load_bugs_rollup_snapshot(snapshot_path)
+    base_analytics = dict(stored.get("analytics") or _empty_defect_analytics())
+    base_labels = list(stored.get("column_labels") or [])
+    base_week_keys = _week_keys_from_snapshot_iso(list(stored.get("week_keys_iso") or []))
+
+    base_analytics, base_labels, base_week_keys = _bootstrap_snapshot_base_if_empty(
+        base_analytics, base_labels, base_week_keys, output_dir
+    )
+
+    merged_analytics, merged_labels = _merge_defect_analytics(
+        base_analytics, run_analytics, base_labels, run_labels
+    )
+    merged_week_keys = sorted(set(base_week_keys) | set(run_week_keys))
+    merged_analytics = _recompute_defect_analytics_derived(merged_analytics, merged_labels)
+    _save_bugs_rollup_snapshot(
+        snapshot_path, merged_analytics, merged_labels, merged_week_keys
+    )
+    return merged_analytics, merged_labels, merged_week_keys
+
+
+def collect_bugs_rollup_jira_keys(
+    report_data: dict[tuple[str, str], dict[str, Any]],
+    output_dir: str,
+) -> list[str]:
+    """Collect Jira keys for rollup metadata: rolling window + persisted all-time snapshot."""
+    keys_ordered: list[str] = []
+    seen: set[str] = set()
+    n_weeks = _bugs_rollup_last_weeks_count()
+    for last_n in (n_weeks, None):
+        _labels, analytics, _weeks = _defect_rollup_from_report_data(
+            report_data, last_n_weeks=last_n
+        )
+        _append_jira_defect_keys(keys_ordered, seen, analytics.get("keys_ordered") or [])
+
+    stored = _load_bugs_rollup_snapshot(_bugs_rollup_snapshot_path(output_dir))
+    _append_jira_defect_keys(
+        keys_ordered,
+        seen,
+        (stored.get("analytics") or {}).get("keys_ordered") or [],
+    )
+
+    if _bugs_rollup_snapshot_bootstrap_build_logs_enabled():
+        boot_analytics, _, _ = _bootstrap_snapshot_from_disk(
+            _default_build_log_report_dir(), output_dir
+        )
+        _append_jira_defect_keys(
+            keys_ordered, seen, boot_analytics.get("keys_ordered") or []
+        )
+    return keys_ordered
 
 
 def _defect_rollup_from_report_data(
@@ -8728,7 +9144,10 @@ def _defect_rollup_from_report_data(
 
 
 def _bugs_rollup_section_subtitle(
-    week_keys: list[date], column_labels: list[str]
+    week_keys: list[date],
+    column_labels: list[str],
+    *,
+    total_build_columns: int | None = None,
 ) -> str:
     parts: list[str] = []
     if week_keys:
@@ -8737,7 +9156,10 @@ def _bugs_rollup_section_subtitle(
             + (f" — {week_keys[-1].isoformat()}" if len(week_keys) > 1 else "")
         )
     if column_labels:
-        parts.append(f"Билдов: {len(column_labels)}")
+        build_part = f"Билдов в матрице: {len(column_labels)}"
+        if total_build_columns is not None and total_build_columns > len(column_labels):
+            build_part += f" (всего в snapshot: {total_build_columns})"
+        parts.append(build_part)
     return " · ".join(parts)
 
 
@@ -8749,9 +9171,12 @@ def _bugs_rollup_html_section(
     column_labels: list[str],
     week_keys: list[date],
     duplicate_candidates: dict[str, DuplicateCandidate | None] | None = None,
+    total_build_columns: int | None = None,
 ) -> list[str]:
     blocks = [f"<h2><strong>{html.escape(section_title)}</strong></h2>"]
-    subtitle = _bugs_rollup_section_subtitle(week_keys, column_labels)
+    subtitle = _bugs_rollup_section_subtitle(
+        week_keys, column_labels, total_build_columns=total_build_columns
+    )
     if subtitle:
         blocks.append(f"<p class='bugs-rollup-subtitle'>{html.escape(subtitle)}</p>")
     keys = list((defect_analytics or {}).get("keys_ordered") or [])
@@ -8780,6 +9205,7 @@ def render_bugs_rollup_html_report(
     all_week_keys: list[date],
     last_weeks_duplicates: dict[str, DuplicateCandidate | None] | None = None,
     all_duplicates: dict[str, DuplicateCandidate | None] | None = None,
+    all_total_build_columns: int | None = None,
 ) -> str:
     sections = [
         "<!doctype html>",
@@ -8791,7 +9217,7 @@ def render_bugs_rollup_html_report(
     ]
     sections.extend(
         _bugs_rollup_html_section(
-            BUGS_ROLLUP_SECTION_LAST_WEEKS,
+            _bugs_rollup_section_last_weeks_title(),
             defect_analytics=last_weeks_analytics,
             defect_meta=defect_meta,
             column_labels=last_weeks_labels,
@@ -8807,6 +9233,7 @@ def render_bugs_rollup_html_report(
             column_labels=all_labels,
             week_keys=all_week_keys,
             duplicate_candidates=all_duplicates,
+            total_build_columns=all_total_build_columns,
         )
     )
     sections.append("</body></html>")
@@ -8821,9 +9248,12 @@ def _bugs_rollup_wiki_section(
     column_labels: list[str],
     week_keys: list[date],
     duplicate_candidates: dict[str, DuplicateCandidate | None] | None = None,
+    total_build_columns: int | None = None,
 ) -> list[str]:
     lines = [f"h2. {section_title}", ""]
-    subtitle = _bugs_rollup_section_subtitle(week_keys, column_labels)
+    subtitle = _bugs_rollup_section_subtitle(
+        week_keys, column_labels, total_build_columns=total_build_columns
+    )
     if subtitle:
         lines.append(f"_{subtitle}_")
     lines.append("")
@@ -8854,11 +9284,12 @@ def render_bugs_rollup_wiki_report(
     all_week_keys: list[date],
     last_weeks_duplicates: dict[str, DuplicateCandidate | None] | None = None,
     all_duplicates: dict[str, DuplicateCandidate | None] | None = None,
+    all_total_build_columns: int | None = None,
 ) -> str:
     lines = [f"h1. {BUGS_ROLLUP_DISPLAY_TITLE}", ""]
     lines.extend(
         _bugs_rollup_wiki_section(
-            BUGS_ROLLUP_SECTION_LAST_WEEKS,
+            _bugs_rollup_section_last_weeks_title(),
             defect_analytics=last_weeks_analytics,
             defect_meta=defect_meta,
             column_labels=last_weeks_labels,
@@ -8874,6 +9305,7 @@ def render_bugs_rollup_wiki_report(
             column_labels=all_labels,
             week_keys=all_week_keys,
             duplicate_candidates=all_duplicates,
+            total_build_columns=all_total_build_columns,
         )
     )
     return "\n".join(lines).rstrip() + "\n"
@@ -8919,8 +9351,14 @@ def write_bugs_rollup_reports(
     last_labels, last_analytics, last_week_keys = _defect_rollup_from_report_data(
         report_data, last_n_weeks=n_weeks
     )
-    all_labels, all_analytics, all_week_keys = _defect_rollup_from_report_data(
+    run_labels, run_analytics, run_week_keys = _defect_rollup_from_report_data(
         report_data, last_n_weeks=None
+    )
+    all_analytics, all_labels, all_week_keys = _refresh_bugs_rollup_all_time_snapshot(
+        output_dir, run_analytics, run_labels, run_week_keys
+    )
+    all_labels_display = _display_build_column_labels(
+        all_labels, _bugs_rollup_all_time_max_build_columns()
     )
     cache_path, overrides_path = resolve_paths_for_rollup_dir(output_dir)
     embedding_cache = load_embedding_cache(cache_path)
@@ -8985,11 +9423,14 @@ def write_bugs_rollup_reports(
             all_analytics=all_analytics,
             defect_meta=defect_meta,
             last_weeks_labels=last_labels,
-            all_labels=all_labels,
+            all_labels=all_labels_display,
             last_weeks_keys=last_week_keys,
             all_week_keys=all_week_keys,
             last_weeks_duplicates=last_duplicates,
             all_duplicates=all_duplicates,
+            all_total_build_columns=(
+                len(all_labels) if len(all_labels) != len(all_labels_display) else None
+            ),
         )
         _write_text_always(html_path, body)
         written.append(html_path)
@@ -9000,11 +9441,14 @@ def write_bugs_rollup_reports(
             all_analytics=all_analytics,
             defect_meta=defect_meta,
             last_weeks_labels=last_labels,
-            all_labels=all_labels,
+            all_labels=all_labels_display,
             last_weeks_keys=last_week_keys,
             all_week_keys=all_week_keys,
             last_weeks_duplicates=last_duplicates,
             all_duplicates=all_duplicates,
+            all_total_build_columns=(
+                len(all_labels) if len(all_labels) != len(all_labels_display) else None
+            ),
         )
         _write_text_always(wiki_path, body)
         written.append(wiki_path)
@@ -13281,20 +13725,7 @@ def run_once(args: argparse.Namespace) -> int:
                     args.build_log_report_format
                     or _env_csv_values("ZEPHYR_BUILD_LOG_REPORT_FORMATS", ["html", "wiki"])
                 )
-                rollup_keys: list[str] = []
-                seen_rollup_keys: set[str] = set()
-                for last_n in (
-                    _bugs_rollup_last_weeks_count(),
-                    None,
-                ):
-                    _labels, analytics, _weeks = _defect_rollup_from_report_data(
-                        report_data, last_n_weeks=last_n
-                    )
-                    for key in analytics.get("keys_ordered") or []:
-                        k = str(key).strip()
-                        if k and _DEFECT_KEY_PATTERN.search(k) and k not in seen_rollup_keys:
-                            seen_rollup_keys.add(k)
-                            rollup_keys.append(k)
+                rollup_keys = collect_bugs_rollup_jira_keys(report_data, bugs_rollup_dir)
                 jira_meta_base = _resolve_weekly_jira_metadata_base(args.base_url)
                 jira_meta_headers = _jira_bug_metadata_auth_headers(headers) or headers
                 rollup_defect_meta = _fetch_jira_bug_metadata(

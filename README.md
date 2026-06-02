@@ -227,7 +227,22 @@ python scripts/confluence_delete_children.py --parent-page-id 123456 --execute -
 
 Папка «Баги» этим скриптом не затрагивается (удаляются только прямые дети корневой страницы).
 
-Сводка багов: одна страница `reports/bugs_rollup/bugs_index.html`, `ZEPHYR_BUGS_ROLLUP_LAST_WEEKS=4` (prod) — глубина раздела «последние N недель» в Confluence.
+Сводка багов: одна страница `reports/bugs_rollup/bugs_index.html`.
+
+- **Последние N недель** (`ZEPHYR_BUGS_ROLLUP_LAST_WEEKS=4` в prod): данные из текущего rolling-окна (`ZEPHYR_REGENERATE_LAST_N_DAYS`).
+- **Все заведённые баги**: накопительный snapshot `reports/bugs_rollup/defect_analytics_snapshot.json` (обновляется каждым прогоном; при первом запуске можно подтянуть ключи из `build_log_reports/`). В HTML/Confluence матрица и сводка по билдам ограничены последними `ZEPHYR_BUGS_ROLLUP_ALL_MAX_BUILD_COLUMNS` (по умолчанию 52); полный список ключей и счётчики `Кейсов`/`Билдов` — в snapshot. Merge в snapshot — **max** по ячейкам (high-water mark: повторный прогон не уменьшает счётчики). Jira metadata и duplicate detection используют union ключей из snapshot + текущего окна (растёт с историей).
+
+Разовый backfill snapshot без Zephyr:
+
+```bash
+py -3 scripts/backfill_bugs_rollup_snapshot.py
+```
+
+Полный backfill за период `ZEPHYR_FROM_DATE`..`ZEPHYR_TO_DATE` (долгий прогон):
+
+```bash
+py -3 scripts/backfill_bugs_rollup_snapshot.py --mode full
+```
 
 ### Возможные дубликаты багов
 
