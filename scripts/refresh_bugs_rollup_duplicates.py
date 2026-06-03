@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Re-fetch Jira description fields and refresh duplicate_candidates.json."""
+"""Повторно загрузить поля описания Jira и пересчитать duplicate_candidates.json."""
 
 from __future__ import annotations
 
@@ -35,6 +35,7 @@ from zephyr_weekly_report import (  # noqa: E402
 
 
 def main() -> int:
+    """CLI: Jira metadata + find_duplicate_candidates + запись JSON."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--use-local-env",

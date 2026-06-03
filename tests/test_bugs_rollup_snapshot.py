@@ -32,7 +32,9 @@ from zephyr_weekly_report import (
 
 
 class BugsRollupSnapshotTests(unittest.TestCase):
+    """Snapshot bugs rollup: merge analytics, bootstrap с диска, env-заголовки недель."""
     def test_merge_defect_analytics_unions_keys_and_uses_max_per_cell(self) -> None:
+        """Вспомогательная функция: test merge defect analytics unions keys and uses max per cell."""
         base = _empty_defect_analytics()
         base["keys_ordered"] = ["CSD-1"]
         base["matrix"] = {"CSD-1": {"build-a": 2}}
@@ -58,6 +60,7 @@ class BugsRollupSnapshotTests(unittest.TestCase):
         self.assertEqual(merged["matrix"]["CSD-2"]["build-b"], 1)
 
     def test_empty_snapshot_plus_incoming_persisted(self) -> None:
+        """Вспомогательная функция: test empty snapshot plus incoming persisted."""
         with tempfile.TemporaryDirectory() as tmp:
             out_dir = os.path.join(tmp, "bugs_rollup")
             os.makedirs(out_dir)
@@ -91,6 +94,7 @@ class BugsRollupSnapshotTests(unittest.TestCase):
                 os.environ.pop("ZEPHYR_BUGS_ROLLUP_SNAPSHOT_BOOTSTRAP_BUILD_LOGS", None)
 
     def test_bootstrap_from_build_log_filenames(self) -> None:
+        """Вспомогательная функция: test bootstrap from build log filenames."""
         with tempfile.TemporaryDirectory() as tmp:
             build_dir = Path(tmp) / "build_log"
             build_dir.mkdir()
@@ -115,6 +119,7 @@ class BugsRollupSnapshotTests(unittest.TestCase):
             self.assertEqual(weeks, [])
 
     def test_issue_key_from_build_log_filename(self) -> None:
+        """Вспомогательная функция: test issue key from build log filename."""
         self.assertEqual(
             _issue_key_from_build_log_filename("NAVIO-42_build_log.html"),
             "NAVIO-42",
@@ -122,12 +127,14 @@ class BugsRollupSnapshotTests(unittest.TestCase):
         self.assertIsNone(_issue_key_from_build_log_filename("readme.html"))
 
     def test_append_jira_defect_keys_dedupes(self) -> None:
+        """Вспомогательная функция: test append jira defect keys dedupes."""
         keys: list[str] = []
         seen: set[str] = set()
         _append_jira_defect_keys(keys, seen, ["CSD-1", "CSD-1", "bad", "CSD-2"])
         self.assertEqual(keys, ["CSD-1", "CSD-2"])
 
     def test_bootstrap_snapshot_base_if_empty_noop_when_keys_present(self) -> None:
+        """Вспомогательная функция: test bootstrap snapshot base if empty noop when keys present."""
         base = _empty_defect_analytics()
         base["keys_ordered"] = ["CSD-1"]
         out_analytics, out_labels, out_weeks = _bootstrap_snapshot_base_if_empty(
@@ -138,6 +145,7 @@ class BugsRollupSnapshotTests(unittest.TestCase):
         self.assertEqual(out_weeks, [])
 
     def test_merge_column_labels_sorted_after_backfill_style_merge(self) -> None:
+        """Вспомогательная функция: test merge column labels sorted after backfill style merge."""
         labels = _merge_column_labels_ordered(
             ["nightly-dev-2026.06.10"],
             ["nightly-dev-2026.06.01"],
@@ -148,6 +156,7 @@ class BugsRollupSnapshotTests(unittest.TestCase):
         )
 
     def test_display_build_column_labels_keeps_most_recent(self) -> None:
+        """Вспомогательная функция: test display build column labels keeps most recent."""
         labels = _sort_build_column_labels_chronologically(
             [f"nightly-dev-2026.01.{day:02d}" for day in range(1, 6)]
         )
@@ -162,6 +171,7 @@ class BugsRollupSnapshotTests(unittest.TestCase):
         )
 
     def test_refresh_snapshot_preserves_keys_from_prior_run(self) -> None:
+        """Вспомогательная функция: test refresh snapshot preserves keys from prior run."""
         with tempfile.TemporaryDirectory() as tmp:
             out_dir = os.path.join(tmp, "bugs_rollup")
             os.makedirs(out_dir)
@@ -208,6 +218,7 @@ class BugsRollupSnapshotTests(unittest.TestCase):
                 os.environ.pop("ZEPHYR_BUGS_ROLLUP_SNAPSHOT_BOOTSTRAP_BUILD_LOGS", None)
 
     def test_refresh_snapshot_max_merge_keeps_higher_count(self) -> None:
+        """Вспомогательная функция: test refresh snapshot max merge keeps higher count."""
         with tempfile.TemporaryDirectory() as tmp:
             out_dir = os.path.join(tmp, "bugs_rollup")
             os.makedirs(out_dir)
@@ -241,6 +252,7 @@ class BugsRollupSnapshotTests(unittest.TestCase):
                 os.environ.pop("ZEPHYR_BUGS_ROLLUP_SNAPSHOT_BOOTSTRAP_BUILD_LOGS", None)
 
     def test_compute_weekly_defect_analytics_collects_linked_scenarios(self) -> None:
+        """Вспомогательная функция: test compute weekly defect analytics collects linked scenarios."""
         day = date(2026, 5, 26)
         cycles = {
             "run-1": {
@@ -263,6 +275,7 @@ class BugsRollupSnapshotTests(unittest.TestCase):
         )
 
     def test_merge_defect_analytics_unions_linked_scenarios(self) -> None:
+        """Вспомогательная функция: test merge defect analytics unions linked scenarios."""
         base = _empty_defect_analytics()
         base["keys_ordered"] = ["CSD-1"]
         base["bug_linked_scenarios"] = {"CSD-1": ["Сценарий A"]}
@@ -278,6 +291,7 @@ class BugsRollupSnapshotTests(unittest.TestCase):
         )
 
     def test_parse_zephyr_issuelink_extracts_test_case_names(self) -> None:
+        """Вспомогательная функция: test parse zephyr issuelink extracts test case names."""
         payload = {
             "testCases": [
                 {"testCase": {"key": "QA-T1", "name": "Объезд ремонтных работ"}},
@@ -291,6 +305,7 @@ class BugsRollupSnapshotTests(unittest.TestCase):
         )
 
     def test_defect_scenario_names_panel_then_zephyr_without_dup(self) -> None:
+        """Вспомогательная функция: test defect scenario names panel then zephyr without dup."""
         meta = {
             "CSD-1": {"traceability_scenarios": "Сценарий A; Сценарий B"},
         }
@@ -305,6 +320,7 @@ class BugsRollupSnapshotTests(unittest.TestCase):
         )
 
     def test_build_scenario_group_catalog(self) -> None:
+        """Вспомогательная функция: test build scenario group catalog."""
         report_data = {
             ("f1", "folder"): {
                 "cycles": {
@@ -333,6 +349,7 @@ class BugsRollupSnapshotTests(unittest.TestCase):
         )
 
     def test_defect_scenario_names_collapsed_to_groups(self) -> None:
+        """Вспомогательная функция: test defect scenario names collapsed to groups."""
         report_data = {
             ("f1", "folder"): {
                 "cycles": {
@@ -348,6 +365,7 @@ class BugsRollupSnapshotTests(unittest.TestCase):
         self.assertEqual(grouped[0], catalog[0]["1"])
 
     def test_unmapped_traceability_name_preserved(self) -> None:
+        """Вспомогательная функция: test unmapped traceability name preserved."""
         catalog = _build_scenario_group_catalog({})
         names = _defect_scenario_group_names_list(
             ["Объезд ремонтных работ слева"],
@@ -356,6 +374,7 @@ class BugsRollupSnapshotTests(unittest.TestCase):
         self.assertEqual(names, ["Объезд ремонтных работ слева"])
 
     def test_defect_scenario_names_list_uses_grouping_with_catalog(self) -> None:
+        """Вспомогательная функция: test defect scenario names list uses grouping with catalog."""
         report_data = {
             ("f1", "folder"): {
                 "cycles": {
@@ -380,7 +399,9 @@ class BugsRollupSnapshotTests(unittest.TestCase):
 
 
 class BugsRollupLastWeeksTests(unittest.TestCase):
+    """Класс «BugsRollupLastWeeksTests»."""
     def test_last_weeks_capped_by_regenerate_window(self) -> None:
+        """Вспомогательная функция: test last weeks capped by regenerate window."""
         with patch(
             "zephyr_weekly_report._env_prefers_repo_dotenv", return_value="4"
         ), patch(
@@ -390,6 +411,7 @@ class BugsRollupLastWeeksTests(unittest.TestCase):
             self.assertEqual(_bugs_rollup_last_weeks_count(), 2)
 
     def test_section_title_uses_capped_week_count(self) -> None:
+        """Вспомогательная функция: test section title uses capped week count."""
         with patch(
             "zephyr_weekly_report._env_prefers_repo_dotenv", return_value="4"
         ), patch(

@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Build/update embedding cache for bugs rollup duplicate detection (optional deps).
+"""Сборка/обновление embedding-кэша для поиска дубликатов багов (опциональные зависимости).
 
-Requires: pip install sentence-transformers
+Требуется: pip install sentence-transformers
 
-Embeddings are computed from Expected + Actual result (description table), not summary.
+Векторы строятся по Expected + Actual из таблицы описания, не по summary.
 
-Example:
+Пример:
   python scripts/compute_bug_embeddings.py --from-rollup-dir reports/bugs_rollup
 """
 

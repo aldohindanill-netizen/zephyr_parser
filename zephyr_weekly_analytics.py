@@ -1,4 +1,7 @@
-"""Weekly analytics page — re-exports from zephyr_weekly_report."""
+"""Страница weekly analytics: реэкспорт функций из zephyr_weekly_report.
+
+Тонкая обёртка для отдельного импорта HTML/wiki отчёта аналитики по циклам.
+"""
 
 from __future__ import annotations
 

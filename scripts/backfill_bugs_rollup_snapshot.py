@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
-"""Backfill bugs rollup all-time snapshot from Zephyr or on-disk build logs.
+"""Дозаполнение all-time snapshot bugs rollup из Zephyr или с диска.
 
-Modes:
-  bootstrap (default): merge keys from build_log_reports + duplicate_rollup_keys.json
-    into defect_analytics_snapshot.json without calling Zephyr.
-  full: run zephyr_weekly_report.py with ZEPHYR_REGENERATE_LAST_N_DAYS=0 and
-    ZEPHYR_FROM_DATE / ZEPHYR_TO_DATE from the environment (wide date window).
+Режимы:
+  bootstrap (по умолчанию): слить ключи из build_log_reports и duplicate_rollup_keys.json
+    в defect_analytics_snapshot.json без вызова Zephyr.
+  full: запустить zephyr_weekly_report.py с широким окном ZEPHYR_FROM_DATE / ZEPHYR_TO_DATE.
 """
 
 from __future__ import annotations
@@ -35,6 +34,7 @@ from zephyr_weekly_report import (  # noqa: E402
 
 
 def _rollup_dir() -> str:
+    """Каталог bugs rollup из ZEPHYR_BUGS_ROLLUP_DIR."""
     return (
         os.getenv("ZEPHYR_BUGS_ROLLUP_DIR", "reports/bugs_rollup").strip()
         or "reports/bugs_rollup"
@@ -42,6 +42,7 @@ def _rollup_dir() -> str:
 
 
 def run_bootstrap() -> int:
+    """Обновить snapshot только данными с диска (bootstrap)."""
     rollup_dir = _rollup_dir()
     os.makedirs(rollup_dir, exist_ok=True)
     snapshot_path = _bugs_rollup_snapshot_path(rollup_dir)
@@ -67,6 +68,7 @@ def run_bootstrap() -> int:
 
 
 def run_full_zephyr(extra_args: list[str]) -> int:
+    """Полный прогон zephyr_weekly_report.py за заданный диапазон дат."""
     script = _REPO / "zephyr_weekly_report.py"
     env = os.environ.copy()
     env["ZEPHYR_REGENERATE_LAST_N_DAYS"] = "0"
@@ -96,6 +98,7 @@ def run_full_zephyr(extra_args: list[str]) -> int:
 
 
 def main() -> int:
+    """CLI: выбор режима bootstrap или full."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--use-local-env",

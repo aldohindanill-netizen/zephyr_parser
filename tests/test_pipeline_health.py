@@ -16,7 +16,9 @@ UTC = timezone.utc
 
 
 class PipelineHealthTests(unittest.TestCase):
+    """Класс «PipelineHealthTests»."""
     def _write_audit(self, path: Path, records: list[dict]) -> None:
+        """Записать: audit."""
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(
             "\n".join(json.dumps(x) for x in records) + "\n",
@@ -24,6 +26,7 @@ class PipelineHealthTests(unittest.TestCase):
         )
 
     def test_writes_html_with_audit_tail(self) -> None:
+        """Вспомогательная функция: test writes html with audit tail."""
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             audit_path = root / "reports" / "audit" / "audit.jsonl"
@@ -59,6 +62,7 @@ class PipelineHealthTests(unittest.TestCase):
             self.assertIn("13:00", text)
 
     def test_lock_stale_minutes_from_env(self) -> None:
+        """Вспомогательная функция: test lock stale minutes from env."""
         with mock.patch.dict(os.environ, {"ZEPHYR_HEALTH_LOCK_STALE_MINUTES": "120"}, clear=False):
             self.assertEqual(ph.lock_stale_minutes(), 120.0)
         with mock.patch.dict(
@@ -69,6 +73,7 @@ class PipelineHealthTests(unittest.TestCase):
             self.assertEqual(ph.lock_stale_minutes(), 75.0)
 
     def test_stale_lock_shows_critical_hint(self) -> None:
+        """Вспомогательная функция: test stale lock shows critical hint."""
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             lock = root / "reports" / "weekly.lock"
@@ -84,6 +89,7 @@ class PipelineHealthTests(unittest.TestCase):
             self.assertIn("runbook", detail)
 
     def test_embeddings_block_success(self) -> None:
+        """Вспомогательная функция: test embeddings block success."""
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             audit_path = root / "reports" / "audit" / "audit.jsonl"
@@ -116,6 +122,7 @@ class PipelineHealthTests(unittest.TestCase):
             self.assertIn("success", text)
 
     def test_embeddings_failure_is_red(self) -> None:
+        """Вспомогательная функция: test embeddings failure is red."""
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             audit_path = root / "reports" / "audit" / "audit.jsonl"
@@ -146,6 +153,7 @@ class PipelineHealthTests(unittest.TestCase):
             self.assertIn('class="err">failure', text)
 
     def test_publish_confluence_warn_row(self) -> None:
+        """Вспомогательная функция: test publish confluence warn row."""
         rec = {
             "timestamp_utc": "2026-06-01T11:00:00Z",
             "operation": "publish_confluence",
@@ -157,6 +165,7 @@ class PipelineHealthTests(unittest.TestCase):
         self.assertEqual(ph._audit_row_class(rec), "warn")  # noqa: SLF001
 
     def test_embeddings_finish_error_row(self) -> None:
+        """Вспомогательная функция: test embeddings finish error row."""
         rec = {
             "timestamp_utc": "2026-06-01T02:00:00Z",
             "operation": "embeddings_finish",
@@ -167,6 +176,7 @@ class PipelineHealthTests(unittest.TestCase):
         self.assertEqual(ph._audit_row_class(rec), "err")  # noqa: SLF001
 
     def test_integration_call_error_row(self) -> None:
+        """Вспомогательная функция: test integration call error row."""
         rec = {
             "timestamp_utc": "2026-06-01T12:00:00Z",
             "operation": "integration_call",
@@ -175,6 +185,7 @@ class PipelineHealthTests(unittest.TestCase):
         self.assertTrue(ph._is_error_record(rec))  # noqa: SLF001
 
     def test_run_start_newer_than_finish_clears_stale_finish(self) -> None:
+        """Вспомогательная функция: test run start newer than finish clears stale finish."""
         records = [
             {
                 "timestamp_utc": "2026-06-02T12:00:00Z",
@@ -194,6 +205,7 @@ class PipelineHealthTests(unittest.TestCase):
         self.assertEqual(parsed["start"]["timestamp_utc"], "2026-06-02T12:00:00Z")
 
     def test_embeddings_found_beyond_display_tail(self) -> None:
+        """Вспомогательная функция: test embeddings found beyond display tail."""
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             audit_path = root / "reports" / "audit" / "audit.jsonl"
@@ -234,6 +246,7 @@ class PipelineHealthTests(unittest.TestCase):
             self.assertEqual(scanned["finish"]["operation"], "embeddings_finish")
 
     def test_embeddings_running_when_start_newer_than_finish(self) -> None:
+        """Вспомогательная функция: test embeddings running when start newer than finish."""
         recent_start = (datetime.now(UTC) - timedelta(minutes=30)).strftime(
             "%Y-%m-%dT%H:%M:%SZ"
         )
@@ -262,6 +275,7 @@ class PipelineHealthTests(unittest.TestCase):
         self.assertEqual(css, "warn")
 
     def test_embeddings_interrupted_hours_from_env(self) -> None:
+        """Вспомогательная функция: test embeddings interrupted hours from env."""
         emb = {
             "start": {
                 "timestamp_utc": (datetime.now(UTC) - timedelta(hours=6)).strftime(
@@ -280,6 +294,7 @@ class PipelineHealthTests(unittest.TestCase):
         self.assertEqual(css, "err")
 
     def test_embeddings_overdue_after_36h(self) -> None:
+        """Вспомогательная функция: test embeddings overdue after 36h."""
         old_ts = (datetime.now(UTC) - timedelta(hours=40)).strftime("%Y-%m-%dT%H:%M:%SZ")
         emb = {
             "finish": {

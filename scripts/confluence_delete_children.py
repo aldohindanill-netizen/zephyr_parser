@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Recursively delete all Confluence child pages under a parent page (parent is kept).
+"""Рекурсивно удалить дочерние страницы Confluence под родителем (родитель сохраняется).
 
-Dry-run by default; pass --execute to perform DELETE (pages go to Confluence trash).
-Uses ZEPHYR_CONFLUENCE_* from the environment / repo .env (publish flags not required).
+По умолчанию dry-run; --execute — реальный DELETE (страницы в корзине Confluence).
+Использует ZEPHYR_CONFLUENCE_* из env/.env (флаги publish не обязательны).
 """
 
 from __future__ import annotations

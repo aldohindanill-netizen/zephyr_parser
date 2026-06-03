@@ -40,31 +40,37 @@ JIRA_WIKI_TABLE = (
 
 
 class ParseDescriptionFieldsTests(unittest.TestCase):
+    """Класс «ParseDescriptionFieldsTests»."""
     def test_parses_wiki_table_from_screenshot(self) -> None:
+        """Вспомогательная функция: test parses wiki table from screenshot."""
         fields = parse_jira_description_fields(SCREENSHOT_TABLE)
         self.assertIn("конусы", fields["actual_result"])
         self.assertIn("останавливается", fields["expected_result"])
         self.assertIn("Мишень", fields["preconditions"])
 
     def test_parses_colon_format(self) -> None:
+        """Вспомогательная функция: test parses colon format."""
         text = "Actual result: ВАТС едет в конусы\nExpected result: ВАТС останавливается"
         fields = parse_jira_description_fields(text)
         self.assertIn("конусы", fields["actual_result"])
         self.assertIn("останавливается", fields["expected_result"])
 
     def test_parses_label_on_next_line(self) -> None:
+        """Вспомогательная функция: test parses label on next line."""
         text = "Actual result\nВАТС не останавливается\nExpected result\nВАТС останавливается"
         fields = parse_jira_description_fields(text)
         self.assertEqual(fields["actual_result"], "ВАТС не останавливается")
         self.assertEqual(fields["expected_result"], "ВАТС останавливается")
 
     def test_parses_jira_wiki_bold_table(self) -> None:
+        """Вспомогательная функция: test parses jira wiki bold table."""
         fields = parse_jira_description_fields(JIRA_WIKI_TABLE)
         self.assertIn("конусы", fields["actual_result"].lower())
         self.assertIn("останавливается", fields["expected_result"].lower())
         self.assertIn("Мишень", fields["preconditions"])
 
     def test_parses_traceability_table_row(self) -> None:
+        """Вспомогательная функция: test parses traceability table row."""
         table = (
             "|*Traceability:*|"
             "[Сценарий A|https://jira.example/browse/QA-T1], "
@@ -76,31 +82,38 @@ class ParseDescriptionFieldsTests(unittest.TestCase):
         self.assertEqual(names, ["Сценарий A", "Сценарий B"])
 
     def test_traceability_dedupes_case_insensitive(self) -> None:
+        """Вспомогательная функция: test traceability dedupes case insensitive."""
         raw = "[Сценарий A|url1], сценарий a; Сценарий B"
         names = parse_traceability_scenario_names(raw)
         self.assertEqual(names, ["Сценарий A", "Сценарий B"])
 
 
 class NormalizeSummaryTests(unittest.TestCase):
+    """Класс «NormalizeSummaryTests»."""
     def test_strips_vats_prefix(self) -> None:
+        """Вспомогательная функция: test strips vats prefix."""
         raw = "ВАТС не останавливается перед препятствием."
         norm = _normalize_summary_for_match(raw)
         self.assertFalse(norm.startswith("ватс"))
         self.assertIn("останавливается", norm)
 
     def test_lowercase_and_punctuation(self) -> None:
+        """Вспомогательная функция: test lowercase and punctuation."""
         norm = _normalize_summary_for_match("Hello, World!")
         self.assertEqual(norm, "hello world")
 
 
 class TextSimilarityTests(unittest.TestCase):
+    """Класс «TextSimilarityTests»."""
     def test_pedestrian_braking_pair_high_score(self) -> None:
+        """Вспомогательная функция: test pedestrian braking pair high score."""
         a = "ВАТС не начинает торможение перед пешеходом спереди"
         b = "ВАТС перестает тормозить перед пешеходом спереди"
         score = text_similarity(a, b)
         self.assertGreaterEqual(score, 0.78)
 
     def test_unrelated_low_score(self) -> None:
+        """Вспомогательная функция: test unrelated low score."""
         a = "Возникает МРМ2 без видимых причин на полигоне SAT"
         b = "ВАТС останавливается на перекрестке на зеленый сигнал светофора"
         score = text_similarity(a, b)
@@ -108,10 +121,13 @@ class TextSimilarityTests(unittest.TestCase):
 
 
 class FindDuplicateCandidatesTests(unittest.TestCase):
+    """Класс «FindDuplicateCandidatesTests»."""
     def _meta(self, entries: list[tuple[str, dict[str, str]]]) -> dict[str, dict[str, str]]:
+        """Вспомогательная функция: meta."""
         return dict(entries)
 
     def test_similar_summary_but_different_results_not_duplicate(self) -> None:
+        """Вспомогательная функция: test similar summary but different results not duplicate."""
         meta = self._meta(
             [
                 (
@@ -142,6 +158,7 @@ class FindDuplicateCandidatesTests(unittest.TestCase):
         self.assertIsNone(result["CSD-46911"])
 
     def test_same_expected_and_actual_are_duplicates(self) -> None:
+        """Вспомогательная функция: test same expected and actual are duplicates."""
         shared_expected = "При приближении к мишени, ВАТС останавливается"
         shared_actual = "ВАТС не останавливается и едет в конусы"
         meta = self._meta(
@@ -176,6 +193,7 @@ class FindDuplicateCandidatesTests(unittest.TestCase):
         self.assertEqual(result["CSD-A"].method, "text_expected_actual")
 
     def test_fallback_summary_when_no_results(self) -> None:
+        """Вспомогательная функция: test fallback summary when no results."""
         meta = self._meta(
             [
                 ("CSD-46908", {"summary": "ВАТС не начинает торможение перед пешеходом спереди"}),
@@ -193,6 +211,7 @@ class FindDuplicateCandidatesTests(unittest.TestCase):
         self.assertEqual(result["CSD-46908"].method, "text_summary")
 
     def test_no_match_below_threshold(self) -> None:
+        """Вспомогательная функция: test no match below threshold."""
         meta = self._meta(
             [
                 ("CSD-48117", {"summary": "Возникает МРМ2 без видимых причин"}),
@@ -208,6 +227,7 @@ class FindDuplicateCandidatesTests(unittest.TestCase):
         self.assertIsNone(result["CSD-48117"])
 
     def test_split_override_blocks_match(self) -> None:
+        """Вспомогательная функция: test split override blocks match."""
         meta = self._meta(
             [
                 (
@@ -238,6 +258,7 @@ class FindDuplicateCandidatesTests(unittest.TestCase):
         self.assertIsNone(result["CSD-46908"])
 
     def test_merge_override_forces_link(self) -> None:
+        """Вспомогательная функция: test merge override forces link."""
         meta = self._meta(
             [
                 ("CSD-A", {"summary": "one"}),
@@ -256,6 +277,7 @@ class FindDuplicateCandidatesTests(unittest.TestCase):
         self.assertEqual(result["CSD-A"].method, "override")
 
     def test_embedding_cache_merge(self) -> None:
+        """Вспомогательная функция: test embedding cache merge."""
         meta = self._meta(
             [
                 (
@@ -296,6 +318,7 @@ class FindDuplicateCandidatesTests(unittest.TestCase):
         self.assertEqual(result["CSD-X"].confidence, "medium")
 
     def test_domain_gate_blocks_conflicting_embedding(self) -> None:
+        """Вспомогательная функция: test domain gate blocks conflicting embedding."""
         meta = self._meta(
             [
                 (
@@ -333,6 +356,7 @@ class FindDuplicateCandidatesTests(unittest.TestCase):
         self.assertIsNone(result["CSD-A"])
 
     def test_soft_expected_actual_rule_promotes_high(self) -> None:
+        """Вспомогательная функция: test soft expected actual rule promotes high."""
         meta = self._meta(
             [
                 (
@@ -365,6 +389,7 @@ class FindDuplicateCandidatesTests(unittest.TestCase):
         self.assertEqual(result["CSD-47279"].confidence, "high")
 
     def test_scenario_conflict_blocks_despite_matching_results(self) -> None:
+        """Вспомогательная функция: test scenario conflict blocks despite matching results."""
         shared_expected = "При приближении к мишени, ВАТС останавливается"
         shared_actual = "ВАТС не останавливается и едет в конусы"
         meta = self._meta(
@@ -402,6 +427,7 @@ class FindDuplicateCandidatesTests(unittest.TestCase):
         self.assertIsNone(result["CSD-B"])
 
     def test_scenario_match_allows_duplicate(self) -> None:
+        """Вспомогательная функция: test scenario match allows duplicate."""
         shared_expected = "При приближении к мишени, ВАТС останавливается"
         shared_actual = "ВАТС не останавливается и едет в конусы"
         meta = self._meta(
@@ -441,6 +467,7 @@ class FindDuplicateCandidatesTests(unittest.TestCase):
         self.assertTrue(result["CSD-A"].scenario_match)
 
     def test_scenario_unknown_when_both_empty(self) -> None:
+        """Вспомогательная функция: test scenario unknown when both empty."""
         shared_expected = "При приближении к мишени, ВАТС останавливается"
         shared_actual = "ВАТС не останавливается и едет в конусы"
         meta = self._meta(
@@ -473,6 +500,7 @@ class FindDuplicateCandidatesTests(unittest.TestCase):
         self.assertIsNotNone(result["CSD-A"])
 
     def test_scenario_gate_disabled_allows_conflict(self) -> None:
+        """Вспомогательная функция: test scenario gate disabled allows conflict."""
         shared_expected = "При приближении к мишени, ВАТС останавливается"
         shared_actual = "ВАТС не останавливается и едет в конусы"
         meta = self._meta(
@@ -519,10 +547,13 @@ class FindDuplicateCandidatesTests(unittest.TestCase):
 
 
 class CacheAndDebugTests(unittest.TestCase):
+    """Класс «CacheAndDebugTests»."""
     def test_load_missing_cache(self) -> None:
+        """Вспомогательная функция: test load missing cache."""
         self.assertIsNone(load_embedding_cache("/nonexistent/path.json"))
 
     def test_write_debug_json_includes_sims(self) -> None:
+        """Вспомогательная функция: test write debug json includes sims."""
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "duplicate_candidates.json")
             write_duplicate_candidates_debug(
@@ -541,12 +572,15 @@ class CacheAndDebugTests(unittest.TestCase):
 
 
 class ResultsEmbeddingTextTests(unittest.TestCase):
+    """Класс «ResultsEmbeddingTextTests»."""
     def test_build_results_text(self) -> None:
+        """Вспомогательная функция: test build results text."""
         text = build_results_embedding_text("ожидаем", "факт")
         self.assertIn("EXPECTED:", text)
         self.assertIn("ACTUAL:", text)
 
     def test_results_hash_stable(self) -> None:
+        """Вспомогательная функция: test results hash stable."""
         h1 = results_hash("exp", "act")
         h2 = results_hash("exp", "act")
         self.assertEqual(h1, h2)

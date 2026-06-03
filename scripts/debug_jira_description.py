@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Debug Jira issue description parsing (one key)."""
+"""Отладка разбора описания Jira для одного issue key."""
 
 from __future__ import annotations
 

@@ -12,12 +12,15 @@ import repo_env as re
 
 
 class RepoEnvTests(unittest.TestCase):
+    """Класс «RepoEnvTests»."""
     def tearDown(self) -> None:
+        """Вспомогательная функция: tearDown."""
         re._dotenv_cache = None
         re._dotenv_secrets_cache = None
         re._dotenv_local_cache = None
 
     def test_parse_dotenv_strips_quotes_and_export_prefix(self) -> None:
+        """Вспомогательная функция: test parse dotenv strips quotes and export prefix."""
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / ".env"
             path.write_text(
@@ -30,6 +33,7 @@ class RepoEnvTests(unittest.TestCase):
             self.assertNotIn("comment", parsed)
 
     def test_load_repo_env_does_not_override_existing_process_env(self) -> None:
+        """Вспомогательная функция: test load repo env does not override existing process env."""
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / ".env").write_text("KEEP_ME=from_file\n", encoding="utf-8")
@@ -40,6 +44,7 @@ class RepoEnvTests(unittest.TestCase):
                     self.assertEqual(os.environ.get("KEEP_ME"), "from_process")
 
     def test_load_repo_env_overlay_local_wins(self) -> None:
+        """Вспомогательная функция: test load repo env overlay local wins."""
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / ".env").write_text("KEY=base\n", encoding="utf-8")
@@ -53,6 +58,7 @@ class RepoEnvTests(unittest.TestCase):
                     self.assertEqual(os.environ.get("KEY"), "local")
 
     def test_load_repo_env_secrets_do_not_override_process_env(self) -> None:
+        """Вспомогательная функция: test load repo env secrets do not override process env."""
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / ".env").write_text("", encoding="utf-8")
@@ -65,6 +71,7 @@ class RepoEnvTests(unittest.TestCase):
                     self.assertEqual(os.environ.get("KEEP_ME"), "from_process")
 
     def test_load_repo_env_secrets_override_env_file_values(self) -> None:
+        """Вспомогательная функция: test load repo env secrets override env file values."""
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / ".env").write_text("SECRET_TOKEN=from_env\n", encoding="utf-8")

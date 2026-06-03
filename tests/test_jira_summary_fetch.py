@@ -5,8 +5,11 @@ import zephyr_weekly_report as z
 
 
 class JiraSummaryFetchTests(unittest.TestCase):
+    """Класс «JiraSummaryFetchTests»."""
     def test_falls_back_to_single_issue_for_missing_bulk_keys(self):
+        """Вспомогательная функция: test falls back to single issue for missing bulk keys."""
         def fake_request_json(base_url, endpoint, headers, **kwargs):  # noqa: ANN001
+            """Вспомогательная функция: fake request json."""
             if endpoint in ("/rest/api/2/search", "/rest/api/3/search"):
                 return {
                     "issues": [

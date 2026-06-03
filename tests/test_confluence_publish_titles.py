@@ -14,6 +14,7 @@ from zephyr_weekly_report import (
 
 
 def _cfg(*, title_prefix: str = "") -> ConfluencePublishConfig:
+    """Вспомогательная функция: cfg."""
     return ConfluencePublishConfig(
         base_url="https://wiki.example",
         space_key="QA",
@@ -26,7 +27,9 @@ def _cfg(*, title_prefix: str = "") -> ConfluencePublishConfig:
 
 
 class ConfluencePublishTitleTests(unittest.TestCase):
+    """Класс «ConfluencePublishTitleTests»."""
     def test_prefix_applied_to_html_style_title(self) -> None:
+        """Вспомогательная функция: test prefix applied to html style title."""
         cfg = _cfg(title_prefix="[LOCAL]")
         self.assertEqual(
             _confluence_publish_title("nightly dev report", cfg),
@@ -34,6 +37,7 @@ class ConfluencePublishTitleTests(unittest.TestCase):
         )
 
     def test_prefix_not_doubled(self) -> None:
+        """Вспомогательная функция: test prefix not doubled."""
         cfg = _cfg(title_prefix="[LOCAL]")
         self.assertEqual(
             _confluence_publish_title("[LOCAL] nightly dev report", cfg),
@@ -41,12 +45,14 @@ class ConfluencePublishTitleTests(unittest.TestCase):
         )
 
     def test_space_wide_lookup_off_when_prefix_set(self) -> None:
+        """Вспомогательная функция: test space wide lookup off when prefix set."""
         cfg = _cfg(title_prefix="[LOCAL]")
         with mock.patch.dict(os.environ, {}, clear=False):
             os.environ.pop("ZEPHYR_CONFLUENCE_SPACE_WIDE_TITLE_LOOKUP", None)
             self.assertFalse(_confluence_space_wide_title_lookup(cfg))
 
     def test_space_wide_lookup_env_override(self) -> None:
+        """Вспомогательная функция: test space wide lookup env override."""
         cfg = _cfg(title_prefix="[LOCAL]")
         with mock.patch.dict(
             os.environ,

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Offline threshold calibration for duplicate detection on labeled override pairs."""
+"""Офлайн-калибровка порогов дубликатов по размеченным парам из duplicate_overrides."""
 
 from __future__ import annotations
 

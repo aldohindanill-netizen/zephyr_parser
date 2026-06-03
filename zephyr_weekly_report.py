@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
-"""Generate a weekly Zephyr test execution summary.
+"""Недельный отчёт по экзекьюшенам Zephyr (Jira-hosted API).
 
-The script fetches paginated execution data from a Zephyr API endpoint,
-aggregates executions by ISO week (Monday start) using raw API statuses,
-and computes normalized pass rate for reporting.
+Скачивает пагинированные execution, агрегирует по ISO-неделям (понедельник),
+считает pass rate, пишет CSV/HTML/wiki и опционально публикует в Confluence.
 """
 
 from __future__ import annotations
@@ -67,7 +66,9 @@ DEFAULT_STATUS_FIELDS = [
 ]
 
 
+# --- CLI, env, конфигурация ---
 def _env_int(name: str, default: int) -> int:
+    """Прочитать целое из переменной окружения.."""
     raw = os.getenv(name)
     if raw is None or not str(raw).strip():
         return default
@@ -78,6 +79,7 @@ def _env_int(name: str, default: int) -> int:
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
+    """Прочитать булево из переменной окружения.."""
     raw = os.getenv(name)
     if raw is None or not str(raw).strip():
         return default
@@ -85,6 +87,7 @@ def _env_bool(name: str, default: bool = False) -> bool:
 
 
 def _env_csv_values(name: str, default: list[str]) -> list[str]:
+    """Прочитать список CSV из переменной окружения.values."""
     raw = os.getenv(name)
     if raw is None or not str(raw).strip():
         return list(default)
@@ -93,6 +96,7 @@ def _env_csv_values(name: str, default: list[str]) -> list[str]:
 
 @dataclass
 class FolderNode:
+    """Класс «FolderNode»."""
     folder_id: str
     folder_name: str
     parent_id: str | None
@@ -102,6 +106,7 @@ class FolderNode:
 
 @dataclass
 class ConfluencePublishConfig:
+    """Класс «ConfluencePublishConfig»."""
     base_url: str
     user: str
     api_token: str
@@ -122,19 +127,22 @@ class ConfluencePublishConfig:
 
 @dataclass
 class ConfluencePublishRoots:
+    """Класс «ConfluencePublishRoots»."""
     root_parent: str | None = None
     bugs_parent: str | None = None
 
 
 class ConfluenceWeekParentCache:
-    """Lazy-create Confluence week folder pages (Week wNN) under the root parent."""
+    """Ленивое создание недельных папок Confluence (Week wNN) под корневым родителем."""
 
     def __init__(self, cfg: ConfluencePublishConfig, root_parent_id: str | None) -> None:
+        """Вспомогательная функция: init  ."""
         self.cfg = cfg
         self.root_parent_id = root_parent_id
         self._by_week: dict[date, str] = {}
 
     def ensure(self, week_start: date) -> str:
+        """Вспомогательная функция: ensure."""
         cached = self._by_week.get(week_start)
         if cached:
             return cached
@@ -157,21 +165,26 @@ class ConfluenceWeekParentCache:
 
 @dataclass
 class StepTiming:
+    """Класс «StepTiming»."""
     name: str
     duration_seconds: float
     detail: str = ""
 
 
 class TimingRecorder:
+    """Класс «TimingRecorder»."""
     def __init__(self) -> None:
+        """Вспомогательная функция: init  ."""
         self.records: list[StepTiming] = []
 
     def record(self, name: str, duration_seconds: float, detail: str = "") -> None:
+        """Вспомогательная функция: record."""
         self.records.append(StepTiming(name, duration_seconds, detail))
         suffix = f" ({detail})" if detail else ""
         print(f"Timing: {name} took {duration_seconds:.2f}s{suffix}")
 
     def summarize(self, limit: int = 12) -> None:
+        """Вспомогательная функция: summarize."""
         if not self.records:
             return
         total = sum(item.duration_seconds for item in self.records)
@@ -184,27 +197,33 @@ class TimingRecorder:
 
 
 class _TimedStep:
+    """Класс «_TimedStep»."""
     def __init__(self, recorder: TimingRecorder, name: str, detail: str = "") -> None:
+        """Вспомогательная функция: init  ."""
         self.recorder = recorder
         self.name = name
         self.detail = detail
         self.started_at = 0.0
 
     def __enter__(self) -> "_TimedStep":
+        """Вспомогательная функция: enter  ."""
         self.started_at = time.perf_counter()
         return self
 
     def __exit__(self, _exc_type: Any, _exc: Any, _tb: Any) -> None:
+        """Вспомогательная функция: exit  ."""
         self.recorder.record(
             self.name, time.perf_counter() - self.started_at, self.detail
         )
 
 
 def timed_step(recorder: TimingRecorder, name: str, detail: str = "") -> _TimedStep:
+    """Вспомогательная функция: timed step."""
     return _TimedStep(recorder, name, detail)
 
 
 def _bounded_worker_count(raw: int | None, item_count: int | None = None) -> int:
+    """Вспомогательная функция: bounded worker count."""
     try:
         workers = int(raw or 1)
     except (TypeError, ValueError):
@@ -216,6 +235,7 @@ def _bounded_worker_count(raw: int | None, item_count: int | None = None) -> int
 
 
 def parse_args() -> argparse.Namespace:
+    """Разобрать: args."""
     parser = argparse.ArgumentParser(
         description="Fetch Zephyr executions and build weekly pass/fail report."
     )
@@ -699,6 +719,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def _resolve_loop_interval_minutes(args: argparse.Namespace) -> int | None:
+    """Определить: loop interval minutes."""
     if args.loop_interval_minutes is not None:
         if args.loop_interval_minutes <= 0:
             raise ValueError("--loop-interval-minutes must be a positive integer")
@@ -719,7 +740,7 @@ _run_lock_handle: Any = None
 
 
 def _try_acquire_run_lock(lock_path: str) -> bool:
-    """Return True if this process holds the lock; False if another instance is running."""
+    """True, если процесс удерживает lock; False, если уже работает другой экземпляр."""
     global _run_lock_handle
     path = Path(lock_path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -749,6 +770,7 @@ def _try_acquire_run_lock(lock_path: str) -> bool:
 
 
 def _release_run_lock() -> None:
+    """Вспомогательная функция: release run lock."""
     global _run_lock_handle
     if _run_lock_handle is None:
         return
@@ -776,6 +798,7 @@ def _release_run_lock() -> None:
 
 
 def _interruptible_sleep(total_seconds: float, stop: threading.Event) -> None:
+    """Вспомогательная функция: interruptible sleep."""
     if total_seconds <= 0:
         return
     deadline = time.monotonic() + total_seconds
@@ -787,9 +810,11 @@ def _interruptible_sleep(total_seconds: float, stop: threading.Event) -> None:
 
 
 def _run_loop(args: argparse.Namespace, interval_minutes: int) -> int:
+    """Вспомогательная функция: run loop."""
     stop = threading.Event()
 
     def _handle_stop(_signum: int, _frame: Any) -> None:
+        """Вспомогательная функция: handle stop."""
         stop.set()
 
     signal.signal(signal.SIGINT, _handle_stop)
@@ -810,6 +835,7 @@ def _run_loop(args: argparse.Namespace, interval_minutes: int) -> int:
 
 
 def parse_date(value: str | None) -> date | None:
+    """Разобрать: date."""
     if value is None:
         return None
     value = value.strip()
@@ -822,6 +848,7 @@ def parse_date(value: str | None) -> date | None:
 
 
 def parse_datetime(value: str) -> datetime:
+    """Разобрать: datetime."""
     cleaned = value.strip()
     if cleaned.endswith("Z"):
         cleaned = cleaned[:-1] + "+00:00"
@@ -838,6 +865,7 @@ def parse_datetime(value: str) -> datetime:
 
 
 def _parse_int_env(name: str, default: int, minimum: int = 1, maximum: int = 1000) -> int:
+    """Разобрать: int env."""
     raw = str(os.getenv(name, "") or "").strip()
     if not raw:
         return default
@@ -849,6 +877,7 @@ def _parse_int_env(name: str, default: int, minimum: int = 1, maximum: int = 100
 
 
 def _to_datetime(value: str | None) -> datetime | None:
+    """Вспомогательная функция: to datetime."""
     text = str(value or "").strip()
     if not text:
         return None
@@ -859,6 +888,7 @@ def _to_datetime(value: str | None) -> datetime | None:
 
 
 def _coerce_utc_naive(value: datetime | None) -> datetime | None:
+    """Вспомогательная функция: coerce utc naive."""
     if value is None:
         return None
     if value.tzinfo is None:
@@ -873,6 +903,7 @@ _SUMMARY_DATE_PATTERNS: list[re.Pattern[str]] = [
 
 
 def parse_date_from_summary(summary: str | None) -> datetime | None:
+    """Разобрать: date from summary."""
     text = str(summary or "").strip()
     if not text:
         return None
@@ -891,6 +922,7 @@ def parse_date_from_summary(summary: str | None) -> datetime | None:
 
 
 def _extract_text_nodes(value: Any) -> list[str]:
+    """Извлечь: text nodes."""
     out: list[str] = []
     if isinstance(value, str):
         text = value.strip()
@@ -913,6 +945,7 @@ def _extract_text_nodes(value: Any) -> list[str]:
 
 
 def _description_to_text(description: Any) -> str:
+    """Вспомогательная функция: description to text."""
     if isinstance(description, str):
         return description
     if description is None:
@@ -940,6 +973,7 @@ _BUILD_PREFIX_RE = re.compile(
 
 
 def extract_build_from_description_point_a(description: Any) -> str:
+    """Вспомогательная функция: extract build from description point a."""
     text = _description_to_text(description).replace("\r\n", "\n").replace("\r", "\n")
     if not text.strip():
         return ""
@@ -972,6 +1006,7 @@ def extract_build_from_description_point_a(description: Any) -> str:
 
 
 def pick_latest_issue(candidates: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Вспомогательная функция: pick latest issue."""
     best_issue: dict[str, Any] | None = None
     best_key: tuple[datetime, datetime] | None = None
     min_dt = datetime.min
@@ -994,11 +1029,7 @@ def pick_latest_issue(candidates: list[dict[str, Any]]) -> dict[str, Any] | None
 def pick_latest_issue_with_point_a_build(
     candidates: list[dict[str, Any]],
 ) -> tuple[dict[str, Any] | None, str]:
-    """Pick latest Jira issue among those that have build in description point A.
-
-    Returns (issue, build_name). If no candidate has build in point A, returns
-    (None, "") so caller can fallback to generic latest-issue selection.
-    """
+    """Выбрать последний Jira issue с билдом в точке A описания."""
     best_issue: dict[str, Any] | None = None
     best_build = ""
     best_key: tuple[datetime, datetime] | None = None
@@ -1032,6 +1063,7 @@ def fetch_autofleet_abtest_candidates(
     base_url: str,
     auth_headers: dict[str, str] | None,
 ) -> list[dict[str, Any]]:
+    """Загрузить из API: autofleet abtest candidates."""
     if not base_url or not auth_headers:
         return []
     jql = str(os.getenv("ZEPHYR_AUTOFLEET_ABTEST_JQL", "labels = autofleet_abtest")).strip()
@@ -1064,6 +1096,7 @@ def fetch_autofleet_abtest_build_name(
     auth_headers: dict[str, str] | None,
     issues: list[dict[str, Any]] | None = None,
 ) -> str:
+    """Загрузить из API: autofleet abtest build name."""
     enabled = _parse_bool_env(os.getenv("ZEPHYR_AUTOFLEET_ABTEST_ENABLED", "true"))
     if not enabled:
         return ""
@@ -1099,7 +1132,7 @@ def fetch_autofleet_abtest_best_branch_context(
     base_url: str,
     auth_headers: dict[str, str] | None,
 ) -> dict[str, Any]:
-    """Return {'name': str, 'effective_date': date|None, 'week_start': date|None}."""
+    """Вернуть dict с name, effective_date и week_start для ветки A/B теста."""
     enabled = _parse_bool_env(os.getenv("ZEPHYR_AUTOFLEET_ABTEST_ENABLED", "true"))
     if not enabled:
         return {}
@@ -1138,6 +1171,7 @@ def fetch_autofleet_abtest_best_branch_context(
 
 
 def get_by_path(data: dict[str, Any], path: str) -> Any:
+    """Вспомогательная функция: get by path."""
     current: Any = data
     for part in path.split("."):
         if not isinstance(current, dict) or part not in current:
@@ -1147,6 +1181,7 @@ def get_by_path(data: dict[str, Any], path: str) -> Any:
 
 
 def parse_extra_params(raw_items: list[str]) -> dict[str, str]:
+    """Разобрать: extra params."""
     params: dict[str, str] = {}
     for item in raw_items:
         if "=" not in item:
@@ -1162,6 +1197,7 @@ def parse_extra_params(raw_items: list[str]) -> dict[str, str]:
 
 
 def fill_template(raw: str, key: str, value: str, arg_name: str) -> str:
+    """Вспомогательная функция: fill template."""
     placeholder = "{" + key + "}"
     if placeholder not in raw:
         raise ValueError(f"{arg_name} must contain '{placeholder}' placeholder")
@@ -1169,6 +1205,7 @@ def fill_template(raw: str, key: str, value: str, arg_name: str) -> str:
 
 
 def sanitize_tql_query(query: str) -> str:
+    """Вспомогательная функция: sanitize tql query."""
     cleaned = query.strip().strip('"').strip("'").strip()
     # Guard against accidental duplicated ORDER BY fragments from copied templates.
     order_by_matches = list(re.finditer(r"\bORDER\s+BY\b", cleaned, flags=re.IGNORECASE))
@@ -1183,6 +1220,7 @@ def sanitize_tql_query(query: str) -> str:
 
 
 def build_headers(token_header: str, token_prefix: str, token: str) -> dict[str, str]:
+    """Построить: headers."""
     auth_value = f"{token_prefix.strip()} {token}".strip() if token_prefix else token
     return {
         token_header: auth_value,
@@ -1191,6 +1229,7 @@ def build_headers(token_header: str, token_prefix: str, token: str) -> dict[str,
 
 
 def extract_items(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    """Вспомогательная функция: extract items."""
     candidate_keys = ("values", "results", "executions", "items", "content")
     for key in candidate_keys:
         items = payload.get(key)
@@ -1209,6 +1248,7 @@ def request_json(
     method: str = "GET",
     body: dict[str, Any] | None = None,
 ) -> Any:
+    """HTTP-запрос: json."""
     query = urllib.parse.urlencode(params or {}, doseq=True)
     url = f"{base_url.rstrip('/')}/{endpoint.lstrip('/')}"
     if query and method.upper() == "GET":
@@ -1227,7 +1267,9 @@ def request_json(
         try:
             with urllib.request.urlopen(request, timeout=30) as response:
                 raw = response.read()
+# --- Загрузка .env и Confluence (базовые хелперы) ---
                 if not raw:
+# --- Загрузка .env и Confluence (базовые хелперы) ---
                     return None
                 return json.loads(raw.decode("utf-8"))
         except urllib.error.HTTPError as exc:
@@ -1267,24 +1309,21 @@ def request_json(
 
 
 def _parse_bool_env(value: str | None) -> bool:
+    """Разобрать: bool env."""
     if value is None:
         return False
     return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
 def _get_repo_dotenv_parsed() -> dict[str, str]:
-    """Return key/value pairs from repo ``.env`` (last assignment per key wins)."""
+    """Пары ключ/значение из ``.env`` репозитория (последнее присваивание побеждает)."""
     import repo_env
 
     return repo_env.get_repo_dotenv_parsed()
 
 
 def _env_prefers_repo_dotenv(name: str, default: str = "") -> str:
-    """Read env var from repo ``.env`` / ``.env.local`` (UTF-8) before process env.
-
-    PowerShell loaders on Windows may mis-decode Cyrillic in ``.env`` into the
-    process environment; Confluence section titles must come from the file.
-    """
+    """Вспомогательная функция: env prefers repo dotenv."""
     import repo_env
 
     parsed = dict(repo_env.get_repo_dotenv_parsed())
@@ -1297,19 +1336,14 @@ def _env_prefers_repo_dotenv(name: str, default: str = "") -> str:
 
 
 def _load_repo_dotenv_if_absent() -> None:
-    """Fill os.environ from ``.env`` next to this script for keys not already set.
-
-    Launchers (PowerShell/bash) often load ``.env`` before Python; IDE / ``python``
-    runs do not. Keys already present in the process environment are left unchanged;
-    use :func:`_weekly_defect_extended_analytics_enabled` for flags where the repo
-    ``.env`` must override a stale user/system variable.
-    """
+    """Загрузить: repo dotenv if absent."""
     import repo_env
 
     repo_env.load_repo_env(overlay_local=False)
 
 
 def _load_confluence_publish_config() -> ConfluencePublishConfig | None:
+    """Загрузить: confluence publish config."""
     base_url = (os.getenv("ZEPHYR_CONFLUENCE_BASE_URL") or "").strip().rstrip("/")
     user = (os.getenv("ZEPHYR_CONFLUENCE_USER") or "").strip()
     api_token = (os.getenv("ZEPHYR_CONFLUENCE_API_TOKEN") or "").strip()
@@ -1382,6 +1416,7 @@ def _load_confluence_publish_config() -> ConfluencePublishConfig | None:
 
 
 def _confluence_auth_headers(cfg: ConfluencePublishConfig) -> dict[str, str]:
+    """Confluence: auth headers."""
     scheme = (cfg.auth_scheme or "basic").lower()
     if scheme == "bearer":
         auth_value = f"Bearer {cfg.api_token}"
@@ -1403,6 +1438,7 @@ def _confluence_request_json(
     body: dict[str, Any] | None = None,
     extra_headers: dict[str, str] | None = None,
 ) -> Any:
+    """Confluence: request json."""
     query = urllib.parse.urlencode(params or {}, doseq=True)
     url = f"{cfg.base_url}/{endpoint.lstrip('/')}"
     if query and method.upper() == "GET":
@@ -1464,6 +1500,7 @@ def _confluence_request_json(
 
 
 def _confluence_page_title_for_file(path: str, cfg: ConfluencePublishConfig) -> str:
+    """Confluence: page title for file."""
     base = os.path.basename(path)
     name, _ext = os.path.splitext(base)
     title = name.replace("_", " ")
@@ -1471,7 +1508,7 @@ def _confluence_page_title_for_file(path: str, cfg: ConfluencePublishConfig) -> 
 
 
 def _confluence_publish_title(raw_title: str, cfg: ConfluencePublishConfig) -> str:
-    """Apply ZEPHYR_CONFLUENCE_TITLE_PREFIX so HTML <title> cannot bypass the prefix."""
+    """Применить ZEPHYR_CONFLUENCE_TITLE_PREFIX к заголовку страницы Confluence."""
     title = (raw_title or "").strip()
     if not title:
         return title
@@ -1482,7 +1519,7 @@ def _confluence_publish_title(raw_title: str, cfg: ConfluencePublishConfig) -> s
 
 
 def _confluence_space_wide_title_lookup(cfg: ConfluencePublishConfig) -> bool:
-    """When false, only match pages that are direct children of the target parent."""
+    """Если false — искать страницы только среди прямых детей целевого родителя."""
     raw = os.getenv("ZEPHYR_CONFLUENCE_SPACE_WIDE_TITLE_LOOKUP")
     if raw is not None and str(raw).strip():
         return _parse_bool_env(raw)
@@ -1491,6 +1528,7 @@ def _confluence_space_wide_title_lookup(cfg: ConfluencePublishConfig) -> bool:
 
 
 def _extract_html_title(raw_html: str) -> str:
+    """Извлечь: html title."""
     match = re.search(r"<title[^>]*>(.*?)</title>", raw_html, flags=re.IGNORECASE | re.DOTALL)
     if not match:
         return ""
@@ -1499,6 +1537,7 @@ def _extract_html_title(raw_html: str) -> str:
 
 
 def _normalize_html_for_confluence_storage(raw_html: str) -> str:
+    """Нормализовать: html for confluence storage."""
     text = str(raw_html or "").strip()
     if not text:
         return ""
@@ -1548,8 +1587,7 @@ _WEEKLY_CELL_H4_RE = re.compile(
 
 
 def _find_matching_close_div(text: str, body_start: int) -> tuple[int, int]:
-    """Return (body_end_index, end_of_close_index) for the </div> that closes
-    a <div ...> opened just before `body_start`. (-1, -1) on malformed input."""
+    """Вспомогательная функция: find matching close div."""
     depth = 1
     for token in _WEEKLY_DIV_TOKEN_RE.finditer(text, body_start):
         if token.group(1) == "/":
@@ -1562,11 +1600,12 @@ def _find_matching_close_div(text: str, body_start: int) -> tuple[int, int]:
 
 
 def _strip_inner_tags(html_fragment: str) -> str:
+    """Очистить: inner tags."""
     return re.sub(r"<[^>]+>", "", html_fragment).strip()
 
 
 def _zephyr_status_counts_data_attr(counts: dict[str, int]) -> str:
-    """Embed case status totals for Confluence chart macro conversion on publish."""
+    """Zephyr: status counts data attr."""
     merged = {str(k): int(v) for k, v in (counts or {}).items() if int(v) > 0}
     if not merged:
         return ""
@@ -1575,15 +1614,7 @@ def _zephyr_status_counts_data_attr(counts: dict[str, int]) -> str:
 
 
 def _replace_weekly_overall_cells_with_zephyr_macro(body_html: str) -> str:
-    """For Confluence publish: rewrite the per-build pie grid into a single
-    one-row table where each cell contains the Zephyr Reporting storage macro
-    when `data-zephyr-cycle-keys` is present, otherwise a Chart macro from
-    `data-zephyr-status-counts`. Cycle keys take precedence when both exist.
-
-    The build label sits in the table header so all builds line up horizontally
-    side by side. If a cell has neither attribute it falls back to placeholder
-    text. The surrounding <div class='weekly-overall-grid'> is replaced entirely.
-    """
+    """Вспомогательная функция: replace weekly overall cells with zephyr macro."""
     if not body_html or "weekly-overall-grid" not in body_html:
         return body_html
 
@@ -1685,6 +1716,7 @@ def _replace_weekly_overall_cells_with_zephyr_macro(body_html: str) -> str:
 
 
 def _append_confluence_attachment_image(storage_html: str, file_name: str) -> str:
+    """Вспомогательная функция: append confluence attachment image."""
     safe_name = html.escape(str(file_name or "").strip(), quote=True)
     if not safe_name:
         return storage_html
@@ -1701,6 +1733,7 @@ def _append_confluence_attachment_image(storage_html: str, file_name: str) -> st
 def _confluence_find_page_by_title_in_space(
     cfg: ConfluencePublishConfig, space_key: str, title: str
 ) -> tuple[str, int] | None:
+    """Confluence: find page by title in space."""
     payload = _confluence_request_json(
         cfg,
         f"{cfg.api_prefix}/content",
@@ -1725,6 +1758,7 @@ def _confluence_find_page_by_title_in_space(
 def _confluence_find_page_by_title(
     cfg: ConfluencePublishConfig, title: str, *, space_key: str | None = None
 ) -> tuple[str, int] | None:
+    """Confluence: find page by title."""
     return _confluence_find_page_by_title_in_space(
         cfg, space_key or cfg.space_key, title
     )
@@ -1733,6 +1767,7 @@ def _confluence_find_page_by_title(
 def _confluence_find_child_page_by_title(
     cfg: ConfluencePublishConfig, parent_page_id: str, title: str
 ) -> tuple[str, int] | None:
+    """Confluence: find child page by title."""
     start = 0
     limit = 50
     while True:
@@ -1767,6 +1802,7 @@ def _confluence_create_child_page(
     *,
     storage_html: str = "<p></p>",
 ) -> str:
+    """Confluence: create child page."""
     space_key = _confluence_get_page_space_key(cfg, parent_page_id)
     create_body: dict[str, Any] = {
         "type": "page",
@@ -1793,6 +1829,7 @@ def _confluence_ensure_section_page(
     explicit_page_id: str | None,
     section_title: str,
 ) -> str | None:
+    """Confluence: ensure section page."""
     if explicit_page_id:
         return explicit_page_id
     if not root_parent_page_id:
@@ -1806,6 +1843,7 @@ def _confluence_ensure_section_page(
 
 
 def _confluence_week_folder_title(cfg: ConfluencePublishConfig, week_start: date) -> str:
+    """Confluence: week folder title."""
     iso = week_start.isocalendar()
     try:
         return cfg.week_folder_title_template.format(
@@ -1821,6 +1859,7 @@ def _confluence_week_folder_title(cfg: ConfluencePublishConfig, week_start: date
 
 
 def _confluence_week_start_from_publish_path(path: str) -> date | None:
+    """Confluence: week start from publish path."""
     base = os.path.basename(path)
     if base.startswith("weekly_cycle_matrix_"):
         match = re.match(r"weekly_cycle_matrix_(\d{4}-\d{2}-\d{2})", base)
@@ -1841,7 +1880,7 @@ def _confluence_week_start_from_publish_path(path: str) -> date | None:
 
 
 def resolve_confluence_publish_roots(cfg: ConfluencePublishConfig) -> ConfluencePublishRoots:
-    """Ensure the bugs folder under root; week folders (Week wNN) are created per publish batch."""
+    """Вспомогательная функция: resolve confluence publish roots."""
     root = cfg.parent_page_id
     bugs = _confluence_ensure_section_page(
         cfg,
@@ -1862,6 +1901,7 @@ def publish_reports_to_confluence_by_week(
     week_parents: ConfluenceWeekParentCache,
     fallback_parent: str | None = None,
 ) -> list[str]:
+    """Опубликовать в Confluence: reports to confluence by week."""
     by_week: dict[date, list[str]] = {}
     ungrouped: list[str] = []
     for path in html_paths:
@@ -1910,10 +1950,12 @@ def publish_reports_to_confluence_by_week(
 
 
 def _is_build_log_html_path(path: str) -> bool:
+    """Вспомогательная функция: is build log html path."""
     return os.path.basename(path).endswith("_build_log.html")
 
 
 def _is_bugs_rollup_html_path(path: str) -> bool:
+    """Вспомогательная функция: is bugs rollup html path."""
     return os.path.basename(path) == "bugs_index.html"
 
 
@@ -1921,7 +1963,7 @@ _confluence_page_space_cache: dict[str, str] = {}
 
 
 def _confluence_get_page_space_key(cfg: ConfluencePublishConfig, page_id: str) -> str:
-    """Space key of an existing page (cached). Falls back to cfg.space_key."""
+    """Confluence: get page space key."""
     cached = _confluence_page_space_cache.get(page_id)
     if cached:
         return cached
@@ -1943,12 +1985,14 @@ def _confluence_get_page_space_key(cfg: ConfluencePublishConfig, page_id: str) -
 def _confluence_space_key_for_parent(
     cfg: ConfluencePublishConfig, parent_page_id: str | None
 ) -> str:
+    """Confluence: space key for parent."""
     if parent_page_id:
         return _confluence_get_page_space_key(cfg, parent_page_id)
     return cfg.space_key
 
 
 def _confluence_get_page_parent_id(cfg: ConfluencePublishConfig, page_id: str) -> str | None:
+    """Confluence: get page parent id."""
     payload = _confluence_request_json(
         cfg,
         f"{cfg.api_prefix}/content/{page_id}",
@@ -1973,7 +2017,7 @@ def _confluence_lookup_page_for_upsert(
     parent_page_id: str | None,
     legacy_title: str | None = None,
 ) -> tuple[str, int, str | None] | None:
-    """Return (page_id, version, current_parent_id) for update/move decisions."""
+    """Confluence: lookup page for upsert."""
     if parent_page_id:
         hit = _confluence_find_child_page_by_title(cfg, parent_page_id, title)
         if hit:
@@ -2015,7 +2059,7 @@ def _confluence_resolve_existing_on_duplicate_title(
     parent_page_id: str | None,
     legacy_title: str | None,
 ) -> tuple[str, int, str | None] | None:
-    """Find an existing page after Confluence rejects create (title unique per space)."""
+    """Confluence: resolve existing on duplicate title."""
     existing = _confluence_lookup_page_for_upsert(
         cfg,
         title,
@@ -2036,6 +2080,7 @@ def _confluence_resolve_existing_on_duplicate_title(
 
 
 def _maybe_audit_export_file(path: str, *, kind: str = "file") -> None:
+    """Вспомогательная функция: maybe audit export file."""
     try:
         import zephyr_audit as za
 
@@ -2053,6 +2098,7 @@ def _maybe_audit_publish_confluence(
     path: str,
     result: str = "success",
 ) -> None:
+    """Вспомогательная функция: maybe audit publish confluence."""
     try:
         import zephyr_audit as za
 
@@ -2076,6 +2122,7 @@ def _confluence_upsert_storage_page(
     legacy_title: str | None = None,
     parent_page_id: str | None = None,
 ) -> tuple[str, str]:
+    """Confluence: upsert storage page."""
     effective_parent = parent_page_id if parent_page_id is not None else cfg.parent_page_id
     space_key = _confluence_space_key_for_parent(cfg, effective_parent)
     existing = _confluence_lookup_page_for_upsert(
@@ -2186,6 +2233,7 @@ def _confluence_upsert_storage_page(
 def _confluence_upload_attachment(
     cfg: ConfluencePublishConfig, page_id: str, file_path: str
 ) -> str:
+    """Confluence: upload attachment."""
     file_name = os.path.basename(file_path)
     boundary = f"----CursorForm{uuid.uuid4().hex}"
     ctype = mimetypes.guess_type(file_name)[0] or "application/octet-stream"
@@ -2220,6 +2268,7 @@ def _confluence_upload_attachment(
 
 
 def _extract_zephyr_status_counts_from_html(raw_html: str) -> dict[str, int] | None:
+    """Извлечь: zephyr status counts from html."""
     match = re.search(
         r'<div\s+id=["\']zephyr-status-counts-json["\'][^>]*>(.*?)</div>',
         raw_html,
@@ -2243,6 +2292,7 @@ def _extract_zephyr_status_counts_from_html(raw_html: str) -> dict[str, int] | N
 
 
 def _strip_zephyr_status_counts_json_div(body_html: str) -> str:
+    """Очистить: zephyr status counts json div."""
     return re.sub(
         r'<div\s+id=["\']zephyr-status-counts-json["\'][^>]*>.*?</div>',
         "",
@@ -2255,6 +2305,7 @@ def _strip_zephyr_status_counts_json_div(body_html: str) -> str:
 def _extract_zephyr_cycle_key_objects_from_html(
     raw_html: str,
 ) -> list[dict[str, Any]] | None:
+    """Извлечь: zephyr cycle key objects from html."""
     match = re.search(
         r'<div\s+id=["\']zephyr-cycle-keys-json["\'][^>]*>(.*?)</div>',
         raw_html,
@@ -2276,6 +2327,7 @@ def _extract_zephyr_cycle_key_objects_from_html(
 
 
 def _strip_zephyr_cycle_keys_json_div(body_html: str) -> str:
+    """Очистить: zephyr cycle keys json div."""
     return re.sub(
         r'<div\s+id=["\']zephyr-cycle-keys-json["\'][^>]*>.*?</div>',
         "",
@@ -2286,7 +2338,7 @@ def _strip_zephyr_cycle_keys_json_div(body_html: str) -> str:
 
 
 def _strip_daily_pie_visual_block(body_html: str) -> str:
-    """Remove global summary pie (section 3) before inserting Zephyr/Chart macro on publish."""
+    """Очистить: daily pie visual block."""
     result = body_html
     for pattern in (
         "<div class='daily-pie-wrap daily-pie-strip-publish'>",
@@ -2323,7 +2375,7 @@ def _strip_daily_pie_visual_block(body_html: str) -> str:
 
 
 def _inject_confluence_anchor_macros(storage_html: str) -> str:
-    """Ensure #fragment links work in Confluence storage by using anchor macros."""
+    """Вспомогательная функция: inject confluence anchor macros."""
 
     pattern = re.compile(
         r"<(?P<tag>h[1-6])(?P<before>[^>]*?)\s+id\s*=\s*['\"](?P<id>[^'\"]+)['\"](?P<after>[^>]*)>"
@@ -2332,6 +2384,7 @@ def _inject_confluence_anchor_macros(storage_html: str) -> str:
     )
 
     def _repl(match: re.Match[str]) -> str:
+        """Вспомогательная функция: repl."""
         tag = match.group("tag")
         anchor_id = match.group("id")
         before = match.group("before") or ""
@@ -2350,7 +2403,7 @@ def _inject_confluence_anchor_macros(storage_html: str) -> str:
 
 
 def _convert_fragment_links_to_confluence(storage_html: str) -> str:
-    """Convert local #fragment links to native Confluence anchor links."""
+    """Вспомогательная функция: convert fragment links to confluence."""
     pattern = re.compile(
         r"<a(?P<attrs>[^>]*?)\s+href\s*=\s*['\"]#(?P<anchor>[^'\"]+)['\"](?P<tail>[^>]*)>"
         r"(?P<body>.*?)</a>",
@@ -2358,6 +2411,7 @@ def _convert_fragment_links_to_confluence(storage_html: str) -> str:
     )
 
     def _repl(match: re.Match[str]) -> str:
+        """Вспомогательная функция: repl."""
         anchor = match.group("anchor").strip()
         body = (match.group("body") or "").strip()
         if not anchor or not body:
@@ -2373,6 +2427,7 @@ def _convert_fragment_links_to_confluence(storage_html: str) -> str:
 
 def _insert_block_after_scenarios_heading(storage_html: str, block: str) -> str:
     # Preferred anchor: raw HTML heading before Confluence anchor conversion.
+    """Вспомогательная функция: insert block after scenarios heading."""
     pattern_raw = re.compile(
         r"(<h2\b[^>]*\bid\s*=\s*['\"]scenarios['\"][^>]*>.*?</h2>)",
         flags=re.IGNORECASE | re.DOTALL,
@@ -2398,6 +2453,7 @@ def _insert_block_after_scenarios_heading(storage_html: str, block: str) -> str:
 
 
 def _replace_scenario_result_cells_with_zephyr_macro(storage_html: str) -> str:
+    """Вспомогательная функция: replace scenario result cells with zephyr macro."""
     pattern = re.compile(
         r"(?P<open><td\b[^>]*\bclass\s*=\s*['\"][^'\"]*scenario-result-cell[^'\"]*['\"][^>]*>)"
         r"(?P<body>.*?)"
@@ -2409,6 +2465,7 @@ def _replace_scenario_result_cells_with_zephyr_macro(storage_html: str) -> str:
     )
 
     def _repl(match: re.Match[str]) -> str:
+        """Вспомогательная функция: repl."""
         key = html.unescape((match.group("key") or "").strip())
         name = html.unescape((match.group("name") or "").strip())
         if not key:
@@ -2428,6 +2485,7 @@ def publish_reports_to_confluence(
     *,
     parent_page_id: str | None = None,
 ) -> list[str]:
+    """Опубликовать в Confluence: reports to confluence."""
     outcomes: list[str] = []
     for html_path in html_paths:
         try:
@@ -2450,6 +2508,7 @@ def _confluence_resolve_publish_titles(
     *,
     fallback_title: str | None = None,
 ) -> tuple[str, str | None]:
+    """Confluence: resolve publish titles."""
     title_from_html = _extract_html_title(raw_html).strip()
     title_from_file = _confluence_page_title_for_file(html_path, cfg)
     raw_primary = title_from_html or title_from_file or (fallback_title or "")
@@ -2472,6 +2531,7 @@ def _publish_single_html_to_confluence(
     *,
     parent_page_id: str | None = None,
 ) -> list[str]:
+    """Вспомогательная функция: publish single html to confluence."""
     outcomes: list[str] = []
 
     def _upsert_audited(
@@ -2479,6 +2539,7 @@ def _publish_single_html_to_confluence(
         storage_html: str,
         **kwargs: Any,
     ) -> tuple[str, str]:
+        """Вспомогательная функция: upsert audited."""
         try:
             page_id, action = _confluence_upsert_storage_page(
                 cfg, title, storage_html, **kwargs
@@ -2638,6 +2699,7 @@ def fetch_executions(
     extra_params: dict[str, str],
     page_size: int,
 ) -> list[dict[str, Any]]:
+    """Загрузить из API: executions."""
     all_items: list[dict[str, Any]] = []
     start_at = 0
     while True:
@@ -2674,6 +2736,7 @@ def fetch_executions(
 
 
 def parse_root_folder_ids(raw_items: list[str]) -> list[str]:
+    """Разобрать: root folder ids."""
     parsed: list[str] = []
     for item in raw_items:
         for part in item.split(","):
@@ -2690,6 +2753,7 @@ def parse_root_folder_ids(raw_items: list[str]) -> list[str]:
 
 
 def _to_folder_node(item: dict[str, Any]) -> FolderNode | None:
+    """Вспомогательная функция: to folder node."""
     folder_id_raw = item.get("id") or item.get("folderTreeId") or item.get("folderId")
     if folder_id_raw is None:
         return None
@@ -2707,6 +2771,7 @@ def _to_folder_node(item: dict[str, Any]) -> FolderNode | None:
 
 
 def _collect_folder_nodes(payload: Any) -> list[FolderNode]:
+    """Собрать: folder nodes."""
     collected: list[FolderNode] = []
     if isinstance(payload, dict):
         node = _to_folder_node(payload)
@@ -2741,6 +2806,7 @@ def discover_folders(
     project_id: str | None,
     root_folder_ids: list[str],
 ) -> list[FolderNode]:
+    """Вспомогательная функция: discover folders."""
     params: dict[str, str] = {}
     if project_id:
         params["projectId"] = project_id
@@ -2826,6 +2892,7 @@ def discover_folders_tree_fallback(
     folder_search_endpoint: str,
     foldertree_endpoint: str,
 ) -> tuple[list[FolderNode], str, list[str]]:
+    """Вспомогательная функция: discover folders tree fallback."""
     errors: list[str] = []
 
     search_body_candidates: list[dict[str, Any]] = []
@@ -2883,6 +2950,7 @@ def probe_tree_endpoints(
     headers: dict[str, str],
     project_id: str | None,
 ) -> tuple[list[FolderNode], str, list[str]]:
+    """Вспомогательная функция: probe tree endpoints."""
     attempts: list[str] = []
     post_candidates = [
         "rest/tests/1.0/folder/search",
@@ -2952,6 +3020,7 @@ def probe_tree_endpoints(
 
 
 def _parse_json_object_arg(raw: str | None, arg_name: str) -> dict[str, Any]:
+    """Разобрать: json object arg."""
     if not raw:
         return {}
     try:
@@ -2966,6 +3035,7 @@ def _parse_json_object_arg(raw: str | None, arg_name: str) -> dict[str, Any]:
 def resolve_folder_creation_name(
     explicit_name: str | None, name_template: str | None
 ) -> str | None:
+    """Вспомогательная функция: resolve folder creation name."""
     if explicit_name and explicit_name.strip():
         return explicit_name.strip()
     if name_template and name_template.strip():
@@ -2975,6 +3045,7 @@ def resolve_folder_creation_name(
 
 
 def _normalize_project_or_parent(value: str | None) -> str | int | None:
+    """Нормализовать: project or parent."""
     if value is None:
         return None
     raw = value.strip()
@@ -2986,6 +3057,7 @@ def _normalize_project_or_parent(value: str | None) -> str | int | None:
 def _find_existing_folder(
     nodes: list[FolderNode], name: str, parent_id: str | None
 ) -> FolderNode | None:
+    """Вспомогательная функция: find existing folder."""
     normalized_name = name.strip()
     normalized_parent = parent_id.strip() if parent_id else None
     candidates: list[FolderNode] = []
@@ -3006,6 +3078,7 @@ def ensure_folder_created_or_existing(
     tree_source_query: dict[str, Any],
     tree_source_body: dict[str, Any],
 ) -> FolderNode | None:
+    """Вспомогательная функция: ensure folder created or existing."""
     if not args.create_folder_first:
         return None
 
@@ -3104,6 +3177,7 @@ def discover_folders_custom_tree_source(
     query_params: dict[str, Any],
     body: dict[str, Any],
 ) -> tuple[list[FolderNode], str]:
+    """Вспомогательная функция: discover folders custom tree source."""
     params = {str(k): str(v) for k, v in query_params.items()}
     payload = request_json(
         base_url=base_url,
@@ -3124,6 +3198,7 @@ def select_tree_target_folders(
     name_pattern: re.Pattern[str] | None,
     root_path_pattern: re.Pattern[str] | None,
 ) -> list[FolderNode]:
+    """Вспомогательная функция: select tree target folders."""
     by_id: dict[str, FolderNode] = {node.folder_id: node for node in nodes}
     children_by_parent: dict[str, list[str]] = defaultdict(list)
     for node in nodes:
@@ -3134,6 +3209,7 @@ def select_tree_target_folders(
     cache: dict[str, str] = {}
 
     def build_path(folder_id: str) -> str:
+        """Построить: path."""
         if folder_id in cache:
             return cache[folder_id]
         node = by_id.get(folder_id)
@@ -3185,11 +3261,13 @@ def select_tree_target_folders(
 
 
 def slugify(value: str) -> str:
+    """Вспомогательная функция: slugify."""
     cleaned = re.sub(r"[^a-zA-Z0-9_-]+", "_", value.strip().lower())
     return cleaned.strip("_") or "folder"
 
 
 def _extract_folder_info(item: dict[str, Any]) -> tuple[str | None, str | None]:
+    """Извлечь: folder info."""
     folder_id_raw = (
         item.get("folderId")
         or get_by_path(item, "folder.id")
@@ -3206,6 +3284,7 @@ def _extract_folder_info(item: dict[str, Any]) -> tuple[str | None, str | None]:
 
 
 def print_folder_field_debug(items: list[dict[str, Any]], limit: int = 15) -> None:
+    """Вспомогательная функция: print folder field debug."""
     samples = []
     for item in items[:limit]:
         samples.append(
@@ -3224,6 +3303,7 @@ def print_folder_field_debug(items: list[dict[str, Any]], limit: int = 15) -> No
 
 
 def print_resolved_folder_names(resolved: dict[str, str]) -> None:
+    """Вспомогательная функция: print resolved folder names."""
     if not resolved:
         print("Resolved folder names: none")
         return
@@ -3233,6 +3313,7 @@ def print_resolved_folder_names(resolved: dict[str, str]) -> None:
 
 
 def print_resolved_folder_paths(resolved_paths: dict[str, str]) -> None:
+    """Вспомогательная функция: print resolved folder paths."""
     if not resolved_paths:
         print("Resolved folder paths: none")
         return
@@ -3254,6 +3335,7 @@ def aggregate_by_folder_from_executions(
     folder_path_pattern: re.Pattern[str] | None = None,
     resolved_folder_paths: dict[str, str] | None = None,
 ) -> tuple[list[tuple[FolderNode, dict[date, Counter[str]]]], Counter]:
+    """Агрегировать: by folder from executions."""
     grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
     names: dict[str, str] = {}
     stats = Counter()
@@ -3309,7 +3391,9 @@ def resolve_folder_names_by_id(
     base_url: str,
     headers: dict[str, str],
 ) -> tuple[dict[str, str], dict[str, str], Counter]:
+    """Вспомогательная функция: resolve folder names by id."""
     def extract_folder_name(payload: Any) -> str | None:
+        """Вспомогательная функция: extract folder name."""
         if isinstance(payload, dict):
             direct = payload.get("name") or payload.get("folderName")
             if isinstance(direct, str) and direct.strip():
@@ -3379,6 +3463,7 @@ def resolve_folder_names_by_id(
 
 
 def normalize_status(status_raw: str | None) -> str:
+    """Вспомогательная функция: normalize status."""
     if status_raw is None:
         return "other"
     value = status_raw.strip().lower()
@@ -3413,8 +3498,10 @@ def normalize_status(status_raw: str | None) -> str:
         "untested",
         "to do",
         "todo",
+# --- Даты билдов, nightly, папки ---
         "wip",
         "in progress",
+# --- Даты билдов, nightly, папки ---
         "не выполнен",
         "не запускался",
         "not tested in this pi",
@@ -3440,6 +3527,7 @@ def normalize_status(status_raw: str | None) -> str:
 
 
 def extract_first_str(item: dict[str, Any], field_paths: list[str]) -> str | None:
+    """Вспомогательная функция: extract first str."""
     for path in field_paths:
         value = get_by_path(item, path)
         if isinstance(value, str) and value.strip():
@@ -3448,6 +3536,7 @@ def extract_first_str(item: dict[str, Any], field_paths: list[str]) -> str | Non
 
 
 def extract_first_scalar_as_str(item: dict[str, Any], field_paths: list[str]) -> str | None:
+    """Вспомогательная функция: extract first scalar as str."""
     for path in field_paths:
         value = get_by_path(item, path)
         if isinstance(value, str) and value.strip():
@@ -3458,6 +3547,7 @@ def extract_first_scalar_as_str(item: dict[str, Any], field_paths: list[str]) ->
 
 
 def _extract_test_case_rows(payload: Any) -> list[dict[str, Any]]:
+    """Извлечь: test case rows."""
     if isinstance(payload, dict):
         rows = extract_items(payload)
         if rows:
@@ -3472,16 +3562,19 @@ def _extract_test_case_rows(payload: Any) -> list[dict[str, Any]]:
 
 
 def _read_cycle_field(cycle: dict[str, Any], paths: list[str], default: str = "") -> str:
+    """Вспомогательная функция: read cycle field."""
     value = extract_first_scalar_as_str(cycle, paths)
     return value or default
 
 
 def _read_case_field(case: dict[str, Any], paths: list[str], default: str = "") -> str:
+    """Вспомогательная функция: read case field."""
     value = extract_first_scalar_as_str(case, paths)
     return value or default
 
 
 def _read_actual_start_date(cycle: dict[str, Any]) -> str:
+    """Вспомогательная функция: read actual start date."""
     return _read_cycle_field(
         cycle,
         [
@@ -3497,6 +3590,7 @@ def _read_actual_start_date(cycle: dict[str, Any]) -> str:
 
 
 def _normalize_display_date(raw_value: str) -> str:
+    """Нормализовать: display date."""
     value = str(raw_value or "").strip()
     if not value:
         return ""
@@ -3507,6 +3601,7 @@ def _normalize_display_date(raw_value: str) -> str:
 
 
 def _resolve_display_date(actual_start_date: str, fallback_date: str) -> str:
+    """Определить: display date."""
     actual = _normalize_display_date(actual_start_date)
     if actual:
         return actual
@@ -3514,6 +3609,7 @@ def _resolve_display_date(actual_start_date: str, fallback_date: str) -> str:
 
 
 def _parse_display_date(value: str) -> date | None:
+    """Разобрать: display date."""
     normalized = _normalize_display_date(value)
     if not normalized:
         return None
@@ -3524,6 +3620,7 @@ def _parse_display_date(value: str) -> date | None:
 
 
 def _resolve_case_display_date(case: dict[str, Any]) -> str:
+    """Определить: case display date."""
     return _resolve_display_date(
         str(case.get("actual_start_date") or ""),
         str(case.get("execution_date", case.get("cycle_updated_on", ""))),
@@ -3531,6 +3628,7 @@ def _resolve_case_display_date(case: dict[str, Any]) -> str:
 
 
 def _resolve_daily_title_date(cycles: dict[str, Any]) -> str:
+    """Определить: daily title date."""
     date_counter: Counter[str] = Counter()
     for cycle in cycles.values():
         if not isinstance(cycle, dict):
@@ -3555,11 +3653,7 @@ def _resolve_nightly_build_version_day(
     *,
     allow_report_day_fallback: bool = True,
 ) -> date | None:
-    """Calendar day for nightly-dev-YYYY.MM.DD build label.
-
-    With a nightly-dev prefix in the folder name: prefix date + 1 day (daily title left).
-    Otherwise, when allow_report_day_fallback: folder report day (weekly matrix logic).
-    """
+    """Определить: nightly build version day."""
     left = _parse_weekly_column_label_from_folder_name(folder_name)
     if left:
         left_date = left.replace("nightly-dev-", "", 1)
@@ -3575,6 +3669,7 @@ def _resolve_nightly_build_version_day(
 def _build_daily_report_title(folder_name: str, cycles: dict[str, Any]) -> str:
     # Daily title format:
     # nightly-dev-YYYY.MM.DD, dow, dd.mm.yyyy
+    """Построить: daily report title."""
     left = _parse_weekly_column_label_from_folder_name(folder_name)
     left_date = left.replace("nightly-dev-", "", 1) if left else ""
     left_day = (
@@ -3607,6 +3702,7 @@ def _build_daily_report_title(folder_name: str, cycles: dict[str, Any]) -> str:
 
 
 def _build_daily_report_base_name(folder_id: str, folder_name: str, cycles: dict[str, Any]) -> str:
+    """Построить: daily report base name."""
     report_day = _parse_report_day_from_folder_name(folder_name)
     if report_day is None:
         report_day = _resolve_folder_report_day(folder_name, cycles)
@@ -3624,6 +3720,7 @@ def build_cycle_case_rows(
     headers: dict[str, str],
     synthetic_cycle_ids: bool = False,
 ) -> list[list[str]]:
+    """Построить: cycle case rows."""
     rows: list[list[str]] = []
     for cycle in cycles:
         real_cycle_id = _read_cycle_field(
@@ -3722,9 +3819,11 @@ def build_cycle_case_rows(
             case_id = _read_case_field(case, ["id", "testCase.id", "testCaseId", "key"], "")
             case_key = _read_case_field(case, ["key", "testCase.key", "testCaseKey"], "")
             case_name = _read_case_field(case, ["name", "testCase.name", "testCaseName"], "")
+# --- Zephyr/Jira: ссылки, traceLinks, issue keys ---
             case_status = _read_case_field(
                 case,
                 ["status.name", "status", "testExecutionStatus.name", "result"],
+# --- Zephyr/Jira: ссылки, traceLinks, issue keys ---
                 "",
             )
             case_iteration_key = _read_case_field(
@@ -3766,6 +3865,7 @@ def fetch_test_result_status_names(
     headers: dict[str, str],
     project_id: str | None,
 ) -> dict[str, str]:
+    """Загрузить из API: test result status names."""
     if not project_id:
         return {}
     endpoint = f"rest/tests/1.0/project/{project_id}/testresultstatus"
@@ -3794,6 +3894,7 @@ _DETAIL_CACHE_LOCK = threading.Lock()
 def fetch_testrun_items(
     base_url: str, headers: dict[str, str], test_run_id: str
 ) -> list[dict[str, Any]]:
+    """Загрузить из API: testrun items."""
     cache_key = (base_url.rstrip("/"), str(test_run_id))
     with _DETAIL_CACHE_LOCK:
         cached = _TESTRUN_ITEMS_CACHE.get(cache_key)
@@ -3826,13 +3927,7 @@ def fetch_testrun_items(
 def _fetch_links_endpoint_silent(
     base_url: str, headers: dict[str, str], endpoint: str
 ) -> Any:
-    """GET helper that swallows network/HTTP errors for optional endpoints.
-
-    Several Zephyr deployments expose linked-issue data via auxiliary
-    endpoints whose exact path varies (`tracelink/testresult/{id}`,
-    `testrunitem/{id}` without field filter, etc). We probe a few of them
-    and ignore failures so the main flow stays unaffected.
-    """
+    """Загрузить из API: links endpoint silent."""
     try:
         return request_json(base_url, endpoint, headers, method="GET")
     except Exception:  # noqa: BLE001
@@ -3846,11 +3941,7 @@ def fetch_links_for_run_item(
     item_id: str,
     test_result_id: str,
 ) -> list[str]:
-    """Try a handful of well-known Zephyr endpoints to collect linked issue keys.
-
-    Returns whatever was found across all probes. Best-effort: empty list
-    when nothing matches, never raises.
-    """
+    """Загрузить из API: links for run item."""
     seen: set[str] = set()
     out: list[str] = []
     candidates: list[str] = []
@@ -3896,6 +3987,7 @@ def fetch_test_results_for_item(
     test_run_id: str,
     item_id: str,
 ) -> list[dict[str, Any]]:
+    """Загрузить из API: test results for item."""
     cache_key = (base_url.rstrip("/"), str(test_run_id), str(item_id))
     with _DETAIL_CACHE_LOCK:
         cached = _TEST_RESULTS_CACHE.get(cache_key)
@@ -3941,13 +4033,7 @@ _ISSUE_KEY_INLINE_PATTERN = re.compile(r"\b[A-Z][A-Z0-9]+-\d+\b")
 
 
 def _extract_key_from_entry(entry: dict[str, Any]) -> str:
-    """Try multiple Zephyr/Jira-style fields to find a Jira-issue key in a single link entry.
-
-    Zephyr Squad / Scale return links in different shapes depending on
-    whether the link sits on a testResult (`traceLinks`) or on a testCase
-    (`issueLinks`/`defects`). We probe the common variants and finally fall
-    back to scanning any URL/href for the canonical KEY-123 token.
-    """
+    """Извлечь: key from entry."""
     direct_keys = (
         "issueKey",
         "displayKey",
@@ -4004,17 +4090,12 @@ _CASE_STEP_TASK_LINKS_INDEX = 22
 
 
 def _task_links_fallback_enabled() -> bool:
-    """Probe optional Zephyr link endpoints when inline fields do not expose defects."""
+    """Вспомогательная функция: task links fallback enabled."""
     return _parse_bool_env(os.getenv("ZEPHYR_FETCH_TASK_LINKS_FALLBACK", "true"))
 
 
 def _maybe_debug_task_links_payload(label: str, payload: Any) -> None:
-    """Dump the first few non-empty link payloads to stderr when debug is on.
-
-    Enable with ZEPHYR_DEBUG_TASK_LINKS=true to investigate cases where
-    Zephyr returns linked issues in a non-standard shape and our parser
-    misses them.
-    """
+    """Вспомогательная функция: maybe debug task links payload."""
     global _TASK_LINKS_DEBUG_REMAINING
     if _TASK_LINKS_DEBUG_REMAINING <= 0:
         return
@@ -4031,6 +4112,7 @@ def _maybe_debug_task_links_payload(label: str, payload: Any) -> None:
 
 
 def _collect_task_links(raw_links: Any) -> list[str]:
+    """Собрать: task links."""
     links: list[str] = []
     if isinstance(raw_links, dict):
         for nested_key in ("traceLinks", "issueLinks", "links", "defects", "items"):
@@ -4063,13 +4145,7 @@ _JIRA_ID_TO_KEY_CACHE: dict[str, str] = {}
 def _resolve_jira_issue_keys(
     base_url: str, headers: dict[str, str], ids: set[str]
 ) -> dict[str, str]:
-    """Batch-resolve numeric Jira issue ids to keys. Cached per process.
-
-    Zephyr Test Player traceLinks come with numeric `issueId` only, so we
-    fan out a single `/rest/api/2/search?jql=id in (...)` per chunk to map
-    them back to canonical keys (e.g. 286915 -> CSD-46501). Failures are
-    swallowed: unresolved ids are kept as-is by the caller.
-    """
+    """Определить: jira issue keys."""
     out: dict[str, str] = {}
     if not ids or not base_url:
         return out
@@ -4121,7 +4197,7 @@ def _resolve_jira_issue_keys(
 def _resolve_id_markers_in_links(
     text: str, id_to_key: dict[str, str]
 ) -> str:
-    """Replace 'id:N' tokens inside a comma-joined task_links string."""
+    """Определить: id markers in links."""
     if not text or "id:" not in text:
         return text
     parts: list[str] = []
@@ -4147,6 +4223,7 @@ def _resolve_id_markers_in_links(
 
 
 def _join_unique(values: list[str]) -> str:
+    """Вспомогательная функция: join unique."""
     out: list[str] = []
     seen: set[str] = set()
     for value in values:
@@ -4167,6 +4244,7 @@ def build_case_step_rows(
     synthetic_cycle_ids: bool = False,
     detail_workers: int = 1,
 ) -> list[list[str]]:
+    """Построить: case step rows."""
     worker_count = _bounded_worker_count(detail_workers, len(cycles))
     if worker_count > 1:
         indexed_rows: list[tuple[int, list[list[str]]]] = []
@@ -4414,6 +4492,7 @@ def build_case_step_rows(
 
 
 def week_start(d: date) -> date:
+    """Вспомогательная функция: week start."""
     return d.fromordinal(d.toordinal() - d.weekday())
 
 
@@ -4424,6 +4503,7 @@ def aggregate_weekly(
     from_date: date | None,
     to_date: date | None,
 ) -> tuple[dict[date, Counter[str]], Counter]:
+    """Агрегировать: weekly."""
     per_week: dict[date, Counter[str]] = defaultdict(Counter)
     skipped = Counter()
 
@@ -4452,16 +4532,19 @@ def aggregate_weekly(
 
 
 def week_total(counter: Counter[str]) -> int:
+    """Вспомогательная функция: week total."""
     return int(sum(counter.values()))
 
 
 def pass_count_for_week(counter: Counter[str]) -> int:
+    """Вспомогательная функция: pass count for week."""
     return sum(
         count for status_label, count in counter.items() if normalize_status(status_label) == "passed"
     )
 
 
 def all_status_labels(weekly: dict[date, Counter[str]]) -> list[str]:
+    """Вспомогательная функция: all status labels."""
     labels: set[str] = set()
     for counter in weekly.values():
         labels.update(counter.keys())
@@ -4469,6 +4552,7 @@ def all_status_labels(weekly: dict[date, Counter[str]]) -> list[str]:
 
 
 def write_csv(path: str, weekly: dict[date, Counter[str]]) -> None:
+    """Записать отчёты: csv."""
     labels = all_status_labels(weekly)
     header = ["week_start", "total", *labels, "pass_rate_pct"]
     with open(path, "w", newline="", encoding="utf-8") as f:
@@ -4492,6 +4576,7 @@ def write_csv(path: str, weekly: dict[date, Counter[str]]) -> None:
 def write_folder_summary_csv(
     path: str, folder_rows: list[tuple[FolderNode, dict[date, Counter[str]]]]
 ) -> None:
+    """Записать отчёты: folder summary csv."""
     header = [
         "folder_id",
         "folder_name",
@@ -4515,10 +4600,12 @@ def write_folder_summary_csv(
                 pass_rate = (
                     normalized["passed"] / total * 100.0
                     if total
+# --- Daily readable: агрегация шагов и legacy ---
                     else 0.0
                 )
                 row = [
                     week.isoformat(),
+# --- Daily readable: агрегация шагов и legacy ---
                     str(total),
                     str(normalized["passed"]),
                     str(normalized["failed"]),
@@ -4537,6 +4624,7 @@ def write_folder_summary_csv(
 
 
 def write_cycles_cases_csv(path: str, rows: list[list[str]]) -> None:
+    """Записать отчёты: cycles cases csv."""
     header = [
         "folder_id",
         "folder_name",
@@ -4562,6 +4650,7 @@ def write_cycles_cases_csv(path: str, rows: list[list[str]]) -> None:
 
 
 def write_case_steps_csv(path: str, rows: list[list[str]]) -> None:
+    """Записать отчёты: case steps csv."""
     header = [
         "folder_id",
         "folder_name",
@@ -4601,7 +4690,7 @@ def write_case_steps_csv(path: str, rows: list[list[str]]) -> None:
 def build_cycle_run_fallback_status(
     cycles_cases_rows: list[list[str]],
 ) -> dict[tuple[str, str], str]:
-    """Map (folder_id, test_run_id) -> cycle-level status for fallback when step data lacks status."""
+    """Построить: cycle run fallback status."""
     out: dict[tuple[str, str], str] = {}
     for row in cycles_cases_rows:
         if len(row) < 11:
@@ -4618,6 +4707,7 @@ def build_cycle_run_fallback_status(
 def build_case_iteration_key_fallback(
     cycles_cases_rows: list[list[str]],
 ) -> dict[tuple[str, str], str]:
+    """Построить: case iteration key fallback."""
     out: dict[tuple[str, str], str] = {}
     for row in cycles_cases_rows:
         if len(row) < 13:
@@ -4642,6 +4732,7 @@ _CASE_STEPS_MIN_ROW_LEN = 15
 
 
 def _case_step_cell(row: list[str], index: int) -> str:
+    """Вспомогательная функция: case step cell."""
     if index >= len(row):
         return ""
     return str(row[index] or "").strip()
@@ -4651,10 +4742,7 @@ def aggregate_readable_daily_reports_from_steps(
     case_steps_rows: list[list[str]],
     cycles_cases_rows: list[list[str]],
 ) -> dict[tuple[str, str], dict[str, Any]]:
-    """
-    Group folder -> test cycle (test_run_id) -> real test cases with result and comment from steps.
-    Result priority: step_status_name, then test_result_status_name, then cycles CSV fallback.
-    """
+    """Агрегировать: readable daily reports from steps."""
     fallback_status = build_cycle_run_fallback_status(cycles_cases_rows)
     fallback_iteration = build_case_iteration_key_fallback(cycles_cases_rows)
     case_merge: dict[tuple[str, str, str, str], dict[str, Any]] = {}
@@ -4795,7 +4883,7 @@ def aggregate_readable_daily_reports_from_steps(
 def aggregate_readable_daily_reports_legacy(
     cycles_cases_rows: list[list[str]],
 ) -> dict[tuple[str, str], dict[str, Any]]:
-    """Fallback when case_steps_rows is empty: one row per cycle-run as in cycles CSV."""
+    """Агрегировать: readable daily reports legacy."""
     reports: dict[tuple[str, str], dict[str, Any]] = {}
     for row in cycles_cases_rows:
         if len(row) < 11:
@@ -4846,6 +4934,7 @@ def aggregate_readable_daily_reports_legacy(
 
 
 def _wiki_escape(value: str) -> str:
+    """Вспомогательная функция: wiki escape."""
     return value.replace("|", "\\|").replace("\n", "\\\\")
 
 
@@ -4856,6 +4945,7 @@ _LOGVIEWER_URL_DEFAULT_RE = re.compile(
 
 
 def _logviewer_url_regex() -> re.Pattern[str]:
+    """Вспомогательная функция: logviewer url regex."""
     raw = (os.getenv("ZEPHYR_LOGVIEWER_URL_REGEX") or "").strip()
     if raw:
         try:
@@ -4866,7 +4956,7 @@ def _logviewer_url_regex() -> re.Pattern[str]:
 
 
 def extract_logviewer_urls(text: str) -> list[str]:
-    """Return unique logviewer URLs in first-seen order."""
+    """Вспомогательная функция: extract logviewer urls."""
     if not text:
         return []
     seen_lower: set[str] = set()
@@ -4885,7 +4975,7 @@ def _build_log_folder_nightly_display_and_date(
     folder_name: str,
     cycles: dict[str, Any],
 ) -> tuple[str, date | None]:
-    """Label like nightly-dev-YYYY.MM.DD (daily title left date) plus sortable date."""
+    """Построить: log folder nightly display and date."""
     build_day = _resolve_nightly_build_version_day(folder_name, cycles)
     if build_day is not None:
         disp = f"nightly-dev-{build_day.strftime('%Y.%m.%d')}"
@@ -4895,6 +4985,7 @@ def _build_log_folder_nightly_display_and_date(
 
 
 def _parse_jira_keys_from_tasks_field(tasks: str) -> list[str]:
+    """Разобрать: jira keys from tasks field."""
     if not tasks or not str(tasks).strip():
         return []
     seen: set[str] = set()
@@ -4914,7 +5005,7 @@ def _parse_jira_keys_from_tasks_field(tasks: str) -> list[str]:
 def _gather_jira_issue_build_log_pages(
     report_data: dict[tuple[str, str], dict[str, Any]],
 ) -> dict[str, list[tuple[str, date | None, list[str]]]]:
-    """Map Jira issue key -> blocks (build_display, sort_date, urls), newest build first."""
+    """Вспомогательная функция: gather jira issue build log pages."""
     bucket: defaultdict[str, dict[str, dict[str, Any]]] = defaultdict(dict)
     for (_folder_id, folder_name), payload in report_data.items():
         cycles = payload.get("cycles") or {}
@@ -4971,6 +5062,7 @@ def render_jira_issue_build_log_html(
     summary: str,
     blocks: list[tuple[str, date | None, list[str]]],
 ) -> str:
+    """Сформировать HTML/wiki: jira issue build log html."""
     page_heading = summary.strip() if summary.strip() else issue_key
     doc_title = f"{page_heading} ({issue_key})" if summary.strip() else issue_key
     parts: list[str] = [
@@ -5013,6 +5105,7 @@ def render_jira_issue_build_log_wiki(
     summary: str,
     blocks: list[tuple[str, date | None, list[str]]],
 ) -> str:
+    """Сформировать HTML/wiki: jira issue build log wiki."""
     page_heading = summary.strip() if summary.strip() else issue_key
     lines: list[str] = [f"h1. {_wiki_escape(page_heading)}"]
     if summary.strip():
@@ -5029,6 +5122,7 @@ def render_jira_issue_build_log_wiki(
 
 
 def _load_readable_template_file(template_dir: str | None, *parts: str) -> str | None:
+    """Загрузить: readable template file."""
     if not template_dir:
         return None
     path = os.path.join(template_dir, *parts)
@@ -5044,6 +5138,7 @@ def _resolve_readable_template(
     format_name: str,
     folder_id: str | None,
 ) -> str | None:
+    """Определить: readable template."""
     if not template_dir or format_name not in ("html", "wiki"):
         return None
     subdir = "html" if format_name == "html" else "wiki"
@@ -5058,6 +5153,7 @@ def _resolve_readable_template(
 
 
 def _apply_readable_template_placeholders(raw: str, mapping: dict[str, str]) -> str:
+    """Вспомогательная функция: apply readable template placeholders."""
     out = raw
     for key, value in mapping.items():
         out = out.replace("{" + key + "}", value)
@@ -5073,6 +5169,7 @@ def _readable_template_mapping(
     week_builds_html: str = "",
     week_builds_wiki: str = "",
 ) -> dict[str, str]:
+    """Вспомогательная функция: readable template mapping."""
     week_label = week_start.isoformat() if week_start else "N/A"
     return {
         "folder_id": escape(str(folder_id)),
@@ -5096,6 +5193,7 @@ def _format_readable_html_preamble(
     week_builds_html: str = "",
     week_builds_wiki: str = "",
 ) -> str:
+    """Форматировать: readable html preamble."""
     raw = _resolve_readable_template(template_dir, kind, "html", folder_id_resolve)
     if not raw or not raw.strip():
         return ""
@@ -5122,6 +5220,7 @@ def _format_readable_wiki_preamble(
     week_builds_html: str = "",
     week_builds_wiki: str = "",
 ) -> str:
+    """Форматировать: readable wiki preamble."""
     raw = _resolve_readable_template(template_dir, kind, "wiki", folder_id_resolve)
     if not raw or not raw.strip():
         return ""
@@ -5140,6 +5239,7 @@ _URL_PATTERN = re.compile(r"(https?://[^\s<>'\"|]+)")
 
 
 def _render_html_with_links(text: str) -> str:
+    """Сформировать разметку: html with links."""
     if not text:
         return ""
     parts = _URL_PATTERN.split(text)
@@ -5159,7 +5259,7 @@ def _render_html_with_links(text: str) -> str:
 
 
 def _html_comment_cell(text: str) -> str:
-    """Escape comment but allow line breaks from Zephyr <br> tags."""
+    """Вспомогательная функция: html comment cell."""
     if not text:
         return ""
     chunks = re.split(r"(?i)<br\s*/?>", text)
@@ -5167,6 +5267,7 @@ def _html_comment_cell(text: str) -> str:
 
 
 def _wiki_text_with_links(text: str) -> str:
+    """Вспомогательная функция: wiki text with links."""
     if not text:
         return ""
     with_breaks = re.sub(r"(?i)<br\s*/?>", "\n", text)
@@ -5186,12 +5287,7 @@ _JIRA_TASK_KEY_RE = re.compile(r"\b[A-Z][A-Z0-9]+-\d+\b")
 
 
 def _html_tasks_render(chunk: str) -> str:
-    """Render a tasks-cell fragment, turning Jira keys into clickable links.
-
-    Behaves like _render_html_with_links for non-key text, plus wraps every
-    KEY-123 token into an <a href="/browse/KEY"> with class daily-jira-key
-    so the Confluence publisher can later swap it for the {jira} macro.
-    """
+    """Вспомогательная функция: html tasks render."""
     if not chunk:
         return ""
     parts = _JIRA_TASK_KEY_RE.split(chunk)
@@ -5210,6 +5306,7 @@ def _html_tasks_render(chunk: str) -> str:
 
 
 def _html_tasks_cell(text: str) -> str:
+    """Вспомогательная функция: html tasks cell."""
     if not text:
         return ""
     chunks = re.split(r"(?i)<br\s*/?>", text)
@@ -5217,7 +5314,7 @@ def _html_tasks_cell(text: str) -> str:
 
 
 def _wiki_tasks_cell(text: str) -> str:
-    """Wiki version of tasks-cell renderer with Jira keys as native links."""
+    """Вспомогательная функция: wiki tasks cell."""
     if not text:
         return ""
     use_plain = _parse_bool_env(os.getenv("ZEPHYR_WEEKLY_WIKI_PLAIN_JIRA_LINKS"))
@@ -5249,11 +5346,13 @@ def _wiki_tasks_cell(text: str) -> str:
 
 
 def _jira_cycle_url(cycle_key: str) -> str:
+    """Jira: cycle url."""
     base_url = os.getenv("ZEPHYR_BASE_URL", "https://jira.navio.auto").rstrip("/")
     return f"{base_url}/secure/Tests.jspa#/testCycle/{urllib.parse.quote(cycle_key)}"
 
 
 def _jira_issue_url(issue_key: str) -> str:
+    """Jira: issue url."""
     base_url = _resolve_weekly_jira_metadata_base(
         os.getenv("ZEPHYR_BASE_URL", "https://jira.navio.auto")
     )
@@ -5266,6 +5365,7 @@ _JIRA_META_BULK_SKIP_FALLBACK = False
 
 
 def _jira_metadata_bulk_failure(exc: BaseException) -> bool:
+    """Jira: metadata bulk failure."""
     text = repr(exc)
     if "Non-JSON response" in text or "JSONDecodeError" in text:
         return True
@@ -5277,7 +5377,7 @@ def _jira_metadata_bulk_failure(exc: BaseException) -> bool:
 
 
 def _normalize_jira_rest_base_url(url: str) -> str:
-    """Normalize Jira REST base URL and warn on common typos."""
+    """Нормализовать: jira rest base url."""
     cleaned = (url or "").strip().rstrip("/")
     if cleaned.endswith(".autoS"):
         fixed = cleaned[:-1]
@@ -5290,7 +5390,7 @@ def _normalize_jira_rest_base_url(url: str) -> str:
 
 
 def _resolve_weekly_jira_metadata_base(cli_base_url: str) -> str:
-    """REST base for Jira issue/search (may differ from Zephyr Scale API host)."""
+    """Определить: weekly jira metadata base."""
     raw = (
         _env_prefers_repo_dotenv("ZEPHYR_JIRA_BASE_URL", "")
         or (os.getenv("ZEPHYR_JIRA_BASE_URL") or "").strip()
@@ -5304,7 +5404,7 @@ def _resolve_weekly_jira_metadata_base(cli_base_url: str) -> str:
 def _jira_bug_metadata_auth_headers(
     zephyr_headers: dict[str, str] | None,
 ) -> dict[str, str] | None:
-    """Use ``ZEPHYR_JIRA_API_TOKEN`` when Jira REST must not reuse the Zephyr token."""
+    """Jira: bug metadata auth headers."""
     token = (os.getenv("ZEPHYR_JIRA_API_TOKEN") or "").strip()
     if token:
         header = (os.getenv("ZEPHYR_JIRA_TOKEN_HEADER") or "Authorization").strip()
@@ -5317,10 +5417,12 @@ _ZEPHYR_ISSUELINK_NAMES_CACHE: dict[str, tuple[str, ...]] = {}
 
 
 def _zephyr_traceability_fetch_enabled() -> bool:
+    """Zephyr: traceability fetch enabled."""
     return _parse_bool_env(os.getenv("ZEPHYR_BUGS_TRACEABILITY_FETCH", "true"))
 
 
 def _zephyr_issuelink_endpoint() -> str:
+    """Zephyr: issuelink endpoint."""
     raw = (
         os.getenv("ZEPHYR_BUGS_TRACEABILITY_ISSUELINK_ENDPOINT")
         or "rest/tests/1.0/issuelink"
@@ -5329,11 +5431,12 @@ def _zephyr_issuelink_endpoint() -> str:
 
 
 def _parse_zephyr_issuelink_test_case_names(payload: Any) -> list[str]:
-    """Extract test case display names from Zephyr Scale ``issuelink`` JSON."""
+    """Разобрать: zephyr issuelink test case names."""
     names: list[str] = []
     seen_lower: set[str] = set()
 
     def _add(raw_name: Any) -> None:
+        """Вспомогательная функция: add."""
         clean = _normalize_linked_scenario_name(str(raw_name or "").strip())
         if not clean:
             return
@@ -5344,6 +5447,7 @@ def _parse_zephyr_issuelink_test_case_names(payload: Any) -> list[str]:
         names.append(clean)
 
     def _add_testcase_dict(tc: dict[str, Any]) -> None:
+        """Вспомогательная функция: add testcase dict."""
         for field in ("name", "summary", "testCaseName"):
             val = tc.get(field)
             if isinstance(val, str) and val.strip():
@@ -5354,6 +5458,7 @@ def _parse_zephyr_issuelink_test_case_names(payload: Any) -> list[str]:
             _add(key_val)
 
     def _walk(obj: Any, depth: int = 0) -> None:
+        """Вспомогательная функция: walk."""
         if depth > 10 or obj is None:
             return
         if isinstance(obj, list):
@@ -5397,7 +5502,7 @@ def _fetch_zephyr_issuelink_scenario_names(
     zephyr_base_url: str,
     zephyr_headers: dict[str, str] | None,
 ) -> list[str]:
-    """Scenario names from Zephyr Scale Traceability panel (``issuelink`` REST)."""
+    """Загрузить из API: zephyr issuelink scenario names."""
     key = str(issue_key or "").strip()
     if not key or not zephyr_base_url or not zephyr_headers:
         return []
@@ -5429,7 +5534,7 @@ def _enrich_defect_meta_zephyr_traceability(
     zephyr_base_url: str,
     zephyr_headers: dict[str, str] | None,
 ) -> None:
-    """Fill ``traceability_scenarios`` from Zephyr Scale Traceability (not Jira description)."""
+    """Вспомогательная функция: enrich defect meta zephyr traceability."""
     if not meta or not keys or not zephyr_base_url or not zephyr_headers:
         return
     if not _zephyr_traceability_fetch_enabled():
@@ -5465,11 +5570,7 @@ def _fetch_jira_bug_metadata(
     base_url: str,
     auth_headers: dict[str, str] | None,
 ) -> dict[str, dict[str, str]]:
-    """Batch-fetch Jira issue metadata for the given keys.
-
-    Returns {key: {summary, status, priority, issuetype}}.
-    Errors and missing keys are silently skipped — the caller falls back to plain key links.
-    """
+    """Пакетно загрузить метаданные Jira issue для списка ключей."""
     global _JIRA_META_BULK_SKIP_FALLBACK
     _JIRA_META_BULK_SKIP_FALLBACK = False
 
@@ -5495,6 +5596,7 @@ def _fetch_jira_bug_metadata(
     fields_csv = ",".join(field_keys)
 
     def _issue_to_entry(issue: dict[str, Any]) -> tuple[str, dict[str, str]] | None:
+        """Вспомогательная функция: issue to entry."""
         key = str(issue.get("key") or "").strip()
         if not key:
             return None
@@ -5525,7 +5627,7 @@ def _fetch_jira_bug_metadata(
         return key, entry
 
     def _fetch_jira_issue_by_key(issue_key: str) -> dict[str, Any] | None:
-        """GET single issue (fallback when search returns nothing or omits keys)."""
+        """Загрузить из API: jira issue by key."""
         k = str(issue_key).strip()
         if not k:
             return None
@@ -5549,6 +5651,7 @@ def _fetch_jira_bug_metadata(
         return None
 
     def _search_chunk(chunk: list[str]) -> list[dict[str, Any]] | None:
+        """Вспомогательная функция: search chunk."""
         jql_keys = ",".join(chunk)
         jql = f"key in ({jql_keys})"
         post_body = {
@@ -5669,7 +5772,7 @@ def _fetch_jira_issue_summaries(
     base_url: str,
     auth_headers: dict[str, str] | None,
 ) -> dict[str, str]:
-    """Return issue key -> summary (best-effort; cached)."""
+    """Загрузить из API: jira issue summaries."""
     out: dict[str, str] = {}
     eff = _jira_bug_metadata_auth_headers(auth_headers) or auth_headers
     if not keys or not base_url or not eff:
@@ -5788,6 +5891,7 @@ def _fetch_jira_issue_summaries(
 
 def _read_cycle_objective(cycle: dict[str, Any]) -> str:
     # Use only cycle-level fields; do not reuse case objective as cycle criterion.
+    """Вспомогательная функция: read cycle objective."""
     return _read_cycle_field(
         cycle,
         [
@@ -5803,7 +5907,7 @@ def _read_cycle_objective(cycle: dict[str, Any]) -> str:
 
 
 def _plain_from_html_like(text: str) -> str:
-    """Convert stored HTML-ish text to readable plain text with line breaks."""
+    """Вспомогательная функция: plain from html like."""
     if not text:
         return ""
     with_breaks = re.sub(r"(?i)<br\s*/?>", "\n", text)
@@ -5812,6 +5916,7 @@ def _plain_from_html_like(text: str) -> str:
 
 
 def _status_bucket_css_class(status_raw: str | None) -> str:
+    """Вспомогательная функция: status bucket css class."""
     raw = (status_raw or "").strip()
     raw_lower = raw.lower()
     exact = {
@@ -5840,6 +5945,7 @@ def _status_bucket_css_class(status_raw: str | None) -> str:
 
 
 def _wiki_status_color_hex(status_raw: str | None) -> str:
+    """Вспомогательная функция: wiki status color hex."""
     cls = _status_bucket_css_class(status_raw)
     return {
         "st-pass": "#33c24d",
@@ -5857,6 +5963,7 @@ def _wiki_status_color_hex(status_raw: str | None) -> str:
 
 
 def _wiki_status_macro_color(status_raw: str | None) -> str:
+    """Вспомогательная функция: wiki status macro color."""
     cls = _status_bucket_css_class(status_raw)
     return {
         "st-pass": "Green",
@@ -5873,6 +5980,7 @@ def _wiki_status_macro_color(status_raw: str | None) -> str:
 
 
 def _status_text_color_hex(status_raw: str | None) -> str:
+    """Вспомогательная функция: status text color hex."""
     cls = _status_bucket_css_class(status_raw)
     return {
         "st-not-executed": "#2f2f2f",
@@ -5884,6 +5992,7 @@ def _status_text_color_hex(status_raw: str | None) -> str:
 
 
 def _render_report_date(case: dict[str, Any]) -> str:
+    """Сформировать разметку: report date."""
     raw = _resolve_case_display_date(case)
     day = _parse_display_date(raw)
     if day is not None:
@@ -5892,6 +6001,7 @@ def _render_report_date(case: dict[str, Any]) -> str:
 
 
 def _wiki_status_markup(status_raw: str | None) -> str:
+    """Вспомогательная функция: wiki status markup."""
     raw_text = str(status_raw or "").strip()
     if not raw_text:
         return ""
@@ -5904,6 +6014,7 @@ def _wiki_status_markup(status_raw: str | None) -> str:
 
 
 def _status_badge_html(status: str) -> str:
+    """Вспомогательная функция: status badge html."""
     raw = status or ""
     cls = _status_bucket_css_class(raw)
     bg = _wiki_status_color_hex(raw)
@@ -5922,6 +6033,7 @@ def _status_badge_html(status: str) -> str:
 
 
 def _render_cycle_info_html(cycle: dict[str, Any]) -> str:
+    """Сформировать разметку: cycle info html."""
     cycle_key_value = str(cycle.get("cycle_key") or "")
     cycle_objective = _plain_from_html_like(str(cycle.get("cycle_objective") or ""))
     cycle_link_html = html.escape(cycle_key_value)
@@ -5940,6 +6052,7 @@ def _render_cycle_info_html(cycle: dict[str, Any]) -> str:
 
 
 def _render_cycle_info_wiki(cycle: dict[str, Any]) -> str:
+    """Сформировать разметку: cycle info wiki."""
     cycle_key_value = str(cycle.get("cycle_key") or "")
     cycle_objective = _plain_from_html_like(str(cycle.get("cycle_objective") or ""))
     cycle_ref = _wiki_escape(cycle_key_value)
@@ -5952,12 +6065,14 @@ def _render_cycle_info_wiki(cycle: dict[str, Any]) -> str:
 
 
 def _normalize_criterion_key(text: str) -> str:
+    """Нормализовать: criterion key."""
     plain = _plain_from_html_like(text or "")
     collapsed = re.sub(r"\s+", " ", plain).strip().lower()
     return collapsed
 
 
 def _prepare_cycle_cases_with_groups(cycle: dict[str, Any]) -> tuple[list[dict[str, Any]], list[int]]:
+    """Вспомогательная функция: prepare cycle cases with groups."""
     cases = list(cycle["cases"].values())
     prepared: list[dict[str, Any]] = []
     for case in cases:
@@ -5988,6 +6103,7 @@ def _prepare_cycle_cases_with_groups(cycle: dict[str, Any]) -> tuple[list[dict[s
 
 
 def _cycle_sort_key(cycle: dict[str, Any]) -> tuple[str, str, str]:
+    """Вспомогательная функция: cycle sort key."""
     return (
         str(cycle.get("cycle_key") or ""),
         str(cycle.get("cycle_name") or ""),
@@ -6028,6 +6144,7 @@ _GROUP_TITLE_STOPWORDS = {
 
 
 def _clean_cycle_name_for_grouping(name: str) -> str:
+    """Вспомогательная функция: clean cycle name for grouping."""
     plain = _plain_from_html_like(name or "")
     no_index = re.sub(r"(?<!\d)\d+\.\d+(?!\d)", " ", plain)
     no_iteration = re.sub(r"(?i)\bитерац(?:ия|ии)\s*\d+\b", " ", no_index)
@@ -6036,10 +6153,12 @@ def _clean_cycle_name_for_grouping(name: str) -> str:
 
 
 def _title_tokens(cleaned_name: str) -> list[str]:
+    """Вспомогательная функция: title tokens."""
     return re.findall(r"[A-Za-zА-Яа-яЁё0-9-]+", cleaned_name)
 
 
 def _common_prefix_tokens(token_rows: list[list[str]]) -> list[str]:
+    """Вспомогательная функция: common prefix tokens."""
     if not token_rows:
         return []
     prefix = list(token_rows[0])
@@ -6055,11 +6174,13 @@ def _common_prefix_tokens(token_rows: list[list[str]]) -> list[str]:
 
 
 def _prettify_group_title(title: str) -> str:
+    """Вспомогательная функция: prettify group title."""
     cleaned = re.sub(r"(?i)\bиз\s+под\b", "из-под", title or "")
     return re.sub(r"\s+", " ", cleaned).strip()
 
 
 def _extract_meaningful_tokens(name: str) -> list[tuple[str, str]]:
+    """Извлечь: meaningful tokens."""
     cleaned = _clean_cycle_name_for_grouping(name)
     raw_tokens = _title_tokens(cleaned)
     meaningful: list[tuple[str, str]] = []
@@ -6077,6 +6198,7 @@ def _extract_meaningful_tokens(name: str) -> list[tuple[str, str]]:
 
 
 def _build_group_title(cycles: list[dict[str, Any]]) -> str:
+    """Построить: group title."""
     if not cycles:
         return "Тестовые циклы"
 
@@ -6121,6 +6243,7 @@ def _build_group_title(cycles: list[dict[str, Any]]) -> str:
 
 
 def _build_summary_cycle_label(row: dict[str, Any]) -> str:
+    """Построить: summary cycle label."""
     cycle_index = str(row.get("cycle_index") or "").strip()
     cycle_title = str(row.get("cycle_title") or "").strip()
     if cycle_index and cycle_title:
@@ -6132,6 +6255,7 @@ def _build_summary_cycle_label(row: dict[str, Any]) -> str:
 
 
 def _summary_scenario_group(row: dict[str, Any]) -> str:
+    """Вспомогательная функция: summary scenario group."""
     cycle_index = str(row.get("cycle_index") or "").strip()
     match = re.match(r"^(\d+)\.\d+$", cycle_index)
     if match:
@@ -6140,7 +6264,7 @@ def _summary_scenario_group(row: dict[str, Any]) -> str:
 
 
 def _is_weekly_scenario_cycle_label(cycle_label: str) -> bool:
-    """True for Zephyr test cycles (X.Y …), false for bare test-case keys (QA-C…)."""
+    """Вспомогательная функция: is weekly scenario cycle label."""
     label = str(cycle_label or "").strip()
     if not label or label.startswith("Итого:"):
         return False
@@ -6151,6 +6275,7 @@ def _is_weekly_scenario_cycle_label(cycle_label: str) -> bool:
 
 
 def _summary_group_title_from_labels(labels: list[str], fallback_group: str) -> str:
+    """Вспомогательная функция: summary group title from labels."""
     meaningful_rows: list[list[tuple[str, str]]] = []
     for label in labels:
         cleaned = re.sub(r"^\s*\d+\.\d+\s*", "", str(label or "")).strip()
@@ -6184,6 +6309,7 @@ def _summary_group_title_from_labels(labels: list[str], fallback_group: str) -> 
 
 
 def _summary_sort_key(row: dict[str, Any]) -> tuple[int, int | str, int | str, str, str]:
+    """Вспомогательная функция: summary sort key."""
     cycle_index = str(row.get("cycle_index") or "").strip()
     match = re.match(r"^(\d+)\.(\d+)$", cycle_index)
     if match:
@@ -6204,10 +6330,7 @@ def _summary_sort_key(row: dict[str, Any]) -> tuple[int, int | str, int | str, s
 
 
 def _extract_cycle_index(cycle: dict[str, Any]) -> str:
-    """
-    Extract dotted index like '1.1' from cycle name/key.
-    Prefer cycle_name because business naming can contain the required index.
-    """
+    """Извлечь: cycle index."""
     candidates = [
         str(cycle.get("cycle_name") or "").strip(),
         str(cycle.get("cycle_key") or "").strip(),
@@ -6223,6 +6346,7 @@ def _extract_cycle_index(cycle: dict[str, Any]) -> str:
 
 
 def _parse_cycle_group_id(cycle: dict[str, Any]) -> str:
+    """Разобрать: cycle group id."""
     cycle_index = _extract_cycle_index(cycle)
     match = re.match(r"^(\d+)\.\d+$", cycle_index)
     if match:
@@ -6233,6 +6357,7 @@ def _parse_cycle_group_id(cycle: dict[str, Any]) -> str:
 
 
 def _group_cycles_by_prefix(cycles: dict[str, Any]) -> list[dict[str, Any]]:
+    """Вспомогательная функция: group cycles by prefix."""
     grouped: dict[str, dict[str, Any]] = {}
     for cycle in cycles.values():
         group_id = _parse_cycle_group_id(cycle)
@@ -6240,6 +6365,7 @@ def _group_cycles_by_prefix(cycles: dict[str, Any]) -> list[dict[str, Any]]:
         group_bucket["cycles"].append(cycle)
 
     def group_sort_key(item: dict[str, Any]) -> tuple[int, int | str]:
+        """Вспомогательная функция: group sort key."""
         group_id = str(item.get("group_id") or "")
         if group_id.isdigit():
             return (0, int(group_id))
@@ -6260,6 +6386,7 @@ def _group_cycles_by_prefix(cycles: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def _build_cycle_progress_rows(cycles: dict[str, Any]) -> list[dict[str, Any]]:
+    """Построить: cycle progress rows."""
     rows: list[dict[str, Any]] = []
     for cycle in sorted(cycles.values(), key=_cycle_sort_key):
         cycle_title = cycle.get("cycle_name") or cycle.get("cycle_key") or cycle.get("cycle_id") or "Unnamed cycle"
@@ -6298,6 +6425,7 @@ def _build_cycle_progress_rows(cycles: dict[str, Any]) -> list[dict[str, Any]]:
 def _passed_count_color(
     passed_cases: int, *, all_not_executed: bool = False, all_blocked: bool = False
 ) -> str:
+    """Вспомогательная функция: passed count color."""
     if passed_cases <= 0:
         if all_blocked:
             return "#4a90e2"
@@ -6314,6 +6442,7 @@ def _passed_count_color(
 def _passed_count_text_color(
     passed_cases: int, *, all_not_executed: bool = False, all_blocked: bool = False
 ) -> str:
+    """Вспомогательная функция: passed count text color."""
     if passed_cases <= 0 and all_blocked:
         return "#ffffff"
     if passed_cases <= 0 and all_not_executed:
@@ -6324,6 +6453,7 @@ def _passed_count_text_color(
 def _cycle_progress_csv_rows(
     report_data: dict[tuple[str, str], dict[str, Any]],
 ) -> list[list[str]]:
+    """Вспомогательная функция: cycle progress csv rows."""
     rows: list[list[str]] = []
     for (folder_id, folder_name), payload in sorted(report_data.items(), key=lambda item: item[0][1]):
         cycles = payload.get("cycles", {})
@@ -6359,6 +6489,7 @@ def _cycle_progress_csv_rows(
 
 
 def _write_text_if_changed(path: str, text: str) -> bool:
+    """Записать: text if changed."""
     if os.path.isfile(path):
         with open(path, encoding="utf-8") as f:
             if f.read() == text:
@@ -6372,7 +6503,7 @@ def _write_text_if_changed(path: str, text: str) -> bool:
 
 
 def _write_text_always(path: str, text: str) -> None:
-    """Write ``text`` to ``path``, creating parent dirs; always overwrites."""
+    """Записать: text always."""
     parent = os.path.dirname(path)
     if parent:
         os.makedirs(parent, exist_ok=True)
@@ -6381,6 +6512,7 @@ def _write_text_always(path: str, text: str) -> None:
 
 
 def write_cycle_progress_csv(path: str, rows: list[list[str]]) -> bool:
+    """Записать отчёты: cycle progress csv."""
     header = [
         "folder_id",
         "folder_name",
@@ -6397,12 +6529,14 @@ def write_cycle_progress_csv(path: str, rows: list[list[str]]) -> bool:
 
 
 def _weekly_cycle_display_label(cycle: dict[str, Any]) -> str:
+    """Weekly-отчёт: cycle display label."""
     cycle_name = str(cycle.get("cycle_name") or "").strip()
     cycle_key = str(cycle.get("cycle_key") or "").strip()
     return cycle_name or cycle_key or str(cycle.get("cycle_id") or "Unnamed cycle")
 
 
 def _weekly_cycle_sort_key_from_cycle(cycle: dict[str, Any]) -> tuple[int, int | str, int | str, str, str]:
+    """Weekly-отчёт: cycle sort key from cycle."""
     cycle_name = str(cycle.get("cycle_name") or "").strip()
     summary_row = {
         "cycle_index": _extract_cycle_index(cycle),
@@ -6413,6 +6547,7 @@ def _weekly_cycle_sort_key_from_cycle(cycle: dict[str, Any]) -> tuple[int, int |
 
 
 def _default_weekday_labels() -> list[str]:
+    """По умолчанию: weekday labels."""
     return ["База", "Вт", "Ср", "Чт", "Пт"]
 
 
@@ -6420,6 +6555,7 @@ def _test_day_from_folder_day(folder_day: date) -> date:
     # Folder name encodes the day a branch was fixed; the actual test run
     # happens on the next business day. Branches fixed on Fri/Sat/Sun are
     # all tested on the following Monday.
+    """Вспомогательная функция: test day from folder day."""
     weekday = folder_day.weekday()
     if weekday <= 3:  # Mon..Thu -> next day
         return folder_day + timedelta(days=1)
@@ -6430,14 +6566,17 @@ def _release_week_start(day: date) -> date:
     # ISO week start (Monday). Caller is expected to pass a "test day"
     # (see _test_day_from_folder_day) so a build fixed on Fri groups with
     # the following Mon..Sun week instead of staying with the previous one.
+    """Вспомогательная функция: release week start."""
     return day - timedelta(days=day.weekday())
 
 
 def _release_week_end(start: date) -> date:
+    """Вспомогательная функция: release week end."""
     return start + timedelta(days=7)
 
 
 def _parse_report_day_from_folder_name(folder_name: str) -> date | None:
+    """Разобрать: report day from folder name."""
     raw_name = str(folder_name or "").strip()
     if not raw_name:
         return None
@@ -6457,6 +6596,7 @@ def _parse_report_day_from_folder_name(folder_name: str) -> date | None:
 
 
 def _parse_weekly_column_label_from_folder_name(folder_name: str) -> str | None:
+    """Разобрать: weekly column label from folder name."""
     raw_name = str(folder_name or "").strip()
     if not raw_name:
         return None
@@ -6467,6 +6607,7 @@ def _parse_weekly_column_label_from_folder_name(folder_name: str) -> str | None:
 
 
 def _normalize_display_date(raw_value: str) -> str:
+    """Нормализовать: display date."""
     value = str(raw_value or "").strip()
     if not value:
         return ""
@@ -6477,6 +6618,7 @@ def _normalize_display_date(raw_value: str) -> str:
 
 
 def _resolve_display_date(actual_start_date: str, fallback_date: str) -> str:
+    """Определить: display date."""
     actual = _normalize_display_date(actual_start_date)
     if actual:
         return actual
@@ -6484,6 +6626,7 @@ def _resolve_display_date(actual_start_date: str, fallback_date: str) -> str:
 
 
 def _parse_display_date(value: str) -> date | None:
+    """Разобрать: display date."""
     normalized = _normalize_display_date(value)
     if not normalized:
         return None
@@ -6494,6 +6637,7 @@ def _parse_display_date(value: str) -> date | None:
 
 
 def _resolve_case_display_date(case: dict[str, Any]) -> str:
+    """Определить: case display date."""
     return _resolve_display_date(
         str(case.get("actual_start_date") or ""),
         str(case.get("execution_date", case.get("cycle_updated_on", ""))),
@@ -6501,6 +6645,7 @@ def _resolve_case_display_date(case: dict[str, Any]) -> str:
 
 
 def _resolve_daily_title_date(cycles: dict[str, Any]) -> str:
+    """Определить: daily title date."""
     date_counter: Counter[str] = Counter()
     for cycle in cycles.values():
         if not isinstance(cycle, dict):
@@ -6519,6 +6664,7 @@ def _resolve_daily_title_date(cycles: dict[str, Any]) -> str:
 
 
 def _resolve_folder_dominant_actual_date(cycles: dict[str, Any]) -> date | None:
+    """Определить: folder dominant actual date."""
     date_counter: Counter[date] = Counter()
     for cycle in cycles.values():
         if not isinstance(cycle, dict):
@@ -6538,6 +6684,7 @@ def _resolve_folder_dominant_actual_date(cycles: dict[str, Any]) -> date | None:
 
 
 def _resolve_daily_title_day(cycles: dict[str, Any]) -> date | None:
+    """Определить: daily title day."""
     title_date = _resolve_daily_title_date(cycles)
     if not title_date:
         return None
@@ -6550,6 +6697,7 @@ _DAILY_HTML_BUILD_REV = "3"
 
 
 def _daily_document_title(folder_name: str) -> str:
+    """Daily-отчёт: document title."""
     suffix = (
         _env_prefers_repo_dotenv(
             "ZEPHYR_DAILY_DOCUMENT_TITLE_SUFFIX", _DAILY_DOCUMENT_TITLE_SUFFIX_DEFAULT
@@ -6560,6 +6708,7 @@ def _daily_document_title(folder_name: str) -> str:
 
 
 def _normalize_weekly_cycle_label(label: str) -> tuple[str, bool]:
+    """Нормализовать: weekly cycle label."""
     raw = _prettify_group_title(str(label or "").strip())
     if not raw:
         return "", False
@@ -6571,6 +6720,7 @@ def _normalize_weekly_cycle_label(label: str) -> tuple[str, bool]:
 
 
 def _resolve_folder_report_day(folder_name: str, cycles: dict[str, Any]) -> date | None:
+    """Определить: folder report day."""
     parsed_from_folder_name = _parse_report_day_from_folder_name(folder_name)
     if parsed_from_folder_name is not None:
         return parsed_from_folder_name
@@ -6583,6 +6733,7 @@ def _filter_report_data_by_resolved_folder_day(
     to_date: date,
     extra_report_days: set[date] | None = None,
 ) -> dict[tuple[str, str], dict[str, Any]]:
+    """Вспомогательная функция: filter report data by resolved folder day."""
     extra = extra_report_days or set()
     out: dict[tuple[str, str], dict[str, Any]] = {}
     for key, payload in report_data.items():
@@ -6604,6 +6755,7 @@ def _filter_tree_folders_by_report_day(
     to_date: date,
     extra_report_days: set[date] | None = None,
 ) -> list[FolderNode]:
+    """Вспомогательная функция: filter tree folders by report day."""
     extra = extra_report_days or set()
     out: list[FolderNode] = []
     for folder in folders:
@@ -6621,7 +6773,7 @@ def _filter_tree_folders_by_report_day(
 
 
 def _drv_branch_token_to_folder_day(token: str) -> date | None:
-    """If DRV/Jira branch string is exactly ``YYYY.MM.DD``, return that calendar day."""
+    """Вспомогательная функция: drv branch token to folder day."""
     t = str(token or "").strip()
     m = re.fullmatch(r"(\d{4})\.(\d{2})\.(\d{2})", t)
     if not m:
@@ -6633,7 +6785,7 @@ def _drv_branch_token_to_folder_day(token: str) -> date | None:
 
 
 def _zephyr_regenerate_last_n_days_from_environment() -> int:
-    """``ZEPHYR_REGENERATE_LAST_N_DAYS`` from process env, else last value in repo ``.env``."""
+    """Zephyr: regenerate last n days from environment."""
     raw = (os.getenv("ZEPHYR_REGENERATE_LAST_N_DAYS") or "").strip()
     if raw.isdigit():
         n = int(raw)
@@ -6650,11 +6802,7 @@ def _drv_cap_extra_folder_days(
     from_d: date,
     to_d: date,
 ) -> set[date]:
-    """Keep at most N extra folder-days closest to the rolling window (both sides).
-
-    ``ZEPHYR_DRV_EXTRA_FOLDER_DAYS_MAX`` (default 48, use 0 for unlimited) avoids
-    fetching dozens of legacy folders when Jira descriptions contain many dates.
-    """
+    """Вспомогательная функция: drv cap extra folder days."""
     cap = _parse_int_env("ZEPHYR_DRV_EXTRA_FOLDER_DAYS_MAX", 48, 0, 366)
     if cap <= 0 or len(days) <= cap:
         return set(days)
@@ -6669,11 +6817,7 @@ def _drv_cap_extra_folder_days(
 
 
 def _drv_calendar_days_parse_from_text(text: str) -> set[date]:
-    """Collect calendar days from build/branch text (ISO-ish and dd.mm.yyyy).
-
-    Supports ``YYYY.MM.DD``, ``YYYY-MM-DD``, ``YYYY_MM_DD``, and optional one-digit
-    month/day (e.g. ``2026.5.7``), plus ``dd.mm.yyyy`` tokens.
-    """
+    """Вспомогательная функция: drv calendar days parse from text."""
     out: set[date] = set()
     s = str(text or "")
     for m in re.finditer(r"\b(\d{4})[._-](\d{1,2})[._-](\d{1,2})\b", s):
@@ -6784,11 +6928,13 @@ _PASSED_STATUS_TOKENS = {"pass", "passed", "пройден", "пройдено",
 
 
 def _is_failed_execution_status(status: str | None) -> bool:
+    """Вспомогательная функция: is failed execution status."""
     text = str(status or "").strip().lower()
     return bool(text) and text in _FAILED_STATUS_TOKENS
 
 
 def _extract_defect_keys_from_cycles(cycles: dict[str, Any]) -> list[str]:
+    """Извлечь: defect keys from cycles."""
     keys: list[str] = []
     if not isinstance(cycles, dict):
         return keys
@@ -6806,6 +6952,7 @@ def _extract_defect_keys_from_cycles(cycles: dict[str, Any]) -> list[str]:
 
 
 def _iter_cases_in_cycles(cycles: dict[str, Any]):
+    """Вспомогательная функция: iter cases in cycles."""
     if not isinstance(cycles, dict):
         return
     for cycle in cycles.values():
@@ -6835,10 +6982,12 @@ def _normalize_linked_scenario_name(name: str) -> str:
 
 
 def _bugs_scenarios_grouped_enabled() -> bool:
+    """Вспомогательная функция: bugs scenarios grouped enabled."""
     return _parse_bool_env(os.getenv("ZEPHYR_BUGS_SCENARIOS_GROUPED", "true"))
 
 
 def _strip_scenario_index_prefix(label: str) -> str:
+    """Очистить: scenario index prefix."""
     return re.sub(r"^\s*\d+\.\d+\s*", "", str(label or "").strip()).strip()
 
 
@@ -6847,15 +6996,18 @@ def _register_scenario_group_alias(
     alias: str,
     gid: str,
 ) -> None:
+    """Вспомогательная функция: register scenario group alias."""
     key = str(alias or "").strip().lower()
     if key and gid:
         alias_to_gid.setdefault(key, gid)
 
+# --- Weekly matrix, defect analytics ---
 
 def _build_scenario_group_catalog(
     report_data: dict[tuple[str, str], dict[str, Any]] | None,
 ) -> tuple[dict[str, str], dict[str, str]]:
-    """Build group titles (1–9) and alias index from Zephyr cycles in report_data."""
+    """Построить: scenario group catalog."""
+# --- Weekly matrix, defect analytics ---
     labels_by_gid: dict[str, list[str]] = defaultdict(list)
     alias_to_gid: dict[str, str] = {}
 
@@ -6902,6 +7054,7 @@ def _scenario_name_to_group_id(
     name: str,
     alias_to_gid: dict[str, str],
 ) -> str | None:
+    """Вспомогательная функция: scenario name to group id."""
     normalized = _normalize_linked_scenario_name(name)
     if not normalized:
         return None
@@ -6925,7 +7078,7 @@ def _defect_scenario_group_names_list(
     raw_names: list[str],
     catalog: tuple[dict[str, str], dict[str, str]],
 ) -> list[str]:
-    """Collapse sub-scenario labels to weekly-style group titles (1–9); keep unmapped raw names."""
+    """Дефекты: scenario group names list."""
     titles_by_gid, alias_to_gid = catalog
     grouped: list[tuple[int, str]] = []
     unmapped: list[str] = []
@@ -6961,7 +7114,7 @@ def _linked_scenario_label_from_cycle_case(
     cycle: dict[str, Any],
     case: dict[str, Any],
 ) -> str:
-    """Prefer weekly-style cycle label (X.Y …), else normalized test case / cycle folder name."""
+    """Вспомогательная функция: linked scenario label from cycle case."""
     cycle_label = _build_summary_cycle_label(
         {
             "cycle_index": _extract_cycle_index(cycle),
@@ -6981,6 +7134,7 @@ def _linked_scenario_label_from_cycle_case(
 
 
 def _empty_defect_analytics() -> dict[str, Any]:
+    """Пустая структура: defect analytics."""
     return {
         "keys_ordered": [],
         "matrix": {},
@@ -7000,12 +7154,7 @@ def _coalesce_weekly_defect_analytics(
     defect_analytics: dict[str, Any] | None,
     defect_keys: list[str] | None,
 ) -> dict[str, Any] | None:
-    """Prefer ``defect_analytics`` keys; if empty but ``defect_keys`` has Jira keys, use a minimal analytics shell.
-
-    ``_weekly_cycle_matrix_data`` can expose keys in ``defect_keys_ordered`` while
-    ``keys_ordered`` in analytics is empty in edge cases; without this, the report
-    falls back to the legacy bullet list and skips the full bugs table.
-    """
+    """Вспомогательная функция: coalesce weekly defect analytics."""
     analytics = defect_analytics
     raw_keys = list((analytics or {}).get("keys_ordered") or [])
     if raw_keys:
@@ -7023,14 +7172,7 @@ def _compute_weekly_defect_analytics(
     ordered_days: list[date],
     column_labels: list[str],
 ) -> dict[str, Any]:
-    """Aggregate per-bug analytics across the week.
-
-    Returns a dict consumable by the renderers. Buckets:
-      keys_ordered, matrix, totals_by_build,
-      cases_with_bug_by_build / cases_without_bug_by_build,
-      failed_cases_with_bug_by_build / failed_cases_without_bug_by_build,
-      bug_total_cases, bug_builds_count, bug_linked_scenarios, hot_bugs.
-    """
+    """Агрегировать analytics по багам за неделю."""
     matrix: dict[str, dict[str, int]] = {}
     cases_with_bug_by_build: dict[str, int] = {label: 0 for label in column_labels}
     cases_without_bug_by_build: dict[str, int] = {label: 0 for label in column_labels}
@@ -7042,6 +7184,7 @@ def _compute_weekly_defect_analytics(
     keys_first_seen_order: list[str] = []
 
     def _append_linked_scenario(bug_key: str, scenario_name: str) -> None:
+        """Вспомогательная функция: append linked scenario."""
         name = _normalize_linked_scenario_name(scenario_name)
         if not name:
             return
@@ -7145,12 +7288,7 @@ def _compute_weekly_defect_analytics(
 
 
 def _extract_cycle_key_objects(cycles: dict[str, Any]) -> list[dict[str, str]]:
-    """Return [{id: cycle_key, name?: cycle_name}] for every Zephyr cycle.
-
-    Mirrors what daily reports embed as <div id="zephyr-cycle-keys-json">.
-    The Confluence publisher uses these to build a per-build Zephyr Reporting
-    macro (TEST_RESULTS_SUMMARY_BY_STATUS) instead of the inline SVG pie.
-    """
+    """Извлечь: cycle key objects."""
     out: list[dict[str, str]] = []
     if not isinstance(cycles, dict):
         return out
@@ -7173,7 +7311,7 @@ def _extract_cycle_key_objects(cycles: dict[str, Any]) -> list[dict[str, str]]:
 def _weekly_aggregate_progress_map(
     progress_rows: list[dict[str, Any]],
 ) -> dict[str, dict[str, Any]]:
-    """Same aggregation as weekly matrix rows: one entry per normalized cycle label."""
+    """Weekly-отчёт: aggregate progress map."""
     aggregated: dict[str, dict[str, Any]] = {}
     for progress_row in progress_rows:
         label = _build_summary_cycle_label(progress_row)
@@ -7231,6 +7369,7 @@ def _weekly_cycle_matrix_data(
     dict[str, list[dict[str, str]]],
     dict[str, Any],
 ]:
+    """Weekly-отчёт: cycle matrix data."""
     weekly_groups: dict[date, list[dict[str, Any]]] = defaultdict(list)
     for (folder_id, folder_name), payload in report_data.items():
         cycles = payload.get("cycles", {})
@@ -7449,6 +7588,7 @@ def _weekly_cycle_matrix_data(
 
 
 def _weekly_cycle_matrix_rows(report_data: dict[tuple[str, str], dict[str, Any]]) -> list[list[str]]:
+    """Weekly-отчёт: cycle matrix rows."""
     _, _, rows, _, _, _, _, _, _ = _weekly_cycle_matrix_data(report_data)
     return rows
 
@@ -7456,6 +7596,7 @@ def _weekly_cycle_matrix_rows(report_data: dict[tuple[str, str], dict[str, Any]]
 def _split_report_data_by_week(
     report_data: dict[tuple[str, str], dict[str, Any]]
 ) -> dict[date, dict[tuple[str, str], dict[str, Any]]]:
+    """Вспомогательная функция: split report data by week."""
     grouped: dict[date, dict[tuple[str, str], dict[str, Any]]] = defaultdict(dict)
     for key, payload in report_data.items():
         folder_id, folder_name = key
@@ -7491,6 +7632,7 @@ def _weekly_cycle_matrix_data_all(
         dict[str, Any],
     ]
 ]:
+    """Weekly-отчёт: cycle matrix data all."""
     by_week = _split_report_data_by_week(report_data)
     matrices: list[
         tuple[
@@ -7523,7 +7665,7 @@ def _weekly_cycle_matrix_data_rolling(
     dict[str, list[dict[str, str]]],
     dict[str, Any],
 ]:
-    """Aggregate matrix across all release weeks in report_data (columns = builds)."""
+    """Weekly-отчёт: cycle matrix data rolling."""
     daily_summaries: list[dict[str, Any]] = []
     for (folder_id, folder_name), payload in report_data.items():
         cycles = payload.get("cycles", {})
@@ -7739,12 +7881,14 @@ def _weekly_cycle_matrix_data_rolling(
 
 
 def _week_short_label(week_start: date | None) -> str:
+    """Вспомогательная функция: week short label."""
     if isinstance(week_start, date):
         return f"W{int(week_start.isocalendar()[1]):02d}"
     return "?"
 
 
 def _analytics_trend_metric() -> str:
+    """Вспомогательная функция: analytics trend metric."""
     raw = (os.getenv("ZEPHYR_ANALYTICS_TREND_METRIC") or "passed").strip().lower()
     return "rate" if raw == "rate" else "passed"
 
@@ -7752,7 +7896,7 @@ def _analytics_trend_metric() -> str:
 def _merge_unique_zephyr_cycle_objects_from_label_map(
     cycle_keys_by_label: dict[str, Any] | None,
 ) -> list[dict[str, str]]:
-    """Union Zephyr test-run objects across all folder columns (dedupe by cycle id)."""
+    """Слить: unique zephyr cycle objects from label map."""
     if not cycle_keys_by_label or not isinstance(cycle_keys_by_label, dict):
         return []
     seen: set[str] = set()
@@ -7790,6 +7934,7 @@ def _weekly_analytics_trend_data(
         ]
     ],
 ) -> dict[str, Any]:
+    """Weekly-отчёт: analytics trend data."""
     week_columns: list[str] = []
     for matrix in matrices:
         week_start = matrix[0]
@@ -7853,6 +7998,7 @@ def _weekly_analytics_trend_data(
 
 
 def _weekly_report_include_analytics_enabled() -> bool:
+    """Weekly-отчёт: report include analytics enabled."""
     name = "ZEPHYR_WEEKLY_REPORT_INCLUDE_ANALYTICS"
     parsed = _get_repo_dotenv_parsed()
     if name in parsed:
@@ -7861,6 +8007,7 @@ def _weekly_report_include_analytics_enabled() -> bool:
 
 
 def _export_weekly_analytics_enabled(args: argparse.Namespace) -> bool:
+    """Вспомогательная функция: export weekly analytics enabled."""
     if getattr(args, "export_weekly_analytics", False):
         return True
     if getattr(args, "export_weekly_readable", False):
@@ -7874,6 +8021,7 @@ def _export_weekly_analytics_enabled(args: argparse.Namespace) -> bool:
 
 
 def _weekly_output_path_for_week(base_path: str, week_start: date | None) -> str:
+    """Weekly-отчёт: output path for week."""
     if week_start is None:
         return base_path
     root, ext = os.path.splitext(base_path)
@@ -7881,6 +8029,7 @@ def _weekly_output_path_for_week(base_path: str, week_start: date | None) -> str
 
 
 def write_weekly_cycle_matrix_csv(path: str, weekday_labels: list[str], rows: list[list[str]]) -> bool:
+    """Записать отчёты: weekly cycle matrix csv."""
     header = [
         "Тестовый цикл",
         "Всего кейсов",
@@ -7899,6 +8048,7 @@ def _weekly_matrix_title_text(week_start: date | None, weekday_labels: list[str]
     # mid-week (it matches existing pages by exact title). We always show
     # Mon..Sun of the ISO week derived from `week_start`, regardless of how
     # many builds we have data for so far.
+    """Weekly-отчёт: matrix title text."""
     if isinstance(week_start, date):
         title_start = week_start
         title_end = week_start + timedelta(days=6)
@@ -7932,6 +8082,7 @@ def _weekly_matrix_title_text(week_start: date | None, weekday_labels: list[str]
 
 
 def _weekly_builds_html_list(column_labels: list[str]) -> str:
+    """Weekly-отчёт: builds html list."""
     items = [
         f"  <li>{html.escape(str(label))}</li>"
         for label in column_labels
@@ -7943,6 +8094,7 @@ def _weekly_builds_html_list(column_labels: list[str]) -> str:
 
 
 def _weekly_builds_wiki_list(column_labels: list[str]) -> str:
+    """Weekly-отчёт: builds wiki list."""
     items = [
         f"* {_wiki_escape(str(label))}"
         for label in column_labels
@@ -7952,10 +8104,12 @@ def _weekly_builds_wiki_list(column_labels: list[str]) -> str:
 
 
 def _weekly_best_branch_column_title(branch_name: str) -> str:
+    """Weekly-отчёт: best branch column title."""
     return f"Лучшая ветка: {str(branch_name or '').strip()}"
 
 
 def _jira_issue_effective_datetime(issue: dict[str, Any]) -> datetime | None:
+    """Jira: issue effective datetime."""
     fields = issue.get("fields") or {}
     if not isinstance(fields, dict):
         return None
@@ -7975,6 +8129,7 @@ _SUMMARY_BRANCH_RE = re.compile(
 
 
 def _extract_branch_from_summary(summary: str | None) -> str:
+    """Извлечь: branch from summary."""
     text = str(summary or "").strip()
     if not text:
         return ""
@@ -7987,11 +8142,7 @@ def _extract_branch_from_summary(summary: str | None) -> str:
 def _build_best_branch_schedule_from_jira(
     issues: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    """Build branch change schedule activated from the next week.
-
-    Rule: when branch in Jira summary changes, this branch is used starting
-    from the following week.
-    """
+    """Построить: best branch schedule from jira."""
     prepared: list[tuple[datetime, datetime, dict[str, Any], str]] = []
     min_dt = datetime.min
     for issue in issues:
@@ -8035,6 +8186,7 @@ def _resolve_branch_for_report_week(
     schedule: list[dict[str, Any]],
     report_week_start: date | None,
 ) -> dict[str, Any] | None:
+    """Определить: branch for report week."""
     if report_week_start is None:
         return None
     chosen: dict[str, Any] | None = None
@@ -8083,11 +8235,7 @@ def _weekly_best_branch_name_for_report_week(
 def _weekly_column_index_matching_branch(
     labels: list[str], branch_name: str
 ) -> int | None:
-    """Pick matrix column index for ``branch_name`` using the same headers as in the report.
-
-    Order: exact header match; same calendar day as ``YYYY.MM.DD`` in branch; branch
-    substring of header; header substring of branch (for long Jira tokens).
-    """
+    """Weekly-отчёт: column index matching branch."""
     raw = str(branch_name or "").strip()
     if not raw:
         return None
@@ -8138,7 +8286,7 @@ def _weekly_column_index_matching_branch(
 def _weekly_collect_daily_summaries_from_report_data(
     report_data: dict[tuple[str, str], dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    """One entry per folder payload with progress rows (all ISO weeks, all folders)."""
+    """Weekly-отчёт: collect daily summaries from report data."""
     out: list[dict[str, Any]] = []
     for (folder_id, folder_name), payload in report_data.items():
         cycles = payload.get("cycles", {})
@@ -8170,6 +8318,7 @@ def _weekly_collect_daily_summaries_from_report_data(
 
 
 def _summary_matches_branch(summary: dict[str, Any], branch_name: str) -> bool:
+    """Вспомогательная функция: summary matches branch."""
     raw = str(branch_name or "").strip()
     if not raw:
         return False
@@ -8196,6 +8345,7 @@ def _summary_matches_branch(summary: dict[str, Any], branch_name: str) -> bool:
 def _weekly_day_map_passed_cases(
     day_map: dict[str, dict[str, Any]], row_label: str
 ) -> int:
+    """Weekly-отчёт: day map passed cases."""
     pl = day_map.get(row_label)
     if pl is not None:
         return int(pl.get("passed_cases", 0))
@@ -8300,6 +8450,7 @@ def _weekly_best_branch_column_context_for_week(
     best_branch_name: str,
     report_week_start: date | None,
 ) -> dict[str, Any] | None:
+    """Weekly-отчёт: best branch column context for week."""
     if report_week_start is None:
         return None
     branch_name = str(best_branch_name or "").strip()
@@ -8314,15 +8465,18 @@ def _weekly_best_branch_column_context_for_week(
 
 
 def _defect_summary_text(entry: dict[str, str] | None) -> str:
+    """Дефекты: summary text."""
     return str((entry or {}).get("summary") or "").strip()
 
 
 def _defect_summary_html(entry: dict[str, str] | None) -> str:
+    """Дефекты: summary html."""
     text = _defect_summary_text(entry)
     return html.escape(text) if text else "—"
 
 
 def _defect_summary_wiki(entry: dict[str, str] | None) -> str:
+    """Дефекты: summary wiki."""
     text = _defect_summary_text(entry)
     return _wiki_escape(text) if text else "—"
 
@@ -8334,11 +8488,12 @@ def _defect_scenario_names_list(
     *,
     scenario_group_catalog: tuple[dict[str, str], dict[str, str]] | None = None,
 ) -> list[str]:
-    """Zephyr Scale Traceability panel first, then names from test runs (unique, ordered)."""
+    """Дефекты: scenario names list."""
     names: list[str] = []
     seen_lower: set[str] = set()
 
     def _add(candidate: str) -> None:
+        """Вспомогательная функция: add."""
         clean = str(candidate or "").strip()
         if not clean:
             return
@@ -8370,6 +8525,7 @@ def _defect_scenarios_html(
     *,
     scenario_group_catalog: tuple[dict[str, str], dict[str, str]] | None = None,
 ) -> str:
+    """Дефекты: scenarios html."""
     names = _defect_scenario_names_list(
         key,
         defect_meta,
@@ -8388,6 +8544,7 @@ def _defect_scenarios_wiki(
     *,
     scenario_group_catalog: tuple[dict[str, str], dict[str, str]] | None = None,
 ) -> str:
+    """Дефекты: scenarios wiki."""
     names = _defect_scenario_names_list(
         key,
         defect_meta,
@@ -8400,6 +8557,7 @@ def _defect_scenarios_wiki(
 
 
 def _weekly_defects_html_block(defect_keys: list[str]) -> str:
+    """Weekly-отчёт: defects html block."""
     if not defect_keys:
         return "<p><em>В процессе написания</em></p>"
     items = [
@@ -8409,6 +8567,7 @@ def _weekly_defects_html_block(defect_keys: list[str]) -> str:
 
 
 def _weekly_defects_wiki_block(defect_keys: list[str]) -> str:
+    """Weekly-отчёт: defects wiki block."""
     if not defect_keys:
         return "_В процессе написания_"
     return "\n".join(f"* {_weekly_jira_key_wiki(key)}" for key in defect_keys)
@@ -8418,7 +8577,7 @@ _DEFECT_TOP_LIMIT = 10
 
 
 def _weekly_defect_extended_analytics_enabled() -> bool:
-    """When false, weekly defect section omits summary, top-N, bug×build matrix, and hot bugs."""
+    """Weekly-отчёт: defect extended analytics enabled."""
     name = "ZEPHYR_WEEKLY_DEFECT_EXTENDED_ANALYTICS"
     parsed = _get_repo_dotenv_parsed()
     if name in parsed:
@@ -8427,11 +8586,12 @@ def _weekly_defect_extended_analytics_enabled() -> bool:
 
 
 def _norm_jira_token(text: str | None) -> str:
+    """Вспомогательная функция: norm jira token."""
     return str(text or "").strip().lower()
 
 
 def _weekly_jira_key_span_html(issue_key: str) -> str:
-    """Issue key cell: monospace link + data attribute for Confluence Jira macro."""
+    """Weekly-отчёт: jira key span html."""
     key = str(issue_key or "").strip()
     if not key:
         return "—"
@@ -8444,6 +8604,7 @@ def _weekly_jira_key_span_html(issue_key: str) -> str:
 
 
 def _jira_status_lozenge_html(status: str | None) -> str:
+    """Jira: status lozenge html."""
     t = _norm_jira_token(status)
     bg, fg, bd = "#dfe1e6", "#42526e", "#dfe1e6"
     if any(x in t for x in ("done", "closed", "resolved", "готов", "закрыт", "выполнен", "решён", "решен")):
@@ -8464,6 +8625,7 @@ def _jira_status_lozenge_html(status: str | None) -> str:
 
 
 def _jira_priority_lozenge_html(priority: str | None) -> str:
+    """Jira: priority lozenge html."""
     t = _norm_jira_token(priority)
     bg, fg = "#dfe1e6", "#42526e"
     if any(x in t for x in ("highest", "blocker", "critical", "наивыс", "блокирующ")):
@@ -8490,7 +8652,7 @@ _WEEKLY_JIRA_KEY_SPAN_RE = re.compile(
 
 
 def _jira_issue_confluence_storage_macro(issue_key: str) -> str:
-    """Confluence storage: native Jira Issues macro (renders like Jira, not plain text)."""
+    """Jira: issue confluence storage macro."""
     key = html.escape(issue_key.strip())
     server_id = (os.getenv("ZEPHYR_CONFLUENCE_JIRA_SERVER_ID") or "").strip()
     server_param = ""
@@ -8506,6 +8668,7 @@ def _jira_issue_confluence_storage_macro(issue_key: str) -> str:
 
 
 def _replace_weekly_jira_key_spans_with_confluence_macro(body_html: str) -> str:
+    """Вспомогательная функция: replace weekly jira key spans with confluence macro."""
     if (
         not body_html
         or "weekly-jira-key" not in body_html
@@ -8514,6 +8677,7 @@ def _replace_weekly_jira_key_spans_with_confluence_macro(body_html: str) -> str:
         return body_html
 
     def _repl(match: re.Match[str]) -> str:
+        """Вспомогательная функция: repl."""
         return _jira_issue_confluence_storage_macro(match.group(1))
 
     return _WEEKLY_JIRA_KEY_SPAN_RE.sub(_repl, body_html)
@@ -8535,7 +8699,7 @@ _WEEKLY_EXCERPT_MACRO_RE = re.compile(
 
 
 def _unwrap_weekly_excerpt_macro(body_html: str) -> str:
-    """Drop a single weekly excerpt wrapper so the span can be rebuilt."""
+    """Вспомогательная функция: unwrap weekly excerpt macro."""
     match = _WEEKLY_EXCERPT_MACRO_RE.search(body_html)
     if not match:
         return body_html
@@ -8573,6 +8737,7 @@ def _find_weekly_excerpt_block_span(body_html: str) -> tuple[int, int] | None:
 def _wrap_html_span_with_excerpt_macro(
     body_html: str, block_start: int, block_end: int
 ) -> str:
+    """Вспомогательная функция: wrap html span with excerpt macro."""
     block_html = body_html[block_start:block_end]
     wrapped = (
         '<ac:structured-macro ac:name="excerpt" ac:schema-version="1">'
@@ -8606,6 +8771,7 @@ _DAILY_REPORT_PREAMBLE_OPEN_RE = re.compile(
 
 
 def _daily_has_scenarios_section(body_html: str) -> bool:
+    """Daily-отчёт: has scenarios section."""
     return bool(
         re.search(
             r"<h2\b[^>]*\bid\s*=\s*['\"]scenarios['\"]",
@@ -8660,6 +8826,7 @@ def _wrap_daily_report_with_excerpt_macro(body_html: str) -> str:
 
 
 def _replace_legacy_weekly_table_macros_with_excerpt(body_html: str) -> str:
+    """Вспомогательная функция: replace legacy weekly table macros with excerpt."""
     if not body_html:
         return body_html
     body_html = body_html.replace('ac:name="table-filter"', 'ac:name="excerpt"')
@@ -8670,7 +8837,7 @@ def _replace_legacy_weekly_table_macros_with_excerpt(body_html: str) -> str:
 
 
 def _weekly_jira_key_wiki(issue_key: str) -> str:
-    """Confluence wiki: embedded Jira issue (falls back to link if macro unsupported)."""
+    """Weekly-отчёт: jira key wiki."""
     key = str(issue_key or "").strip()
     if not key:
         return " "
@@ -8680,10 +8847,12 @@ def _weekly_jira_key_wiki(issue_key: str) -> str:
 
 
 def _duplicate_confidence_rank(level: str) -> int:
+    """Вспомогательная функция: duplicate confidence rank."""
     return {"low": 0, "medium": 1, "high": 2}.get(str(level or "").lower(), 0)
 
 
 def _is_duplicate_publishable(cand: DuplicateCandidate) -> bool:
+    """Вспомогательная функция: is duplicate publishable."""
     min_conf = bugs_duplicate_publish_min_confidence()
     return _duplicate_confidence_rank(cand.confidence) >= _duplicate_confidence_rank(min_conf)
 
@@ -8692,6 +8861,7 @@ def _duplicate_candidate_cell_html(
     key: str,
     duplicate_candidates: dict[str, DuplicateCandidate | None] | None,
 ) -> str:
+    """Вспомогательная функция: duplicate candidate cell html."""
     if duplicate_candidates is None:
         return ""
     cand = duplicate_candidates.get(key)
@@ -8709,6 +8879,7 @@ def _duplicate_candidate_cell_wiki(
     key: str,
     duplicate_candidates: dict[str, DuplicateCandidate | None] | None,
 ) -> str:
+    """Вспомогательная функция: duplicate candidate cell wiki."""
     if duplicate_candidates is None:
         return ""
     cand = duplicate_candidates.get(key)
@@ -8721,10 +8892,7 @@ def _filter_keys_by_issuetype(
     keys: list[str],
     defect_meta: dict[str, dict[str, str]] | None,
 ) -> list[str]:
-    """Optionally restrict to issuetype = ZEPHYR_DEFECT_TYPE_FILTER (default Bug).
-
-    If Jira metadata is missing for a key, the key is kept (graceful).
-    """
+    """Вспомогательная функция: filter keys by issuetype."""
     raw_filter = os.getenv("ZEPHYR_DEFECT_TYPE_FILTER", "Bug")
     allowed = {
         token.strip().lower()
@@ -8754,6 +8922,7 @@ def _weekly_defect_analytics_html(
     *,
     scenario_group_catalog: tuple[dict[str, str], dict[str, str]] | None = None,
 ) -> str:
+    """Weekly-отчёт: defect analytics html."""
     analytics = defect_analytics or {}
     keys_ordered = list(analytics.get("keys_ordered") or [])
     keys_ordered = _filter_keys_by_issuetype(keys_ordered, defect_meta)
@@ -8789,6 +8958,7 @@ def _weekly_defect_analytics_html(
         parts.append("<tbody>")
 
         def _row(label: str, getter) -> str:
+            """Вспомогательная функция: row."""
             cells = [f"<td>{html.escape(label)}</td>"]
             for col in column_labels:
                 cells.append(f"<td>{int(getter(col) or 0)}</td>")
@@ -8902,12 +9072,14 @@ def _weekly_defect_analytics_html(
             f"<td>{_defect_scenarios_html(key, meta, analytics, scenario_group_catalog=scenario_group_catalog)}</td>"
             f"<td>{_jira_priority_lozenge_html(entry.get('priority', ''))}</td>"
             f"<td>{_jira_status_lozenge_html(entry.get('status', ''))}</td>"
+# --- Bugs rollup и snapshot ---
             f"<td style='text-align:center;'>{int(bug_total_cases.get(key, 0))}</td>"
             f"<td style='text-align:center;'>{int(bug_builds_count.get(key, 0))}</td>"
             f"{_duplicate_candidate_cell_html(key, duplicate_candidates)}"
             "</tr>"
         )
     parts.append("</tbody></table></div>")
+# --- Bugs rollup и snapshot ---
 
     parts.append("</div>")
     return "\n".join(parts)
@@ -8921,6 +9093,7 @@ def _weekly_defect_analytics_wiki(
     *,
     scenario_group_catalog: tuple[dict[str, str], dict[str, str]] | None = None,
 ) -> str:
+    """Weekly-отчёт: defect analytics wiki."""
     analytics = defect_analytics or {}
     keys_ordered = list(analytics.get("keys_ordered") or [])
     keys_ordered = _filter_keys_by_issuetype(keys_ordered, defect_meta)
@@ -8950,6 +9123,7 @@ def _weekly_defect_analytics_wiki(
         parts.append("|| " + " || ".join(_wiki_escape(c) for c in header_cells) + " ||")
 
         def _row(label: str, source: dict[str, int]) -> str:
+            """Вспомогательная функция: row."""
             cells = [label] + [str(int(source.get(c, 0))) for c in column_labels]
             return "| " + " | ".join(_wiki_escape(c) for c in cells) + " |"
 
@@ -9077,7 +9251,7 @@ _WEEKLY_HTML_DEFECT_STYLES = (
 
 
 def _bugs_rollup_regenerate_iso_weeks() -> int | None:
-    """ISO-week cap implied by ``ZEPHYR_REGENERATE_LAST_N_DAYS`` (14 days → 2 weeks)."""
+    """Bugs rollup: regenerate iso weeks."""
     n_days = _zephyr_regenerate_last_n_days_from_environment()
     if n_days <= 0:
         return None
@@ -9085,6 +9259,7 @@ def _bugs_rollup_regenerate_iso_weeks() -> int | None:
 
 
 def _bugs_rollup_last_weeks_count() -> int:
+    """Bugs rollup: last weeks count."""
     raw = _env_prefers_repo_dotenv("ZEPHYR_BUGS_ROLLUP_LAST_WEEKS", "")
     explicit: int | None = None
     if raw:
@@ -9103,6 +9278,7 @@ def _bugs_rollup_last_weeks_count() -> int:
 
 
 def _bugs_rollup_section_last_weeks_title(week_keys: list[date] | None = None) -> str:
+    """Bugs rollup: section last weeks title."""
     n = _bugs_rollup_last_weeks_count()
     if week_keys:
         n = min(n, len(week_keys))
@@ -9110,6 +9286,7 @@ def _bugs_rollup_section_last_weeks_title(week_keys: list[date] | None = None) -
 
 
 def _bugs_rollup_snapshot_bootstrap_build_logs_enabled() -> bool:
+    """Bugs rollup: snapshot bootstrap build logs enabled."""
     raw = os.getenv("ZEPHYR_BUGS_ROLLUP_SNAPSHOT_BOOTSTRAP_BUILD_LOGS")
     if raw is None or not str(raw).strip():
         return True
@@ -9117,6 +9294,7 @@ def _bugs_rollup_snapshot_bootstrap_build_logs_enabled() -> bool:
 
 
 def _default_build_log_report_dir() -> str:
+    """По умолчанию: build log report dir."""
     return (
         os.getenv("ZEPHYR_BUILD_LOG_REPORT_DIR", "reports/build_log_reports").strip()
         or "reports/build_log_reports"
@@ -9128,6 +9306,7 @@ def _append_jira_defect_keys(
     seen: set[str],
     keys: Iterable[Any],
 ) -> None:
+    """Вспомогательная функция: append jira defect keys."""
     for key in keys:
         k = str(key).strip()
         if k and _DEFECT_KEY_PATTERN.search(k) and k not in seen:
@@ -9141,7 +9320,7 @@ def _bootstrap_snapshot_base_if_empty(
     base_week_keys: list[date],
     output_dir: str,
 ) -> tuple[dict[str, Any], list[str], list[date]]:
-    """When snapshot has no keys, seed base state from on-disk build logs."""
+    """Если в snapshot нет ключей — инициализировать из build_log на диске."""
     if base_analytics.get("keys_ordered") or not _bugs_rollup_snapshot_bootstrap_build_logs_enabled():
         return base_analytics, base_labels, base_week_keys
     boot_analytics, boot_labels, boot_week_keys = _bootstrap_snapshot_from_disk(
@@ -9156,6 +9335,7 @@ def _bootstrap_snapshot_base_if_empty(
 
 
 def _bugs_rollup_snapshot_path(output_dir: str) -> str:
+    """Bugs rollup: snapshot path."""
     explicit = (os.getenv("ZEPHYR_BUGS_ROLLUP_SNAPSHOT") or "").strip()
     if explicit:
         return explicit
@@ -9163,7 +9343,7 @@ def _bugs_rollup_snapshot_path(output_dir: str) -> str:
 
 
 def _load_bugs_rollup_snapshot(path: str) -> dict[str, Any]:
-    """Load persisted rollup snapshot or return an empty payload."""
+    """Загрузить сохранённый snapshot rollup или вернуть пустую структуру."""
     empty: dict[str, Any] = {
         "version": 1,
         "column_labels": [],
@@ -9201,6 +9381,7 @@ def _load_bugs_rollup_snapshot(path: str) -> dict[str, Any]:
 
 
 def _week_keys_from_snapshot_iso(week_keys_iso: list[str]) -> list[date]:
+    """Вспомогательная функция: week keys from snapshot iso."""
     out: list[date] = []
     for raw in week_keys_iso:
         try:
@@ -9211,6 +9392,7 @@ def _week_keys_from_snapshot_iso(week_keys_iso: list[str]) -> list[date]:
 
 
 def _issue_key_from_build_log_filename(name: str) -> str | None:
+    """Вспомогательная функция: issue key from build log filename."""
     if not name.endswith("_build_log.html"):
         return None
     stem = name[: -len("_build_log.html")]
@@ -9222,11 +9404,12 @@ def _bootstrap_snapshot_from_disk(
     build_log_dir: str,
     rollup_dir: str,
 ) -> tuple[dict[str, Any], list[str], list[date]]:
-    """Seed snapshot keys from on-disk build logs and duplicate_rollup_keys.json."""
+    """Заполнить ключи snapshot из build_log на диске и duplicate_rollup_keys.json."""
     keys_seen: set[str] = set()
     keys_ordered: list[str] = []
 
     def _add_key(raw: str) -> None:
+        """Вспомогательная функция: add key."""
         key = str(raw).strip()
         if not key or not _DEFECT_KEY_PATTERN.search(key) or key in keys_seen:
             return
@@ -9255,6 +9438,7 @@ def _bootstrap_snapshot_from_disk(
 
 
 def _parse_build_column_label_day(label: str) -> date | None:
+    """Разобрать: build column label day."""
     raw = str(label or "").strip()
     match = re.match(
         r"^nightly-dev-(\d{4})[._-](\d{2})[._-](\d{2})\b",
@@ -9270,7 +9454,7 @@ def _parse_build_column_label_day(label: str) -> date | None:
 
 
 def _sort_build_column_labels_chronologically(labels: list[str]) -> list[str]:
-    """Order build columns by calendar day so backfills do not scramble matrix/hot-bugs."""
+    """Упорядочить колонки билдов по календарному дню (для matrix и hot_bugs)."""
     known: list[tuple[date, int, str]] = []
     unknown: list[tuple[int, str]] = []
     for idx, label in enumerate(labels):
@@ -9285,6 +9469,7 @@ def _sort_build_column_labels_chronologically(labels: list[str]) -> list[str]:
 
 
 def _bugs_rollup_all_time_max_build_columns() -> int:
+    """Bugs rollup: all time max build columns."""
     raw = (os.getenv("ZEPHYR_BUGS_ROLLUP_ALL_MAX_BUILD_COLUMNS") or "52").strip()
     try:
         return max(1, int(raw))
@@ -9293,6 +9478,7 @@ def _bugs_rollup_all_time_max_build_columns() -> int:
 
 
 def _display_build_column_labels(labels: list[str], max_columns: int) -> list[str]:
+    """Вспомогательная функция: display build column labels."""
     ordered = _sort_build_column_labels_chronologically(labels)
     if len(ordered) <= max_columns:
         return ordered
@@ -9302,6 +9488,7 @@ def _display_build_column_labels(labels: list[str], max_columns: int) -> list[st
 def _merge_column_labels_ordered(
     base_labels: list[str], incoming_labels: list[str]
 ) -> list[str]:
+    """Слить: column labels ordered."""
     merged = list(base_labels)
     seen = set(merged)
     for label in incoming_labels:
@@ -9316,6 +9503,7 @@ def _merge_int_maps_max(
     incoming: dict[str, int],
     labels: list[str],
 ) -> dict[str, int]:
+    """Слить: int maps max."""
     out: dict[str, int] = {}
     for label in labels:
         out[label] = max(int(base.get(label, 0)), int(incoming.get(label, 0)))
@@ -9328,7 +9516,7 @@ def _merge_defect_analytics(
     base_labels: list[str],
     incoming_labels: list[str],
 ) -> tuple[dict[str, Any], list[str]]:
-    """Merge two analytics dicts; per bug×build cell counts use max (idempotent re-runs)."""
+    """Слить два analytics; в ячейке баг×билд — max (идемпотентные перезапуски)."""
     merged_labels = _merge_column_labels_ordered(base_labels, incoming_labels)
     base_matrix = dict(base.get("matrix") or {})
     incoming_matrix = dict(incoming.get("matrix") or {})
@@ -9417,6 +9605,7 @@ def _merge_defect_analytics(
 
 
 def _recompute_defect_keys_order(analytics: dict[str, Any]) -> list[str]:
+    """Вспомогательная функция: recompute defect keys order."""
     bug_total_cases = dict(analytics.get("bug_total_cases") or {})
     bug_builds_count = dict(analytics.get("bug_builds_count") or {})
     keys = list(analytics.get("keys_ordered") or [])
@@ -9433,7 +9622,7 @@ def _recompute_defect_keys_order(analytics: dict[str, Any]) -> list[str]:
 def _recompute_defect_analytics_derived(
     analytics: dict[str, Any], column_labels: list[str]
 ) -> dict[str, Any]:
-    """Refresh totals_by_build and hot_bugs from matrix after a merge."""
+    """Пересчитать totals_by_build и hot_bugs из matrix после merge."""
     matrix = dict(analytics.get("matrix") or {})
     label_index = {label: idx for idx, label in enumerate(column_labels)}
     totals_by_build = {
@@ -9467,6 +9656,7 @@ def _save_bugs_rollup_snapshot(
     column_labels: list[str],
     week_keys: list[date],
 ) -> None:
+    """Сохранить: bugs rollup snapshot."""
     parent = os.path.dirname(path)
     if parent:
         os.makedirs(parent, exist_ok=True)
@@ -9489,7 +9679,7 @@ def _refresh_bugs_rollup_all_time_snapshot(
     run_labels: list[str],
     run_week_keys: list[date],
 ) -> tuple[dict[str, Any], list[str], list[date]]:
-    """Merge current run analytics into the persisted all-time snapshot."""
+    """Влить analytics текущего прогона в all-time snapshot."""
     snapshot_path = _bugs_rollup_snapshot_path(output_dir)
     stored = _load_bugs_rollup_snapshot(snapshot_path)
     base_analytics = dict(stored.get("analytics") or _empty_defect_analytics())
@@ -9515,7 +9705,7 @@ def collect_bugs_rollup_jira_keys(
     report_data: dict[tuple[str, str], dict[str, Any]],
     output_dir: str,
 ) -> list[str]:
-    """Collect Jira keys for rollup metadata: rolling window + persisted all-time snapshot."""
+    """Собрать Jira-ключи для rollup: скользящее окно + all-time snapshot."""
     keys_ordered: list[str] = []
     seen: set[str] = set()
     n_weeks = _bugs_rollup_last_weeks_count()
@@ -9547,7 +9737,7 @@ def _defect_rollup_from_report_data(
     *,
     last_n_weeks: int | None,
 ) -> tuple[list[str], dict[str, Any], list[date]]:
-    """Aggregate defect analytics across one or more ISO weeks (weekly report format)."""
+    """Дефекты: rollup from report data."""
     weekly_groups: dict[date, list[dict[str, Any]]] = defaultdict(list)
     for (folder_id, folder_name), payload in report_data.items():
         cycles = payload.get("cycles", {})
@@ -9615,6 +9805,7 @@ def _bugs_rollup_section_subtitle(
     *,
     total_build_columns: int | None = None,
 ) -> str:
+    """Bugs rollup: section subtitle."""
     parts: list[str] = []
     if week_keys:
         parts.append(
@@ -9640,6 +9831,7 @@ def _bugs_rollup_html_section(
     total_build_columns: int | None = None,
     scenario_group_catalog: tuple[dict[str, str], dict[str, str]] | None = None,
 ) -> list[str]:
+    """Bugs rollup: html section."""
     blocks = [f"<h2><strong>{html.escape(section_title)}</strong></h2>"]
     subtitle = _bugs_rollup_section_subtitle(
         week_keys, column_labels, total_build_columns=total_build_columns
@@ -9676,6 +9868,7 @@ def render_bugs_rollup_html_report(
     all_total_build_columns: int | None = None,
     scenario_group_catalog: tuple[dict[str, str], dict[str, str]] | None = None,
 ) -> str:
+    """Сформировать HTML/wiki: bugs rollup html report."""
     sections = [
         "<!doctype html>",
         "<html><head><meta charset='utf-8'>",
@@ -9722,6 +9915,7 @@ def _bugs_rollup_wiki_section(
     total_build_columns: int | None = None,
     scenario_group_catalog: tuple[dict[str, str], dict[str, str]] | None = None,
 ) -> list[str]:
+    """Bugs rollup: wiki section."""
     lines = [f"h2. {section_title}", ""]
     subtitle = _bugs_rollup_section_subtitle(
         week_keys, column_labels, total_build_columns=total_build_columns
@@ -9760,6 +9954,7 @@ def render_bugs_rollup_wiki_report(
     all_total_build_columns: int | None = None,
     scenario_group_catalog: tuple[dict[str, str], dict[str, str]] | None = None,
 ) -> str:
+    """Сформировать HTML/wiki: bugs rollup wiki report."""
     lines = [f"h1. {BUGS_ROLLUP_DISPLAY_TITLE}", ""]
     lines.extend(
         _bugs_rollup_wiki_section(
@@ -9795,6 +9990,7 @@ def _bugs_rollup_duplicate_candidates_for_analytics(
     overrides: dict[str, Any] | None,
     scenario_group_catalog: tuple[dict[str, str], dict[str, str]] | None = None,
 ) -> dict[str, DuplicateCandidate | None] | None:
+    """Bugs rollup: duplicate candidates for analytics."""
     from bug_duplicate_detection import bugs_duplicate_detect_enabled
 
     if not bugs_duplicate_detect_enabled():
@@ -9832,7 +10028,7 @@ def write_bugs_rollup_reports(
     defect_meta: dict[str, dict[str, str]] | None,
     last_weeks: int | None = None,
 ) -> list[str]:
-    """Write a single bugs index page (last N weeks + all time) in weekly defect format."""
+    """Записать индекс багов (последние N недель + all time) в формате weekly defect."""
     os.makedirs(output_dir, exist_ok=True)
     n_weeks = last_weeks if last_weeks is not None else _bugs_rollup_last_weeks_count()
     last_labels, last_analytics, last_week_keys = _defect_rollup_from_report_data(
@@ -9956,6 +10152,7 @@ def write_bugs_rollup_reports(
 
 
 def _list_bugs_rollup_html_paths(output_dir: str) -> list[str]:
+    """Вспомогательная функция: list bugs rollup html paths."""
     if not os.path.isdir(output_dir):
         return []
     path = os.path.join(output_dir, "bugs_index.html")
@@ -9978,6 +10175,7 @@ def _render_analytics_sections_html(
     defect_column_labels: list[str] | None = None,
     defect_matrix_title: str = "билд",
 ) -> str:
+    """Сформировать разметку: analytics sections html."""
     labels = list(weekday_labels)
     best_column = best_branch_column or {}
     best_title = str(best_column.get("title") or "").strip()
@@ -10177,6 +10375,7 @@ def _render_analytics_sections_wiki(
     defect_column_labels: list[str] | None = None,
 ) -> str:
     # cycle_keys_by_label accepted for call-site parity with HTML (Confluence macros only).
+    """Сформировать разметку: analytics sections wiki."""
     labels = list(weekday_labels)
     best_column = best_branch_column or {}
     best_title = str(best_column.get("title") or "").strip()
@@ -10283,6 +10482,7 @@ def render_weekly_html_report(
     folder_name_mapping: str = "",
     best_branch_column: dict[str, Any] | None = None,
 ) -> str:
+    """Сформировать HTML/wiki: weekly html report."""
     labels = list(weekday_labels)
     title_text = _weekly_matrix_title_text(week_start, weekday_labels)
     builds_html = _weekly_builds_html_list(labels)
@@ -10388,6 +10588,7 @@ def render_weekly_wiki_report(
     folder_name_mapping: str = "",
     best_branch_column: dict[str, Any] | None = None,
 ) -> str:
+    """Сформировать HTML/wiki: weekly wiki report."""
     title_text = _weekly_matrix_title_text(week_start, weekday_labels)
     labels = list(weekday_labels)
     best_column = best_branch_column or {}
@@ -10468,6 +10669,7 @@ def write_weekly_readable_reports(
     filename_suffix: str = "",
     best_branch_column: dict[str, Any] | None = None,
 ) -> list[str]:
+    """Записать отчёты: weekly readable reports."""
     os.makedirs(output_dir, exist_ok=True)
     week_label = week_start.isoformat() if week_start else "unknown_week"
     base_name = f"weekly_cycle_matrix_{week_label}{filename_suffix}"
@@ -10516,6 +10718,7 @@ def write_weekly_readable_reports(
 
 
 def _analytics_env_int(name: str, default: int) -> int:
+    """Вспомогательная функция: analytics env int."""
     raw = (os.getenv(name) or "").strip()
     if not raw:
         return default
@@ -10526,6 +10729,7 @@ def _analytics_env_int(name: str, default: int) -> int:
 
 
 def _status_counts_metrics(counts: dict[str, int] | None) -> dict[str, Any]:
+    """Вспомогательная функция: status counts metrics."""
     data = counts or {}
     passed = int(data.get("passed", 0))
     failed = int(data.get("failed", 0))
@@ -10548,10 +10752,12 @@ def _status_counts_metrics(counts: dict[str, int] | None) -> dict[str, Any]:
 
 
 def _matrix_detail_rows(rows: list[list[str]]) -> list[list[str]]:
+    """Вспомогательная функция: matrix detail rows."""
     return [r for r in rows if r and not str(r[0]).startswith("Итого:")]
 
 
 def _matrix_group_rows(rows: list[list[str]]) -> list[list[str]]:
+    """Вспомогательная функция: matrix group rows."""
     return [r for r in rows if r and str(r[0]).startswith("Итого:")]
 
 
@@ -10561,6 +10767,7 @@ def _matrix_scenario_snapshot(
     cell_all_not_executed: list[list[bool]] | None,
     cell_all_blocked: list[list[bool]] | None,
 ) -> dict[str, Any]:
+    """Вспомогательная функция: matrix scenario snapshot."""
     detail = _matrix_detail_rows(rows)
     green_by_label: dict[str, int] = {label: 0 for label in labels}
     gray_by_label: dict[str, int] = {label: 0 for label in labels}
@@ -10588,6 +10795,7 @@ def _matrix_scenario_snapshot(
 def _compute_fail_without_jira_by_build(
     report_data: dict[tuple[str, str], dict[str, Any]],
 ) -> dict[str, list[str]]:
+    """Вычислить: fail without jira by build."""
     by_build: dict[str, set[str]] = defaultdict(set)
     for (_folder_id, folder_name), payload in report_data.items():
         cycles = payload.get("cycles") or {}
@@ -10595,6 +10803,7 @@ def _compute_fail_without_jira_by_build(
             continue
         build_label = _parse_weekly_column_label_from_folder_name(folder_name)
         if not build_label:
+# --- Weekly analytics, matrix delta ---
             build_display, _sort_d = _build_log_folder_nightly_display_and_date(
                 folder_name, cycles
             )
@@ -10602,6 +10811,7 @@ def _compute_fail_without_jira_by_build(
         for cycle in cycles.values():
             if not isinstance(cycle, dict):
                 continue
+# --- Weekly analytics, matrix delta ---
             scenario = str(cycle.get("cycle_name") or cycle.get("name") or "").strip()
             if not scenario:
                 continue
@@ -10628,6 +10838,7 @@ def _aggregate_top_failure_comments(
     *,
     top_n: int = 10,
 ) -> list[dict[str, Any]]:
+    """Агрегировать: top failure comments."""
     if not case_steps_rows:
         return []
     # folder_id, folder_name, cycle_id, cycle_key, cycle_name, ...
@@ -10666,6 +10877,7 @@ def _build_log_index_for_analytics(
     report_data: dict[tuple[str, str], dict[str, Any]],
     build_log_dir: str,
 ) -> list[dict[str, Any]]:
+    """Построить: log index for analytics."""
     pages = _gather_jira_issue_build_log_pages(report_data)
     if not pages:
         return []
@@ -10702,6 +10914,7 @@ def _build_extended_analytics_bundle(
     case_steps_rows: list[list[str]] | None = None,
     build_log_dir: str = "",
 ) -> dict[str, Any]:
+    """Построить: extended analytics bundle."""
     labels = list(rolling_matrix[1] or []) if rolling_matrix else []
     rows = list(rolling_matrix[2] or []) if rolling_matrix else []
     ne = rolling_matrix[3] if rolling_matrix else []
@@ -10785,6 +10998,7 @@ def _build_extended_analytics_bundle(
 
 
 def _parse_matrix_column_label_day(label: str) -> date | None:
+    """Разобрать: matrix column label day."""
     raw = str(label or "").strip()
     if not raw:
         return None
@@ -10808,7 +11022,7 @@ def _matrix_delta_column_indices(
     *,
     week_start: date | None = None,
 ) -> tuple[int, int, date | None, str]:
-    """Pick matrix columns for week-scale delta (not the last two builds)."""
+    """Вспомогательная функция: matrix delta column indices."""
     test_days = [
         _test_day_from_folder_day(report_day)
         if (report_day := _parse_matrix_column_label_day(label)) is not None
@@ -10866,6 +11080,7 @@ def _build_matrix_delta_rows(
     week_start: date | None = None,
     top_n: int = 10,
 ) -> dict[str, Any]:
+    """Построить: matrix delta rows."""
     empty: dict[str, Any] = {
         "prev_label": "",
         "curr_label": "",
@@ -10942,6 +11157,7 @@ def _build_matrix_delta_rows(
 
 
 def _format_analytics_delta_comparison_intro(delta: dict[str, Any]) -> str:
+    """Форматировать: analytics delta comparison intro."""
     if not delta.get("prev_label") or not delta.get("curr_label"):
         return ""
     week_start = delta.get("week_start")
@@ -10978,6 +11194,7 @@ def _build_group_heatmap_rows(
     rows: list[list[str]],
     labels: list[str],
 ) -> list[dict[str, Any]]:
+    """Построить: group heatmap rows."""
     out: list[dict[str, Any]] = []
     for row in _matrix_group_rows(rows):
         title = str(row[0] or "").replace("Итого:", "", 1).strip()
@@ -10998,6 +11215,7 @@ def _compute_flaky_scenarios(
     labels: list[str],
     cell_all_not_executed: list[list[bool]] | None,
 ) -> list[dict[str, Any]]:
+    """Вычислить: flaky scenarios."""
     if len(labels) < 2:
         return []
     detail = _matrix_detail_rows(rows)
@@ -11042,6 +11260,7 @@ def _compute_best_branch_comparison(
     labels: list[str],
     best_branch: dict[str, Any] | None,
 ) -> dict[str, Any]:
+    """Вычислить: best branch comparison."""
     if not labels or not best_branch:
         return {"title": "", "worse": [], "better": [], "same": 0}
     latest = labels[-1]
@@ -11073,6 +11292,7 @@ def _compute_best_branch_comparison(
 
 
 def _rate_bar_html(rate: float, *, width: int = 120) -> str:
+    """Вспомогательная функция: rate bar html."""
     pct = max(0.0, min(100.0, float(rate)))
     fill = int(width * pct / 100.0)
     return (
@@ -11084,6 +11304,7 @@ def _rate_bar_html(rate: float, *, width: int = 120) -> str:
 
 
 def _render_analytics_build_rates_html(bundle: dict[str, Any]) -> str:
+    """Сформировать разметку: analytics build rates html."""
     metrics = bundle.get("build_metrics") or []
     if not metrics:
         return "<p class='pie-empty'>Нет данных по билдам</p>"
@@ -11112,6 +11333,7 @@ def _render_analytics_build_rates_html(bundle: dict[str, Any]) -> str:
 
 
 def _render_analytics_trend_week_rates_html(bundle: dict[str, Any]) -> str:
+    """Сформировать разметку: analytics trend week rates html."""
     rates = bundle.get("trend_week_rates") or []
     if not rates:
         return "<p class='pie-empty'>Нет данных</p>"
@@ -11135,6 +11357,7 @@ def _render_analytics_trend_week_rates_html(bundle: dict[str, Any]) -> str:
 
 
 def _render_analytics_delta_html(bundle: dict[str, Any]) -> str:
+    """Сформировать разметку: analytics delta html."""
     delta = bundle.get("delta_rows") or {}
     prev_label = str(delta.get("prev_label") or "")
     curr_label = str(delta.get("curr_label") or "")
@@ -11152,6 +11375,7 @@ def _render_analytics_delta_html(bundle: dict[str, Any]) -> str:
     ]
 
     def _table(title: str, rows: list[dict[str, Any]]) -> str:
+        """Вспомогательная функция: table."""
         if not rows:
             return f"<h4>{html.escape(title)}</h4><p><em>Нет изменений</em></p>"
         out = [
@@ -11180,6 +11404,7 @@ def _render_analytics_delta_html(bundle: dict[str, Any]) -> str:
 
 
 def _heatmap_cell_style(rate: float) -> str:
+    """Вспомогательная функция: heatmap cell style."""
     if rate >= 100.0:
         return "background:#01875b;color:#fff;"
     if rate >= 66.0:
@@ -11257,6 +11482,7 @@ _ANALYTICS_WIDE_TABLE_CSS = (
 
 
 def _render_analytics_group_heatmap_html(bundle: dict[str, Any]) -> str:
+    """Сформировать разметку: analytics group heatmap html."""
     groups = bundle.get("group_heatmap") or []
     labels = bundle.get("labels") or []
     if not groups or not labels:
@@ -11294,6 +11520,7 @@ def _render_analytics_quality_html(
     bundle: dict[str, Any],
     defect_meta: dict[str, dict[str, str]] | None,
 ) -> str:
+    """Сформировать разметку: analytics quality html."""
     parts: list[str] = []
     latest = str(bundle.get("latest_label") or "")
     fail_map = bundle.get("fail_no_jira") or {}
@@ -11364,6 +11591,7 @@ def _render_analytics_quality_html(
 
 
 def _render_analytics_failure_text_html(bundle: dict[str, Any]) -> str:
+    """Сформировать разметку: analytics failure text html."""
     parts: list[str] = []
     comments = bundle.get("top_comments") or []
     parts.append("<h4>Топ комментариев при Fail</h4>")
@@ -11416,6 +11644,7 @@ def _render_analytics_failure_text_html(bundle: dict[str, Any]) -> str:
 
 
 def _render_analytics_build_rates_wiki(bundle: dict[str, Any]) -> str:
+    """Сформировать разметку: analytics build rates wiki."""
     metrics = bundle.get("build_metrics") or []
     if not metrics:
         return "_Нет данных_"
@@ -11440,6 +11669,7 @@ def _render_analytics_build_rates_wiki(bundle: dict[str, Any]) -> str:
 
 
 def _render_analytics_delta_wiki(bundle: dict[str, Any]) -> str:
+    """Сформировать разметку: analytics delta wiki."""
     delta = bundle.get("delta_rows") or {}
     if not delta.get("prev_label"):
         return (
@@ -11490,6 +11720,7 @@ def _render_analytics_delta_wiki(bundle: dict[str, Any]) -> str:
 
 
 def _render_analytics_group_heatmap_wiki(bundle: dict[str, Any]) -> str:
+    """Сформировать разметку: analytics group heatmap wiki."""
     groups = bundle.get("group_heatmap") or []
     labels = bundle.get("labels") or []
     if not groups or not labels:
@@ -11505,6 +11736,7 @@ def _render_analytics_group_heatmap_wiki(bundle: dict[str, Any]) -> str:
 
 
 def _render_analytics_quality_wiki(bundle: dict[str, Any]) -> str:
+    """Сформировать разметку: analytics quality wiki."""
     lines: list[str] = []
     latest = str(bundle.get("latest_label") or "")
     fail_list = (bundle.get("fail_no_jira") or {}).get(latest, [])
@@ -11546,6 +11778,7 @@ def _render_analytics_quality_wiki(bundle: dict[str, Any]) -> str:
 
 
 def _render_analytics_failure_text_wiki(bundle: dict[str, Any]) -> str:
+    """Сформировать разметку: analytics failure text wiki."""
     lines: list[str] = ["h4. Топ комментариев при Fail"]
     comments = bundle.get("top_comments") or []
     if comments:
@@ -11601,6 +11834,7 @@ _ANALYTICS_PAGE_CSS = (
 
 
 def _defect_analytics_from_trend(trend: dict[str, Any]) -> dict[str, Any]:
+    """Дефекты: analytics from trend."""
     week_columns = list(trend.get("week_columns") or [])
     defect_matrix = trend.get("defect_matrix") or {}
     keys_ordered = list(trend.get("keys_ordered") or [])
@@ -11637,6 +11871,7 @@ def _defect_analytics_from_trend(trend: dict[str, Any]) -> dict[str, Any]:
 
 
 def _render_trend_scenario_table_html(trend: dict[str, Any]) -> str:
+    """Сформировать разметку: trend scenario table html."""
     week_columns = list(trend.get("week_columns") or [])
     scenario_by_week = trend.get("scenario_by_week") or {}
     metric = trend.get("metric") or "passed"
@@ -11660,6 +11895,7 @@ def _render_trend_scenario_table_html(trend: dict[str, Any]) -> str:
 
 
 def _render_trend_scenario_table_wiki(trend: dict[str, Any]) -> str:
+    """Сформировать разметку: trend scenario table wiki."""
     week_columns = list(trend.get("week_columns") or [])
     scenario_by_week = trend.get("scenario_by_week") or {}
     if not week_columns:
@@ -11683,6 +11919,7 @@ def render_weekly_analytics_html(
     per_week_best: dict[date | None, dict[str, Any]] | None = None,
     extended_bundle: dict[str, Any] | None = None,
 ) -> str:
+    """Сформировать HTML/wiki: weekly analytics html."""
     page_title = (os.getenv("ZEPHYR_CONFLUENCE_WEEKLY_ANALYTICS_TITLE") or "Zephyr Weekly Analytics").strip()
     bundle = extended_bundle or _build_extended_analytics_bundle(
         rolling_matrix=rolling_matrix,
@@ -11767,6 +12004,7 @@ def render_weekly_analytics_html(
             r_blocked,
             r_counts,
             r_defect_keys,
+# --- Daily HTML/wiki, Chart и Zephyr macro ---
             r_cycle_keys,
             r_defect_analytics,
         ) = rolling_matrix
@@ -11775,6 +12013,7 @@ def render_weekly_analytics_html(
                 r_labels,
                 r_rows,
                 r_ne,
+# --- Daily HTML/wiki, Chart и Zephyr macro ---
                 r_blocked,
                 column_status_counts=r_counts,
                 defect_keys=r_defect_keys,
@@ -11829,6 +12068,7 @@ def render_weekly_analytics_wiki(
     per_week_best: dict[date | None, dict[str, Any]] | None = None,
     extended_bundle: dict[str, Any] | None = None,
 ) -> str:
+    """Сформировать HTML/wiki: weekly analytics wiki."""
     page_title = (os.getenv("ZEPHYR_CONFLUENCE_WEEKLY_ANALYTICS_TITLE") or "Zephyr Weekly Analytics").strip()
     bundle = extended_bundle or _build_extended_analytics_bundle(
         rolling_matrix=rolling_matrix,
@@ -11975,6 +12215,7 @@ def write_weekly_analytics_reports(
     case_steps_rows: list[list[str]] | None = None,
     build_log_dir: str = "",
 ) -> list[str]:
+    """Записать отчёты: weekly analytics reports."""
     os.makedirs(output_dir, exist_ok=True)
     extended_bundle = _build_extended_analytics_bundle(
         rolling_matrix=rolling_matrix,
@@ -12016,7 +12257,7 @@ def write_weekly_analytics_reports(
 
 
 def _daily_sanitize_cycle_title(title: str) -> str:
-    """Remove cloned markers from Zephyr cycle titles for daily readable output."""
+    """Daily-отчёт: sanitize cycle title."""
     t = str(title or "").strip()
     if not t:
         return ""
@@ -12026,16 +12267,19 @@ def _daily_sanitize_cycle_title(title: str) -> str:
 
 
 def _daily_strip_cycle_title_suffix(title: str) -> str:
+    """Daily-отчёт: strip cycle title suffix."""
     return _daily_sanitize_cycle_title(title)
 
 
 def _daily_progress_row_for_display(row: dict[str, Any]) -> dict[str, Any]:
+    """Daily-отчёт: progress row for display."""
     out = dict(row)
     out["cycle_title"] = _daily_sanitize_cycle_title(str(out.get("cycle_title") or ""))
     return out
 
 
 def _daily_display_cycle_index(cycle: dict[str, Any]) -> str | None:
+    """Daily-отчёт: display cycle index."""
     idx = _extract_cycle_index(cycle)
     if idx and re.match(r"^\d+\.\d+$", idx):
         return f"3.{idx}"
@@ -12043,6 +12287,7 @@ def _daily_display_cycle_index(cycle: dict[str, Any]) -> str | None:
 
 
 def _daily_cycle_anchor_id(display_index: str | None, cycle: dict[str, Any]) -> str:
+    """Daily-отчёт: cycle anchor id."""
     if display_index:
         return "cycle-" + display_index.replace(".", "-")
     slug = slugify(
@@ -12052,6 +12297,7 @@ def _daily_cycle_anchor_id(display_index: str | None, cycle: dict[str, Any]) -> 
 
 
 def _daily_cycle_heading_parts(cycle: dict[str, Any]) -> tuple[str, str]:
+    """Daily-отчёт: cycle heading parts."""
     display_idx = _daily_display_cycle_index(cycle)
     anchor = _daily_cycle_anchor_id(display_idx, cycle)
     heading = _daily_toc_child_label(cycle)
@@ -12059,10 +12305,12 @@ def _daily_cycle_heading_parts(cycle: dict[str, Any]) -> tuple[str, str]:
 
 
 def _daily_wiki_anchor_name(html_anchor_id: str) -> str:
+    """Daily-отчёт: wiki anchor name."""
     return html_anchor_id.replace("-", "_")
 
 
 def _daily_cycle_to_label_row(cycle: dict[str, Any]) -> dict[str, Any]:
+    """Daily-отчёт: cycle to label row."""
     cycle_title = str(cycle.get("cycle_name") or cycle.get("cycle_key") or cycle.get("cycle_id") or "")
     return {
         "cycle_title": _daily_sanitize_cycle_title(cycle_title),
@@ -12072,6 +12320,7 @@ def _daily_cycle_to_label_row(cycle: dict[str, Any]) -> dict[str, Any]:
 
 
 def _daily_toc_group_sort_key(gid: str) -> tuple[int, int | str]:
+    """Daily-отчёт: toc group sort key."""
     if gid == "_other":
         return (2, 0)
     if gid.isdigit():
@@ -12082,10 +12331,7 @@ def _daily_toc_group_sort_key(gid: str) -> tuple[int, int | str]:
 def _daily_toc_groups_from_sorted_cycles(
     sorted_cycles: list[dict[str, Any]],
 ) -> list[tuple[str, str, list[dict[str, Any]]]]:
-    """
-    Group cycles by major index (first digit of X.Y). Returns
-    (group_id, group_heading_plain, cycles) sorted like conclusion groups.
-    """
+    """Daily-отчёт: toc groups from sorted cycles."""
     groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
     order: list[str] = []
     for cycle in sorted_cycles:
@@ -12112,6 +12358,7 @@ def _daily_toc_groups_from_sorted_cycles(
 
 
 def _daily_toc_child_label(cycle: dict[str, Any]) -> str:
+    """Daily-отчёт: toc child label."""
     idx = _extract_cycle_index(cycle)
     raw_title = cycle.get("cycle_name") or cycle.get("cycle_key") or cycle.get("cycle_id") or ""
     stripped = _daily_sanitize_cycle_title(str(raw_title))
@@ -12126,6 +12373,7 @@ def _daily_toc_child_label(cycle: dict[str, Any]) -> str:
 
 
 def _daily_render_html_toc(sorted_cycles: list[dict[str, Any]]) -> str:
+    """Daily-отчёт: render html toc."""
     groups = _daily_toc_groups_from_sorted_cycles(sorted_cycles)
     scenarios_anchor = "#scenarios"
     parts: list[str] = [
@@ -12149,6 +12397,7 @@ def _daily_render_html_toc(sorted_cycles: list[dict[str, Any]]) -> str:
 
 
 def _daily_aggregate_case_status_counts(cycles: dict[str, Any]) -> dict[str, int]:
+    """Daily-отчёт: aggregate case status counts."""
     counts: defaultdict[str, int] = defaultdict(int)
     for cycle in cycles.values():
         for case in cycle.get("cases", {}).values():
@@ -12157,10 +12406,12 @@ def _daily_aggregate_case_status_counts(cycles: dict[str, Any]) -> dict[str, int
 
 
 def _daily_aggregate_case_status_counts_for_cycle(cycle: dict[str, Any]) -> dict[str, int]:
+    """Daily-отчёт: aggregate case status counts for cycle."""
     return _daily_aggregate_case_status_counts({"_": cycle})
 
 
 def _daily_global_passed_total(cycles: dict[str, Any]) -> tuple[int, int]:
+    """Daily-отчёт: global passed total."""
     total_y = 0
     total_x = 0
     for cycle in cycles.values():
@@ -12172,6 +12423,7 @@ def _daily_global_passed_total(cycles: dict[str, Any]) -> tuple[int, int]:
 
 
 def _daily_scenario_group_lines(progress_rows: list[dict[str, Any]]) -> list[str]:
+    """Daily-отчёт: scenario group lines."""
     groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for row in progress_rows:
         g = _summary_scenario_group(row)
@@ -12180,6 +12432,7 @@ def _daily_scenario_group_lines(progress_rows: list[dict[str, Any]]) -> list[str
         groups[g].append(row)
 
     def gid_sort(gid: str) -> tuple[int, int | str]:
+        """Вспомогательная функция: gid sort."""
         if gid == "_other":
             return (2, 0)
         if gid.isdigit():
@@ -12203,6 +12456,7 @@ def _daily_status_pie_svg(
     size: int = 220,
     extra_wrap_class: str = "",
 ) -> str:
+    """Daily-отчёт: status pie svg."""
     order: list[tuple[str, str, str]] = [
         ("passed", "#33c24d", "Пройден"),
         ("failed", "#e53935", "Не пройден"),
@@ -12257,6 +12511,7 @@ def _daily_status_pie_svg(
 
 
 def _daily_status_summary_lines(counts: dict[str, int]) -> list[str]:
+    """Daily-отчёт: status summary lines."""
     ordered: list[tuple[str, str]] = [
         ("passed", "Пройден"),
         ("failed", "Не пройден"),
@@ -12278,7 +12533,7 @@ def _daily_status_summary_lines(counts: dict[str, int]) -> list[str]:
 
 
 def _daily_status_chart_html_block(counts: dict[str, int]) -> str:
-    """HTML: data table for Confluence Chart macro (replaces inline SVG pies)."""
+    """Daily-отчёт: status chart html block."""
     ordered: list[tuple[str, str]] = [
         ("passed", "Пройден"),
         ("failed", "Не пройден"),
@@ -12310,7 +12565,7 @@ def _daily_status_chart_html_block(counts: dict[str, int]) -> str:
 
 
 def _daily_status_chart_wiki_block(counts: dict[str, int]) -> str:
-    """Confluence wiki: table + native Chart macro (pie)."""
+    """Daily-отчёт: status chart wiki block."""
     ordered: list[tuple[str, str]] = [
         ("passed", "Пройден"),
         ("failed", "Не пройден"),
@@ -12339,6 +12594,7 @@ def _daily_status_chart_wiki_block(counts: dict[str, int]) -> str:
 def _daily_zephyr_normalize_cycle_value_objects(
     cycle_objects: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
+    """Daily-отчёт: zephyr normalize cycle value objects."""
     normalized: list[dict[str, Any]] = []
     for obj in cycle_objects:
         oid = str(obj.get("id") or "").strip()
@@ -12359,7 +12615,7 @@ def _daily_zephyr_build_conditions_info(
     project_key: str,
     project_display_name: str,
 ) -> dict[str, Any]:
-    """conditionsInfo JSON for Zephyr Reporting TEST_RESULTS_SUMMARY_BY_STATUS (storage)."""
+    """Daily-отчёт: zephyr build conditions info."""
     proj_entry = {
         "id": project_key,
         "name": project_display_name,
@@ -12367,6 +12623,7 @@ def _daily_zephyr_build_conditions_info(
     }
 
     def _exec_between(alias: str = "testResult") -> dict[str, Any]:
+        """Вспомогательная функция: exec between."""
         return {
             "alias": alias,
             "field": "executionDate",
@@ -12374,6 +12631,7 @@ def _daily_zephyr_build_conditions_info(
         }
 
     def _last_result(alias: str) -> dict[str, Any]:
+        """Вспомогательная функция: last result."""
         return {
             "alias": alias,
             "field": "onlyLastTestResult",
@@ -12472,7 +12730,7 @@ def _daily_zephyr_build_conditions_info(
 def _daily_zephyr_test_results_summary_storage_macro(
     cycle_objects: list[dict[str, Any]],
 ) -> str:
-    """Confluence storage XML: Zephyr Reporting macro replacing Chart on publish."""
+    """Daily-отчёт: zephyr test results summary storage macro."""
     normalized = _daily_zephyr_normalize_cycle_value_objects(cycle_objects)
     if not normalized:
         return ""
@@ -12525,7 +12783,7 @@ def _weekly_overall_zephyr_or_chart_wiki(
     cycle_objects: list[dict[str, Any]] | None,
     counts: dict[str, int] | None,
 ) -> str:
-    """Wiki fragment: live Zephyr Reporting macro when test runs are known, else Chart pie."""
+    """Weekly-отчёт: overall zephyr or chart wiki."""
     z = _daily_zephyr_test_results_summary_storage_macro(list(cycle_objects or []))
     if z:
         return z
@@ -12533,7 +12791,7 @@ def _weekly_overall_zephyr_or_chart_wiki(
 
 
 def _daily_status_chart_storage_macro(counts: dict[str, int]) -> str:
-    """Confluence storage XML: Chart macro (pie) + data table for REST publish."""
+    """Daily-отчёт: status chart storage macro."""
     ordered: list[tuple[str, str, str]] = [
         ("passed", "Пройден", "#33c24d"),
         ("failed", "Не пройден", "#e53935"),
@@ -12581,6 +12839,7 @@ def _daily_status_chart_storage_macro(counts: dict[str, int]) -> str:
 
 
 def _daily_status_palette() -> list[tuple[str, tuple[int, int, int]]]:
+    """Daily-отчёт: status palette."""
     return [
         ("passed", (51, 194, 77)),
         ("failed", (229, 57, 53)),
@@ -12591,6 +12850,7 @@ def _daily_status_palette() -> list[tuple[str, tuple[int, int, int]]]:
 
 
 def _write_daily_pie_png(path: str, counts: dict[str, int], *, size: int = 240) -> bool:
+    """Записать: daily pie png."""
     ordered = _daily_status_palette()
     total = sum(counts.get(key, 0) for key, _ in ordered)
     if total <= 0:
@@ -12652,6 +12912,7 @@ def _write_daily_pie_png(path: str, counts: dict[str, int], *, size: int = 240) 
         rows.extend(img[start : start + stride])
 
     def _chunk(tag: bytes, payload: bytes) -> bytes:
+        """Вспомогательная функция: chunk."""
         return (
             len(payload).to_bytes(4, "big")
             + tag
@@ -12682,6 +12943,7 @@ def _write_daily_pie_png(path: str, counts: dict[str, int], *, size: int = 240) 
 
 
 def _load_daily_confluence_execution_macro(template_dir: str | None) -> str:
+    """Загрузить: daily confluence execution macro."""
     env_val = (os.getenv("ZEPHYR_CONFLUENCE_TEST_EXEC_MACRO") or "").strip()
     if env_val:
         return env_val
@@ -12707,6 +12969,7 @@ def _load_daily_confluence_execution_macro(template_dir: str | None) -> str:
 
 
 def _daily_cycle_keys_from_cycles(cycles: dict[str, Any]) -> list[str]:
+    """Daily-отчёт: cycle keys from cycles."""
     keys: list[str] = []
     seen: set[str] = set()
     for cycle in sorted(cycles.values(), key=_cycle_sort_key):
@@ -12721,16 +12984,7 @@ def _daily_cycle_keys_from_cycles(cycles: dict[str, Any]) -> list[str]:
 def _render_daily_confluence_execution_macro(
     template_dir: str | None, folder_name: str, cycles: dict[str, Any]
 ) -> str:
-    """
-    Render optional Zephyr macro text with cycle placeholders.
-
-    Supported placeholders in env/template macro text:
-    - {CYCLE_KEYS_CSV}  -> QA-1,QA-2,QA-3
-    - {CYCLE_KEYS_PIPE} -> QA-1|QA-2|QA-3
-    - {CYCLE_KEYS_JSON} -> ["QA-1","QA-2","QA-3"]
-    - {CYCLE_KEYS_OBJECTS_JSON} -> [{"id":"QA-1"},{"id":"QA-2"}]
-    - {FOLDER_NAME}     -> raw folder name from current report
-    """
+    """Сформировать разметку: daily confluence execution macro."""
     macro = _load_daily_confluence_execution_macro(template_dir)
     if not macro:
         return ""
@@ -12758,6 +13012,7 @@ def render_daily_html_report(
     folder_id: str,
     template_dir: str | None = None,
 ) -> str:
+    """Сформировать HTML/wiki: daily html report."""
     doc_title = _daily_document_title(folder_name)
     preamble = _format_readable_html_preamble(
         template_dir,
@@ -12910,6 +13165,7 @@ def render_daily_html_report(
                     f"<td>{html.escape(case['test_case_name'])}</td>"
                     f"{criterion_cell}"
                     f"<td>{cycle_cell_html}</td>"
+# --- Build-log отчёты по Jira issue ---
                     f"<td>{_status_badge_html(result_value)}</td>"
                     f"{result_col}"
                     f"<td>{_html_comment_cell(case.get('comment', ''))}</td>"
@@ -12919,6 +13175,7 @@ def render_daily_html_report(
         sections.append("</tbody></table>")
     progress_rows_raw = sorted(_build_cycle_progress_rows(cycles), key=_summary_sort_key)
     progress_rows = [_daily_progress_row_for_display(r) for r in progress_rows_raw]
+# --- Build-log отчёты по Jira issue ---
     sections.append("<h2 id='summary'><strong>Сводка по тестовым циклам</strong></h2>")
     sections.append(
         "<table>"
@@ -12995,6 +13252,7 @@ def render_daily_wiki_report(
     folder_id: str,
     template_dir: str | None = None,
 ) -> str:
+    """Сформировать HTML/wiki: daily wiki report."""
     sorted_cycles = sorted(cycles.values(), key=_cycle_sort_key)
     status_counts = _daily_aggregate_case_status_counts(cycles)
     grouped_cycles = _daily_toc_groups_from_sorted_cycles(sorted_cycles)
@@ -13108,6 +13366,7 @@ def render_daily_wiki_report(
     lines.append("h2. 4. Заключение")
     lines.append("")
     lines.append(
+# --- Zephyr API write (test results) ---
         f"*Итоговый score nightly-dev-{_wiki_escape(folder_name)}, {total_x}/{total_y}*"
     )
     if macro_body:
@@ -13118,6 +13377,7 @@ def render_daily_wiki_report(
         for line in status_summary_lines:
             lines.append(f"*{_wiki_escape(line)}*")
     lines.append("")
+# --- Zephyr API write (test results) ---
     for line in scenario_lines:
         lines.append(_wiki_escape(line))
     return "\n".join(lines)
@@ -13130,6 +13390,7 @@ def write_daily_readable_reports(
     *,
     template_dir: str | None = None,
 ) -> list[str]:
+    """Записать отчёты: daily readable reports."""
     os.makedirs(output_dir, exist_ok=True)
     written_paths: list[str] = []
     for (folder_id, folder_name), payload in sorted(report_data.items(), key=lambda item: item[0][1]):
@@ -13171,11 +13432,7 @@ def write_build_log_reports(
     jira_base_url: str,
     jira_auth_headers: dict[str, str] | None,
 ) -> list[str]:
-    """One HTML/wiki file per Jira issue: reproduction lines per build, newest build first.
-
-    Files are always rewritten on each run (even when content is unchanged) so timestamps
-    refresh and Confluence weekly publish receives every HTML path.
-    """
+    """Записать отчёты: build log reports."""
     pages = _gather_jira_issue_build_log_pages(report_data)
     if not pages:
         return []
@@ -13207,7 +13464,7 @@ def write_build_log_reports(
 
 
 def _list_build_log_html_publish_paths(output_dir: str) -> list[str]:
-    """All per-issue build log HTML files on disk (for Confluence bugs publish)."""
+    """Вспомогательная функция: list build log html publish paths."""
     if not os.path.isdir(output_dir):
         return []
     return sorted(
@@ -13218,6 +13475,7 @@ def _list_build_log_html_publish_paths(output_dir: str) -> list[str]:
 
 
 def _list_daily_readable_html_paths(output_dir: str) -> list[str]:
+    """Вспомогательная функция: list daily readable html paths."""
     if not os.path.isdir(output_dir):
         return []
     return sorted(
@@ -13228,6 +13486,7 @@ def _list_daily_readable_html_paths(output_dir: str) -> list[str]:
 
 
 def _list_weekly_readable_html_paths(output_dir: str) -> list[str]:
+    """Вспомогательная функция: list weekly readable html paths."""
     if not os.path.isdir(output_dir):
         return []
     return sorted(
@@ -13244,6 +13503,7 @@ def _merge_confluence_publish_paths(
     list_on_disk,
     union_disk: bool = True,
 ) -> list[str]:
+    """Слить: confluence publish paths."""
     on_disk = list_on_disk(output_dir) if union_disk else []
     merged = sorted({p for p in expected_paths if p} | {p for p in on_disk if p})
     if on_disk and not expected_paths:
@@ -13255,7 +13515,7 @@ def _merge_confluence_publish_paths(
 
 
 def _prune_orphan_daily_html(output_dir: str, keep_paths: Iterable[str]) -> int:
-    """Remove stale daily HTML files not produced in the current run."""
+    """Удалить устаревшее: orphan daily html."""
     if not os.path.isdir(output_dir):
         return 0
     keep_abs = {os.path.normpath(p) for p in keep_paths if p}
@@ -13280,6 +13540,7 @@ def _expected_daily_readable_html_paths(
     output_dir: str,
     report_data: dict[tuple[str, str], dict[str, Any]],
 ) -> list[str]:
+    """Вспомогательная функция: expected daily readable html paths."""
     paths: list[str] = []
     for (folder_id, folder_name), _payload in sorted(
         report_data.items(), key=lambda item: item[0][1]
@@ -13296,6 +13557,7 @@ def _expected_weekly_readable_html_paths(
     *,
     per_folder: bool,
 ) -> list[str]:
+    """Вспомогательная функция: expected weekly readable html paths."""
     paths: list[str] = []
     for week_start, *_rest in _weekly_cycle_matrix_data_all(report_data):
         week_label = week_start.isoformat() if week_start else "unknown_week"
@@ -13316,6 +13578,7 @@ def _expected_weekly_readable_html_paths(
 
 
 def print_readable_report(weekly: dict[date, Counter[str]]) -> None:
+    """Вспомогательная функция: print readable report."""
     if not weekly:
         print("No executions found for selected filters.")
         return
@@ -13346,6 +13609,7 @@ def print_readable_report(weekly: dict[date, Counter[str]]) -> None:
 def _apply_regenerate_last_n_days(
     args: argparse.Namespace, n: int, effective_rolling_days: int
 ) -> int:
+    """Вспомогательная функция: apply regenerate last n days."""
     if args.from_date or args.to_date:
         raise ValueError(
             "Rolling regenerate mode cannot be used together with "
@@ -13376,7 +13640,7 @@ def list_folders_as_json(
     tree_source_body: dict[str, Any],
     root_folder_ids: list[str],
 ) -> str:
-    """Discover the folder tree and return a JSON string (array of folder dicts)."""
+    """Список: folders as json."""
     selected: list[FolderNode] = []
     if args.tree_source_endpoint:
         nodes, _, _ = discover_folders_custom_tree_source(
@@ -13430,20 +13694,7 @@ def post_test_result(
     comment: str | None = None,
     execution_date: str | None = None,
 ) -> dict[str, Any] | None:
-    """POST a new test result for a test-run item.
-
-    Corresponds to: POST rest/tests/1.0/testrun/{test_run_id}/testresults
-    Body fields that the Navio/Zephyr API accepts::
-
-        {
-            "testRunItemId": <item_id>,
-            "testResultStatusId": <status_id>,
-            "comment": "...",          # optional
-            "executionDate": "...",    # optional ISO-8601
-        }
-
-    Returns the parsed response body or None when the server returns no body.
-    """
+    """POST в Zephyr API: test result."""
     endpoint = f"rest/tests/1.0/testrun/{test_run_id}/testresults"
     body: dict[str, Any] = {
         "testRunItemId": item_id,
@@ -13465,11 +13716,7 @@ def put_test_result(
     comment: str | None = None,
     execution_date: str | None = None,
 ) -> dict[str, Any] | None:
-    """PUT (update) an existing test result by its id.
-
-    Corresponds to: PUT rest/tests/1.0/testrun/{test_run_id}/testresults/{result_id}
-    Returns the parsed response body or None when the server returns no body.
-    """
+    """PUT в Zephyr API: test result."""
     endpoint = f"rest/tests/1.0/testrun/{test_run_id}/testresults/{result_id}"
     body: dict[str, Any] = {"testResultStatusId": status_id}
     if comment is not None:
@@ -13488,12 +13735,7 @@ def put_test_step_result(
     status_id: str,
     comment: str | None = None,
 ) -> dict[str, Any] | None:
-    """PUT (update) a single script-step result within a test result.
-
-    Corresponds to:
-    PUT rest/tests/1.0/testrun/{test_run_id}/testresults/{result_id}/testscriptresults/{step_result_id}
-    Returns the parsed response body or None when the server returns no body.
-    """
+    """PUT в Zephyr API: test step result."""
     endpoint = (
         f"rest/tests/1.0/testrun/{test_run_id}/testresults/{result_id}"
         f"/testscriptresults/{step_result_id}"
@@ -13505,6 +13747,7 @@ def put_test_step_result(
 
 
 def _emit_startup_heartbeat() -> None:
+    """Вспомогательная функция: emit startup heartbeat."""
     print(
         f"zephyr_weekly_report starting pid={os.getpid()} "
         f"at {datetime.now().isoformat(timespec='seconds')}",
@@ -13513,6 +13756,7 @@ def _emit_startup_heartbeat() -> None:
 
 
 def main() -> int:
+    """Вспомогательная функция: main."""
     _load_repo_dotenv_if_absent()
     args = parse_args()
 
@@ -13566,6 +13810,7 @@ def main() -> int:
 
 
 def run_once(args: argparse.Namespace) -> int:
+    """Вспомогательная функция: run once."""
     try:
         effective_rolling_days = args.rolling_days
         if args.regenerate_last_7_days and args.regenerate_last_n_days > 0:
@@ -13960,6 +14205,7 @@ def run_once(args: argparse.Namespace) -> int:
                     )
 
                 def _process_tree_folder(idx: int, folder: FolderNode) -> dict[str, Any]:
+                    """Вспомогательная функция: process tree folder."""
                     folder_started_at = time.perf_counter()
                     per_folder_params = dict(extra_params)
                     per_folder_params["query"] = sanitize_tql_query(
@@ -14711,6 +14957,7 @@ def run_once(args: argparse.Namespace) -> int:
                             "expected paths."
                         )
             if confluence_cfg and publish_confluence_weekly:
+# --- main, orchestration, логирование ---
                 if not args.export_weekly_readable:
                     print(
                         "Confluence weekly publish skipped: --export-weekly-readable not enabled."
@@ -14722,6 +14969,7 @@ def run_once(args: argparse.Namespace) -> int:
                             "Confluence weekly publish skipped: weekly readable format does "
                             "not include html."
                         )
+# --- main, orchestration, логирование ---
                     else:
                         print(
                             "Confluence weekly publish skipped: no weekly HTML pages for "
@@ -14960,26 +15208,31 @@ def run_once(args: argparse.Namespace) -> int:
 
 
 class _TeeIO:
-    """Write to multiple text streams (console + log file)."""
+    """Писать в несколько потоков (консоль и файл лога)."""
 
     def __init__(self, *streams: TextIO) -> None:
+        """Вспомогательная функция: init  ."""
         self._streams = streams
 
     def write(self, data: str) -> int:
+        """Вспомогательная функция: write."""
         for stream in self._streams:
             stream.write(data)
             stream.flush()
         return len(data)
 
     def flush(self) -> None:
+        """Вспомогательная функция: flush."""
         for stream in self._streams:
             stream.flush()
 
     def isatty(self) -> bool:
+        """Вспомогательная функция: isatty."""
         return bool(getattr(self._streams[0], "isatty", lambda: False)())
 
 
 def _log_to_file_enabled() -> bool:
+    """Вспомогательная функция: log to file enabled."""
     raw = os.getenv("ZEPHYR_LOG_TO_FILE")
     if raw is None or not str(raw).strip():
         return True
@@ -14987,6 +15240,7 @@ def _log_to_file_enabled() -> bool:
 
 
 def _log_retention_days() -> int:
+    """Вспомогательная функция: log retention days."""
     raw = (os.getenv("ZEPHYR_LOG_RETENTION_DAYS") or "").strip()
     if not raw.isdigit():
         return 7
@@ -14994,6 +15248,7 @@ def _log_retention_days() -> int:
 
 
 def _prune_old_zephyr_logs(log_dir: Path, retention_days: int) -> None:
+    """Удалить устаревшее: old zephyr logs."""
     if retention_days <= 0 or not log_dir.is_dir():
         return
     cutoff = datetime.now().timestamp() - retention_days * 86400
@@ -15008,6 +15263,7 @@ def _prune_old_zephyr_logs(log_dir: Path, retention_days: int) -> None:
 def _restore_stdio_and_close_log(
     orig_stdout: TextIO, orig_stderr: TextIO, log_f: TextIO
 ) -> None:
+    """Вспомогательная функция: restore stdio and close log."""
     sys.stdout = orig_stdout
     sys.stderr = orig_stderr
     try:
@@ -15018,6 +15274,7 @@ def _restore_stdio_and_close_log(
 
 
 def _maybe_setup_run_log_file() -> None:
+    """Вспомогательная функция: maybe setup run log file."""
     if not _log_to_file_enabled():
         return
     script_dir = Path(__file__).resolve().parent

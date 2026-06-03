@@ -1,4 +1,8 @@
-"""Detect possible duplicate Jira bugs for bugs rollup reports (stdlib + optional embedding cache)."""
+"""Поиск возможных дубликатов Jira-багов для отчёта bugs rollup.
+
+Сравнение по summary, expected/actual, опционально embedding-кэшу; пороги и gate'ы
+задаются через ZEPHYR_BUGS_DUPLICATE_*; ручные split/merge — duplicate_overrides.json.
+"""
 
 from __future__ import annotations
 
@@ -94,6 +98,8 @@ _TRACEABILITY_SPLIT_RE = re.compile(r"[,;\n]+", re.UNICODE)
 
 @dataclass(frozen=True)
 class DuplicateCandidate:
+    """Кандидат в дубликаты для одного ключа Jira: пара, score, метод и confidence."""
+
     other_key: str
     score: float
     method: str  # text_expected_actual | text_summary | embedding_candidate | override
@@ -111,12 +117,14 @@ class DuplicateCandidate:
 
 
 def _parse_bool_env(raw: str | None, default: bool = False) -> bool:
+    """Разобрать булево из строки env."""
     if raw is None or not str(raw).strip():
         return default
     return str(raw).strip().lower() in ("1", "true", "yes", "on")
 
 
 def _parse_float_env(raw: str | None, default: float) -> float:
+    """Разобрать float из строки env."""
     if raw is None or not str(raw).strip():
         return default
     try:
@@ -126,26 +134,32 @@ def _parse_float_env(raw: str | None, default: float) -> float:
 
 
 def bugs_duplicate_detect_enabled() -> bool:
+    """Включён ли поиск дубликатов (ZEPHYR_BUGS_DUPLICATE_DETECT)."""
     return _parse_bool_env(os.getenv("ZEPHYR_BUGS_DUPLICATE_DETECT"), default=True)
 
 
 def bugs_duplicate_text_threshold() -> float:
+    """Порог текстового сходства для пары багов."""
     return _parse_float_env(os.getenv("ZEPHYR_BUGS_DUPLICATE_TEXT_THRESHOLD"), 0.78)
 
 
 def bugs_duplicate_text_soft_expected_threshold() -> float:
+    """Мягкий порог сходства expected_result."""
     return _parse_float_env(os.getenv("ZEPHYR_BUGS_DUPLICATE_TEXT_SOFT_EXPECTED_THRESHOLD"), 0.60)
 
 
 def bugs_duplicate_text_soft_actual_threshold() -> float:
+    """Мягкий порог сходства actual_result."""
     return _parse_float_env(os.getenv("ZEPHYR_BUGS_DUPLICATE_TEXT_SOFT_ACTUAL_THRESHOLD"), 0.74)
 
 
 def bugs_duplicate_embed_threshold() -> float:
+    """Порог cosine similarity для embedding-кандидатов."""
     return _parse_float_env(os.getenv("ZEPHYR_BUGS_DUPLICATE_EMBED_THRESHOLD"), 0.85)
 
 
 def bugs_duplicate_embeddings_enabled() -> bool:
+    """Включить учёт embedding-кэша (ZEPHYR_BUGS_DUPLICATE_EMBEDDINGS)."""
     return _parse_bool_env(os.getenv("ZEPHYR_BUGS_DUPLICATE_EMBEDDINGS"), default=False)
 
 
@@ -227,7 +241,7 @@ def _description_to_text(description: Any) -> str:
 
 
 def _strip_jira_wiki_markup(text: str) -> str:
-    """Remove Jira wiki markers (*bold*, {*}, [links]) from table cell text."""
+    """Убрать разметку Jira wiki (*жирный*, ссылки) из текста ячейки таблицы."""
     s = str(text or "")
     s = _JIRA_WIKI_LINK_RE.sub(
         lambda m: (m.group(1) or m.group(2) or "").strip(),
@@ -263,7 +277,7 @@ def _strip_wiki_cell(value: str) -> str:
 
 
 def parse_traceability_scenario_names(text: str) -> list[str]:
-    """Extract unique scenario names from a Jira Traceability cell (wiki links + plain text)."""
+    """Извлечь уникальные имена сценариев из ячейки Traceability (wiki-ссылки и текст)."""
     raw = str(text or "").strip()
     if not raw:
         return []
@@ -295,7 +309,7 @@ def parse_traceability_scenario_names(text: str) -> list[str]:
 
 
 def parse_jira_description_fields(description: Any) -> dict[str, str]:
-    """Extract Expected/Actual, Preconditions, Traceability from Jira description table."""
+    """Извлечь Expected/Actual, Preconditions, Traceability из описания Jira (таблица/wiki)."""
     text = _description_to_text(description).replace("\r\n", "\n").replace("\r", "\n")
     out: dict[str, str] = {
         "expected_result": "",
@@ -411,7 +425,7 @@ def _tokenize_summary(text: str) -> set[str]:
 
 
 def text_similarity(text_a: str, text_b: str) -> float:
-    """Jaccard on tokens, max with SequenceMatcher ratio on normalized strings."""
+    """Сходство текстов: max(Jaccard по токенам, SequenceMatcher по нормализованным строкам)."""
     tokens_a = _tokenize_summary(text_a)
     tokens_b = _tokenize_summary(text_b)
     jaccard = 0.0
@@ -458,7 +472,7 @@ def _pair_key(a: str, b: str) -> frozenset[str]:
 
 
 def _load_overrides_from_dict(data: dict[str, Any] | None) -> tuple[set[frozenset[str]], dict[str, str]]:
-    """Return (split_pairs, merge_best_other_by_key)."""
+    """Вернуть (пары split, карта merge: ключ → лучший другой ключ)."""
     split_pairs: set[frozenset[str]] = set()
     merge_map: dict[str, str] = {}
     if not data:
@@ -559,7 +573,7 @@ def _scenario_gate_status(
     scenarios_a: frozenset[str],
     scenarios_b: frozenset[str],
 ) -> tuple[bool, bool, bool]:
-    """Return (match, conflict, unknown) for scenario gate."""
+    """Статус scenario gate: (совпадение, конфликт, оба набора пусты)."""
     shared = scenarios_a & scenarios_b
     scenario_match = bool(shared)
     scenario_conflict = bool(scenarios_a and scenarios_b and not shared)
@@ -572,7 +586,7 @@ def _pair_text_scores(
     key_b: str,
     meta: dict[str, dict[str, str]],
 ) -> tuple[float, str, float | None, float | None]:
-    """Return (pair_score, method, expected_sim, actual_sim)."""
+    """Текстовые score пары: (итог, method, expected_sim, actual_sim)."""
     exp_a = _expected_for_key(key_a, meta)
     exp_b = _expected_for_key(key_b, meta)
     act_a = _actual_for_key(key_a, meta)
@@ -624,7 +638,7 @@ def find_duplicate_candidates(
     embed_threshold: float | None = None,
     use_embeddings: bool | None = None,
 ) -> dict[str, DuplicateCandidate | None]:
-    """For each key, return the best duplicate candidate or None."""
+    """Для каждого ключа — лучший кандидат в дубликаты или None (с учётом overrides и gate'ов)."""
     if not bugs_duplicate_detect_enabled():
         return {k: None for k in keys}
 
@@ -790,6 +804,7 @@ def write_duplicate_candidates_debug(
     path: str,
     candidates: dict[str, DuplicateCandidate | None],
 ) -> None:
+    """Записать JSON-отладку кандидатов в дубликаты на диск."""
     payload: dict[str, Any] = {}
     for key, cand in candidates.items():
         if cand is None:
@@ -828,4 +843,5 @@ def write_duplicate_candidates_debug(
 
 
 def resolve_paths_for_rollup_dir(rollup_dir: str) -> tuple[str, str]:
+    """Пути к embedding-кэшу и duplicate_overrides для каталога rollup."""
     return _default_cache_path(rollup_dir), _default_overrides_path(rollup_dir)

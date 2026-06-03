@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Publish existing HTML under reports_local/ to Confluence sandbox (no Zephyr fetch)."""
+"""Публикация готового HTML из reports_local/ в Confluence (без запросов к Zephyr)."""
 
 from __future__ import annotations
 
@@ -29,7 +29,7 @@ def _publish_paths_one_by_one(
     paths: list[str],
     publish_fn,
 ) -> int:
-    """Publish each HTML separately so one Confluence 5xx does not abort the batch."""
+    """Публиковать каждый HTML отдельно: ошибка 5xx на одном файле не прерывает пакет."""
     exit_code = 0
     print(f"{label} ({len(paths)} file(s)):")
     for path in paths:

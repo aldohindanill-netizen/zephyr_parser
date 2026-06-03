@@ -1,4 +1,7 @@
-"""Generate reports/pipeline_health.html for on-call QA monitoring."""
+"""HTML-дашборд pipeline health (`reports/pipeline_health.html`) для on-call QA.
+
+Анализирует audit.jsonl, lock-файлы, логи zephyr/embeddings; пороги — через ZEPHYR_* env.
+"""
 
 from __future__ import annotations
 
@@ -22,6 +25,7 @@ _STALE_LOCK_HINT = (
 
 
 def _pipeline_version() -> str:
+    """Вспомогательная функция: pipeline version."""
     path = _REPO_ROOT / "PIPELINE_VERSION"
     try:
         return path.read_text(encoding="utf-8").strip() or "unknown"
@@ -30,6 +34,7 @@ def _pipeline_version() -> str:
 
 
 def _reports_dir() -> Path:
+    """Вспомогательная функция: reports dir."""
     raw = (os.getenv("ZEPHYR_DAILY_READABLE_DIR") or "reports/daily_readable").strip()
     health_dir = (os.getenv("ZEPHYR_HEALTH_REPORT_DIR") or "").strip()
     if health_dir:
@@ -44,6 +49,7 @@ def _reports_dir() -> Path:
 
 
 def health_html_path() -> Path:
+    """Вспомогательная функция: health html path."""
     explicit = (os.getenv("ZEPHYR_PIPELINE_HEALTH_HTML") or "").strip()
     if explicit:
         path = Path(explicit)
@@ -54,6 +60,7 @@ def health_html_path() -> Path:
 
 
 def run_lock_path() -> Path:
+    """Вспомогательная функция: run lock path."""
     raw = (os.getenv("ZEPHYR_RUN_LOCK_FILE") or "reports/.zephyr_weekly_report.lock").strip()
     path = Path(raw)
     if not path.is_absolute():
@@ -62,10 +69,12 @@ def run_lock_path() -> Path:
 
 
 def scheduled_lock_path() -> Path:
+    """Вспомогательная функция: scheduled lock path."""
     return _REPO_ROOT / "reports" / ".zephyr_scheduled.lock"
 
 
 def _env_float(name: str, default: float, *, minimum: float = 0.25) -> float:
+    """Вспомогательная функция: env float."""
     raw = (os.getenv(name) or "").strip()
     if not raw:
         return default
@@ -77,6 +86,7 @@ def _env_float(name: str, default: float, *, minimum: float = 0.25) -> float:
 
 
 def embeddings_overdue_hours() -> float:
+    """Вспомогательная функция: embeddings overdue hours."""
     return _env_float(
         "ZEPHYR_HEALTH_EMBEDDINGS_OVERDUE_HOURS",
         _DEFAULT_EMBEDDINGS_OVERDUE_HOURS,
@@ -85,6 +95,7 @@ def embeddings_overdue_hours() -> float:
 
 
 def embeddings_interrupted_hours() -> float:
+    """Вспомогательная функция: embeddings interrupted hours."""
     return _env_float(
         "ZEPHYR_HEALTH_EMBEDDINGS_INTERRUPTED_HOURS",
         _DEFAULT_EMBEDDINGS_INTERRUPTED_HOURS,
@@ -93,6 +104,7 @@ def embeddings_interrupted_hours() -> float:
 
 
 def embeddings_audit_scan_lines() -> int:
+    """Вспомогательная функция: embeddings audit scan lines."""
     raw = (os.getenv("ZEPHYR_HEALTH_EMBEDDINGS_AUDIT_SCAN_LINES") or "").strip()
     if raw.isdigit():
         return max(500, int(raw))
@@ -100,6 +112,7 @@ def embeddings_audit_scan_lines() -> int:
 
 
 def lock_stale_minutes() -> float:
+    """Вспомогательная функция: lock stale minutes."""
     raw = (os.getenv("ZEPHYR_HEALTH_LOCK_STALE_MINUTES") or "").strip()
     if raw:
         try:
@@ -119,6 +132,7 @@ def lock_stale_minutes() -> float:
 
 
 def _log_dir() -> Path:
+    """Вспомогательная функция: log dir."""
     raw = (os.getenv("ZEPHYR_LOG_DIR") or "logs").strip() or "logs"
     path = Path(raw)
     if not path.is_absolute():
@@ -127,10 +141,12 @@ def _log_dir() -> Path:
 
 
 def _reports_logs_dir() -> Path:
+    """Вспомогательная функция: reports logs dir."""
     return _reports_dir() / "logs"
 
 
 def _audit_log_path() -> Path:
+    """Вспомогательная функция: audit log path."""
     raw = (os.getenv("ZEPHYR_AUDIT_LOG") or "reports/audit/audit.jsonl").strip()
     path = Path(raw)
     if not path.is_absolute():
@@ -139,6 +155,7 @@ def _audit_log_path() -> Path:
 
 
 def _read_audit_tail(limit: int = _AUDIT_SCAN_LINES) -> list[dict[str, Any]]:
+    """Вспомогательная функция: read audit tail."""
     path = _audit_log_path()
     if not path.is_file():
         return []
@@ -160,6 +177,7 @@ def _read_audit_tail(limit: int = _AUDIT_SCAN_LINES) -> list[dict[str, Any]]:
 
 
 def _parse_utc_timestamp(ts: str) -> datetime | None:
+    """Разобрать: utc timestamp."""
     try:
         return datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC)
     except ValueError:
@@ -170,6 +188,7 @@ def _pair_start_finish(
     start: dict[str, Any] | None,
     finish: dict[str, Any] | None,
 ) -> dict[str, Any] | None:
+    """Вспомогательная функция: pair start finish."""
     if not start and not finish:
         return None
     if start and finish:
@@ -181,6 +200,7 @@ def _pair_start_finish(
 
 
 def _last_run_from_audit(records: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Вспомогательная функция: last run from audit."""
     start: dict[str, Any] | None = None
     finish: dict[str, Any] | None = None
     for rec in records:
@@ -193,6 +213,7 @@ def _last_run_from_audit(records: list[dict[str, Any]]) -> dict[str, Any] | None
 
 
 def _last_embeddings_from_audit_scan() -> dict[str, Any] | None:
+    """Вспомогательная функция: last embeddings from audit scan."""
     ops = {"embeddings_start", "embeddings_finish"}
     max_lines = embeddings_audit_scan_lines()
     finish: dict[str, Any] | None = None
@@ -227,6 +248,7 @@ def _last_embeddings_from_audit_scan() -> dict[str, Any] | None:
 
 
 def _last_embeddings_from_audit(records: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Вспомогательная функция: last embeddings from audit."""
     finish: dict[str, Any] | None = None
     start: dict[str, Any] | None = None
     for rec in records:
@@ -239,6 +261,7 @@ def _last_embeddings_from_audit(records: list[dict[str, Any]]) -> dict[str, Any]
 
 
 def _duration_seconds(start_ts: str, finish_ts: str) -> int | None:
+    """Вспомогательная функция: duration seconds."""
     start = _parse_utc_timestamp(start_ts)
     finish = _parse_utc_timestamp(finish_ts)
     if start is None or finish is None:
@@ -247,6 +270,7 @@ def _duration_seconds(start_ts: str, finish_ts: str) -> int | None:
 
 
 def _latest_zephyr_log() -> tuple[str, str] | None:
+    """Вспомогательная функция: latest zephyr log."""
     log_dir = _log_dir()
     if not log_dir.is_dir():
         return None
@@ -259,6 +283,7 @@ def _latest_zephyr_log() -> tuple[str, str] | None:
 
 
 def _latest_embeddings_log() -> tuple[str, str] | None:
+    """Вспомогательная функция: latest embeddings log."""
     log_dir = _reports_logs_dir()
     if not log_dir.is_dir():
         return None
@@ -273,6 +298,7 @@ def _latest_embeddings_log() -> tuple[str, str] | None:
 
 
 def _lock_status_for_path(path: Path, *, stale_minutes: float, label: str) -> tuple[str, str]:
+    """Вспомогательная функция: lock status for path."""
     if not path.exists():
         return "free", f"{label}: lock file absent"
     try:
@@ -291,6 +317,7 @@ def _lock_status_for_path(path: Path, *, stale_minutes: float, label: str) -> tu
 
 
 def _lock_status() -> tuple[str, str, str]:
+    """Вспомогательная функция: lock status."""
     stale_min = lock_stale_minutes()
     py_state, py_detail = _lock_status_for_path(
         run_lock_path(), stale_minutes=stale_min, label="Python"
@@ -308,6 +335,7 @@ def _lock_status() -> tuple[str, str, str]:
 
 
 def _hours_since_utc(ts: str) -> float | None:
+    """Вспомогательная функция: hours since utc."""
     parsed = _parse_utc_timestamp(ts)
     if parsed is None:
         return None
@@ -318,7 +346,7 @@ def _embeddings_summary(
     emb: dict[str, Any] | None,
     log_info: tuple[str, str] | None,
 ) -> tuple[str, str, str]:
-    """Return (status_label, detail_text, css_class)."""
+    """См. реализацию: Return (status_label, detail_text, css_class)."""
     finish_rec = (emb or {}).get("finish") or {}
     start_rec = (emb or {}).get("start") or {}
 
@@ -357,6 +385,7 @@ def _embeddings_summary(
 
 
 def _is_warn_record(rec: dict[str, Any]) -> bool:
+    """Вспомогательная функция: is warn record."""
     if _is_error_record(rec):
         return False
     op = rec.get("operation")
@@ -366,6 +395,7 @@ def _is_warn_record(rec: dict[str, Any]) -> bool:
 
 
 def _is_error_record(rec: dict[str, Any]) -> bool:
+    """Вспомогательная функция: is error record."""
     op = rec.get("operation")
     if op in ("run_finish", "embeddings_finish"):
         code = rec.get("exit_code")
@@ -381,6 +411,7 @@ def _is_error_record(rec: dict[str, Any]) -> bool:
 
 
 def _audit_row_class(rec: dict[str, Any]) -> str:
+    """Вспомогательная функция: audit row class."""
     if _is_error_record(rec):
         return "err"
     if _is_warn_record(rec):
@@ -389,7 +420,7 @@ def _audit_row_class(rec: dict[str, Any]) -> str:
 
 
 def write_pipeline_health_html(*, exit_code: int | None = None) -> Path:
-    """Write pipeline health HTML; returns output path."""
+    """См. реализацию: Write pipeline health HTML; returns output path."""
     out_path = health_html_path()
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -523,6 +554,7 @@ def write_pipeline_health_html(*, exit_code: int | None = None) -> Path:
 
 
 def main() -> int:
+    """Вспомогательная функция: main."""
     import sys
 
     code: int | None = None

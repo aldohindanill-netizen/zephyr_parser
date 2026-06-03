@@ -25,6 +25,7 @@ def _sample_case_step_row(
     task_links: str = "CSD-100",
     step_index: str = "1",
 ) -> list[str]:
+    """Вспомогательная функция: sample case step row."""
     row = [""] * 25
     row[0] = "fid"
     row[1] = "folder A"
@@ -43,7 +44,9 @@ def _sample_case_step_row(
 
 
 class DailyAggregateTests(unittest.TestCase):
+    """Класс «DailyAggregateTests»."""
     def test_aggregate_populates_status_comment_tasks(self) -> None:
+        """Вспомогательная функция: test aggregate populates status comment tasks."""
         rows = [_sample_case_step_row(test_case_key="TC-1")]
         cycles_cases = [
             ["fid", "folder A", "run-1", "QA-CYC", "Cycle 1", "", "", "", "", "", "Blocked"],
@@ -55,6 +58,7 @@ class DailyAggregateTests(unittest.TestCase):
         self.assertIn("CSD-100", case["tasks"])
 
     def test_aggregate_accepts_test_case_id_without_key(self) -> None:
+        """Вспомогательная функция: test aggregate accepts test case id without key."""
         rows = [_sample_case_step_row(test_case_key="", test_case_id="555")]
         reports = aggregate_readable_daily_reports_from_steps(rows, [])
         cases = reports[("fid", "folder A")]["cycles"]["run-1"]["cases"]
@@ -62,6 +66,7 @@ class DailyAggregateTests(unittest.TestCase):
         self.assertEqual("step note", cases["555"]["comment"])
 
     def test_comment_uses_merged_log_parts_when_step_comment_empty(self) -> None:
+        """Вспомогательная функция: test comment uses merged log parts when step comment empty."""
         row = _sample_case_step_row(test_case_key="TC-2", step_comment="")
         row[14] = ""
         reports = aggregate_readable_daily_reports_from_steps([row], [])
@@ -72,6 +77,7 @@ class DailyAggregateTests(unittest.TestCase):
         self.assertEqual("from result", case["comment"])
 
     def test_legacy_has_empty_comment_and_tasks(self) -> None:
+        """Вспомогательная функция: test legacy has empty comment and tasks."""
         cycles_cases = [
             [
                 "fid",

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Quick calibration check for duplicate pairs (Expected/Actual + summary fallback)."""
+"""Быстрая проверка калибровки дубликатов (Expected/Actual + fallback по summary)."""
 
 from __future__ import annotations
 
