@@ -53,7 +53,7 @@ _VATS_PREFIX_RE = re.compile(
 _TOKEN_RE = re.compile(r"\w+", re.UNICODE)
 
 _WIKI_TABLE_ROW_RE = re.compile(
-    r"^\s*\|{1,2}\s*(?P<label>[^|]+?)\s*\|{1,2}\s*(?P<value>[^|]*)\s*\|{0,2}\s*$",
+    r"^\s*\|{1,2}\s*(?P<label>[^|]+?)\s*\|{1,2}(?P<value>.+?)\|{0,2}\s*$",
     re.UNICODE,
 )
 _JIRA_WIKI_LINK_RE = re.compile(r"\[([^\]|]+)\|[^\]]+\]|\[([^\]]+)\]")
@@ -78,7 +78,18 @@ _FIELD_LABEL_PATTERNS: dict[str, tuple[str, ...]] = {
         r"^предусловия\s*$",
         r"^precondition\s*$",
     ),
+    "traceability": (
+        r"^traceability\s*$",
+        r"^трассируемость\s*$",
+        r"^трассировка\s*$",
+        r"^tests?\s*id\b.*$",
+        r"^test\s*case\s*id\b.*$",
+        r"^linked\s*tests?\b.*$",
+        r"^привязанн(?:ые|ый)\s*тест(?:ы|(?:\s*кейс)?)?\b.*$",
+    ),
 }
+
+_TRACEABILITY_SPLIT_RE = re.compile(r"[,;\n]+", re.UNICODE)
 
 
 @dataclass(frozen=True)
@@ -93,6 +104,9 @@ class DuplicateCandidate:
     domain_match: bool | None = None
     domain_conflict: bool | None = None
     domain_tags: tuple[str, ...] = ()
+    scenario_match: bool | None = None
+    scenario_conflict: bool | None = None
+    scenario_tags: tuple[str, ...] = ()
     reasons: tuple[str, ...] = ()
 
 
@@ -146,6 +160,10 @@ def bugs_duplicate_summary_text_allows_high() -> bool:
 
 def bugs_duplicate_domain_gate_enabled() -> bool:
     return _parse_bool_env(os.getenv("ZEPHYR_BUGS_DUPLICATE_DOMAIN_GATE"), default=True)
+
+
+def bugs_duplicate_scenario_gate_enabled() -> bool:
+    return _parse_bool_env(os.getenv("ZEPHYR_BUGS_DUPLICATE_SCENARIO_GATE"), default=True)
 
 
 _DOMAIN_PATTERNS: dict[str, tuple[str, ...]] = {
@@ -244,13 +262,46 @@ def _strip_wiki_cell(value: str) -> str:
     return text.strip()
 
 
+def parse_traceability_scenario_names(text: str) -> list[str]:
+    """Extract unique scenario names from a Jira Traceability cell (wiki links + plain text)."""
+    raw = str(text or "").strip()
+    if not raw:
+        return []
+
+    names: list[str] = []
+    seen_lower: set[str] = set()
+
+    def _add(candidate: str) -> None:
+        clean = _strip_wiki_cell(candidate)
+        if not clean:
+            return
+        key = clean.lower()
+        if key in seen_lower:
+            return
+        seen_lower.add(key)
+        names.append(clean)
+
+    for match in _JIRA_WIKI_LINK_RE.finditer(raw):
+        link_text = (match.group(1) or match.group(2) or "").strip()
+        if link_text:
+            _add(link_text)
+
+    remainder = _JIRA_WIKI_LINK_RE.sub("", raw)
+    remainder = re.sub(r"\*+", "", remainder)
+    for part in _TRACEABILITY_SPLIT_RE.split(remainder):
+        _add(part)
+
+    return names
+
+
 def parse_jira_description_fields(description: Any) -> dict[str, str]:
-    """Extract Expected/Actual (and optional Preconditions) from Jira description table."""
+    """Extract Expected/Actual, Preconditions, Traceability from Jira description table."""
     text = _description_to_text(description).replace("\r\n", "\n").replace("\r", "\n")
     out: dict[str, str] = {
         "expected_result": "",
         "actual_result": "",
         "preconditions": "",
+        "traceability": "",
     }
     if not text.strip():
         return out
@@ -489,6 +540,33 @@ def _actual_for_key(key: str, meta: dict[str, dict[str, str]]) -> str:
     return str(_meta_entry(key, meta).get("actual_result") or "").strip()
 
 
+def _scenarios_set_for_key(
+    key: str,
+    scenarios_by_key: dict[str, list[str]] | None,
+) -> frozenset[str]:
+    if not scenarios_by_key:
+        return frozenset()
+    names = scenarios_by_key.get(key) or scenarios_by_key.get(key.upper()) or []
+    out: set[str] = set()
+    for name in names:
+        clean = str(name or "").strip().lower()
+        if clean:
+            out.add(clean)
+    return frozenset(out)
+
+
+def _scenario_gate_status(
+    scenarios_a: frozenset[str],
+    scenarios_b: frozenset[str],
+) -> tuple[bool, bool, bool]:
+    """Return (match, conflict, unknown) for scenario gate."""
+    shared = scenarios_a & scenarios_b
+    scenario_match = bool(shared)
+    scenario_conflict = bool(scenarios_a and scenarios_b and not shared)
+    scenario_unknown = not scenarios_a and not scenarios_b
+    return scenario_match, scenario_conflict, scenario_unknown
+
+
 def _pair_text_scores(
     key_a: str,
     key_b: str,
@@ -541,6 +619,7 @@ def find_duplicate_candidates(
     *,
     embedding_cache: dict[str, Any] | None = None,
     overrides: dict[str, Any] | None = None,
+    scenarios_by_key: dict[str, list[str]] | None = None,
     text_threshold: float | None = None,
     embed_threshold: float | None = None,
     use_embeddings: bool | None = None,
@@ -561,6 +640,7 @@ def find_duplicate_candidates(
 
     allow_summary_high = bugs_duplicate_summary_text_allows_high()
     domain_gate = bugs_duplicate_domain_gate_enabled()
+    scenario_gate = bugs_duplicate_scenario_gate_enabled()
     clean_keys = [str(k).strip() for k in keys if str(k).strip()]
     split_pairs, merge_map = _load_overrides_from_dict(overrides)
 
@@ -587,6 +667,15 @@ def find_duplicate_candidates(
             if key_a == key_b:
                 continue
             if _is_split(key_a, key_b, split_pairs):
+                continue
+
+            scenarios_a = _scenarios_set_for_key(key_a, scenarios_by_key)
+            scenarios_b = _scenarios_set_for_key(key_b, scenarios_by_key)
+            scenario_match, scenario_conflict, _scenario_unknown = _scenario_gate_status(
+                scenarios_a, scenarios_b
+            )
+            shared_scenarios = scenarios_a & scenarios_b
+            if scenario_gate and scenario_conflict:
                 continue
 
             text_score, text_method, exp_sim, act_sim = _pair_text_scores(key_a, key_b, meta)
@@ -634,6 +723,9 @@ def find_duplicate_candidates(
                     domain_match=domain_match,
                     domain_conflict=domain_conflict,
                     domain_tags=tuple(sorted(shared_tags)),
+                    scenario_match=scenario_match or None,
+                    scenario_conflict=scenario_conflict or None,
+                    scenario_tags=tuple(sorted(shared_scenarios)),
                     reasons=tuple(reasons),
                 )
             elif (
@@ -656,6 +748,9 @@ def find_duplicate_candidates(
                     domain_match=domain_match,
                     domain_conflict=domain_conflict,
                     domain_tags=tuple(sorted(shared_tags)),
+                    scenario_match=scenario_match or None,
+                    scenario_conflict=scenario_conflict or None,
+                    scenario_tags=tuple(sorted(shared_scenarios)),
                     reasons=tuple(reasons),
                 )
             elif (
@@ -675,6 +770,9 @@ def find_duplicate_candidates(
                     domain_match=domain_match,
                     domain_conflict=domain_conflict,
                     domain_tags=tuple(sorted(shared_tags)),
+                    scenario_match=scenario_match or None,
+                    scenario_conflict=scenario_conflict or None,
+                    scenario_tags=tuple(sorted(shared_scenarios)),
                     reasons=tuple(reasons),
                 )
 
@@ -715,6 +813,12 @@ def write_duplicate_candidates_debug(
                 entry["domain_conflict"] = cand.domain_conflict
             if cand.domain_tags:
                 entry["domain_tags"] = list(cand.domain_tags)
+            if cand.scenario_match is not None:
+                entry["scenario_match"] = cand.scenario_match
+            if cand.scenario_conflict is not None:
+                entry["scenario_conflict"] = cand.scenario_conflict
+            if cand.scenario_tags:
+                entry["scenario_tags"] = list(cand.scenario_tags)
             if cand.reasons:
                 entry["reasons"] = list(cand.reasons)
             payload[key] = entry

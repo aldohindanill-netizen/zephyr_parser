@@ -152,6 +152,7 @@
 
 - Каталог rollup: `reports/bugs_rollup/`.
 - Источник: Jira issues типа Bug (фильтр `ZEPHYR_DEFECT_TYPE_FILTER`), поля из description (Expected/Actual в таблице).
+- Колонка **«Сценарии»** в таблицах багов: **группы 1–9** (как строки «Итого:» в weekly-матрице), без перечисления подсценариев `X.Y` и `(cloned)`. Источники: панель Zephyr Scale Traceability (`GET rest/tests/1.0/issuelink`), затем прогоны Zephyr; нераспознанные имена Traceability выводятся как есть. Отключение группировки: `ZEPHYR_BUGS_SCENARIOS_GROUPED=false`.
 - В Confluence публикуется `bugs_index.html` и связанные build-log.
 - Секция **«последние N недель»** — rolling-окно (`ZEPHYR_REGENERATE_LAST_N_DAYS`, `ZEPHYR_BUGS_ROLLUP_LAST_WEEKS`).
 - Секция **«Все заведённые баги»** — `defect_analytics_snapshot.json` (merge каждого прогона; bootstrap из `build_log_reports/` при пустом snapshot). Backfill: `scripts/backfill_bugs_rollup_snapshot.py`.
@@ -159,6 +160,7 @@
 **Колонка «Возможно дубль»**
 
 - **Text similarity** по Expected и Actual: пара считается кандидатом, если `min(expected_sim, actual_sim) >= 0.78` (`ZEPHYR_BUGS_DUPLICATE_TEXT_THRESHOLD`). Похожие только summary без совпадения результатов — не дубль.
+- **Scenario gate** (`ZEPHYR_BUGS_DUPLICATE_SCENARIO_GATE=true`): если у обоих багов заполнена колонка «Сценарии» и пересечения нет — пара отбрасывается; при пустых сценариях у обоих или у одного — правила дублей применяются как раньше. Источник сценариев тот же, что в колонке UI (Traceability + прогоны, группы 1–9).
 - **Embeddings** (обязательно в prod): `ZEPHYR_BUGS_DUPLICATE_EMBEDDINGS=true`, порог **0.85** (`ZEPHYR_BUGS_DUPLICATE_EMBED_THRESHOLD`). Векторы строятся по Expected+Actual, не по summary.
 - **Ручные правила (опционально):** `reports/bugs_rollup/duplicate_overrides.json` — операции `merge` / `split`; в prod по умолчанию не используются (ложные подсказки игнорируются).
 - **Свежесть подсказок:** text — каждые 30 мин (основной пайплайн); semantic (embeddings) — после ежедневного прогона в **13:00** (см. §9).

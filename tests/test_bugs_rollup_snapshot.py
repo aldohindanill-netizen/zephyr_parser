@@ -11,12 +11,17 @@ from zephyr_weekly_report import (
     _append_jira_defect_keys,
     _bootstrap_snapshot_base_if_empty,
     _bootstrap_snapshot_from_disk,
+    _compute_weekly_defect_analytics,
+    _defect_scenario_names_list,
     _display_build_column_labels,
     _empty_defect_analytics,
     _issue_key_from_build_log_filename,
     _load_bugs_rollup_snapshot,
     _merge_defect_analytics,
     _merge_column_labels_ordered,
+    _build_scenario_group_catalog,
+    _defect_scenario_group_names_list,
+    _parse_zephyr_issuelink_test_case_names,
     _refresh_bugs_rollup_all_time_snapshot,
     _save_bugs_rollup_snapshot,
     _sort_build_column_labels_chronologically,
@@ -231,6 +236,144 @@ class BugsRollupSnapshotTests(unittest.TestCase):
             finally:
                 os.environ.pop("ZEPHYR_BUGS_ROLLUP_SNAPSHOT", None)
                 os.environ.pop("ZEPHYR_BUGS_ROLLUP_SNAPSHOT_BOOTSTRAP_BUILD_LOGS", None)
+
+    def test_compute_weekly_defect_analytics_collects_linked_scenarios(self) -> None:
+        day = date(2026, 5, 26)
+        cycles = {
+            "run-1": {
+                "cases": {
+                    "QA-C1": {
+                        "test_case_name": "Остановка перед конусами",
+                        "tasks": "CSD-100",
+                    }
+                }
+            }
+        }
+        analytics = _compute_weekly_defect_analytics(
+            {day: [cycles]},
+            [day],
+            ["nightly-dev-2026.05.26"],
+        )
+        self.assertEqual(
+            analytics["bug_linked_scenarios"]["CSD-100"],
+            ["Остановка перед конусами"],
+        )
+
+    def test_merge_defect_analytics_unions_linked_scenarios(self) -> None:
+        base = _empty_defect_analytics()
+        base["keys_ordered"] = ["CSD-1"]
+        base["bug_linked_scenarios"] = {"CSD-1": ["Сценарий A"]}
+
+        incoming = _empty_defect_analytics()
+        incoming["keys_ordered"] = ["CSD-1"]
+        incoming["bug_linked_scenarios"] = {"CSD-1": ["Сценарий B", "сценарий a"]}
+
+        merged, _labels = _merge_defect_analytics(base, incoming, [], [])
+        self.assertEqual(
+            merged["bug_linked_scenarios"]["CSD-1"],
+            ["Сценарий A", "Сценарий B"],
+        )
+
+    def test_parse_zephyr_issuelink_extracts_test_case_names(self) -> None:
+        payload = {
+            "testCases": [
+                {"testCase": {"key": "QA-T1", "name": "Объезд ремонтных работ"}},
+                {"name": "Остановка перед конусами", "testCaseId": 99},
+            ]
+        }
+        names = _parse_zephyr_issuelink_test_case_names(payload)
+        self.assertEqual(
+            names,
+            ["Объезд ремонтных работ", "Остановка перед конусами"],
+        )
+
+    def test_defect_scenario_names_panel_then_zephyr_without_dup(self) -> None:
+        meta = {
+            "CSD-1": {"traceability_scenarios": "Сценарий A; Сценарий B"},
+        }
+        analytics = _empty_defect_analytics()
+        analytics["bug_linked_scenarios"] = {
+            "CSD-1": ["Сценарий B", "Сценарий из прогона"],
+        }
+        names = _defect_scenario_names_list("CSD-1", meta, analytics)
+        self.assertEqual(
+            names,
+            ["Сценарий A", "Сценарий B", "Сценарий из прогона"],
+        )
+
+    def test_build_scenario_group_catalog(self) -> None:
+        report_data = {
+            ("f1", "folder"): {
+                "cycles": {
+                    "c1": {
+                        "cycle_name": "1.1 Стационарный автомобиль без объезда",
+                        "cycle_key": "QA-C1",
+                    },
+                    "c2": {
+                        "cycle_name": "1.2 Стационарный автомобиль объезд слева",
+                        "cycle_key": "QA-C2",
+                    },
+                    "c3": {
+                        "cycle_name": "4.1 Пешеход из-под препятствия справа 3 секунды",
+                        "cycle_key": "QA-C3",
+                    },
+                }
+            }
+        }
+        titles, aliases = _build_scenario_group_catalog(report_data)
+        self.assertIn("1", titles)
+        self.assertIn("4", titles)
+        self.assertNotEqual(titles["1"], titles["4"])
+        self.assertEqual(
+            aliases["1.2 стационарный автомобиль объезд слева".lower()],
+            "1",
+        )
+
+    def test_defect_scenario_names_collapsed_to_groups(self) -> None:
+        report_data = {
+            ("f1", "folder"): {
+                "cycles": {
+                    "c1": {"cycle_name": "1.1 Alpha sub", "cycle_key": "k1"},
+                    "c2": {"cycle_name": "1.2 Beta sub (cloned)", "cycle_key": "k2"},
+                }
+            }
+        }
+        catalog = _build_scenario_group_catalog(report_data)
+        raw = ["1.2 Beta sub (cloned)", "1.1 Alpha sub"]
+        grouped = _defect_scenario_group_names_list(raw, catalog)
+        self.assertEqual(len(grouped), 1)
+        self.assertEqual(grouped[0], catalog[0]["1"])
+
+    def test_unmapped_traceability_name_preserved(self) -> None:
+        catalog = _build_scenario_group_catalog({})
+        names = _defect_scenario_group_names_list(
+            ["Объезд ремонтных работ слева"],
+            catalog,
+        )
+        self.assertEqual(names, ["Объезд ремонтных работ слева"])
+
+    def test_defect_scenario_names_list_uses_grouping_with_catalog(self) -> None:
+        report_data = {
+            ("f1", "folder"): {
+                "cycles": {
+                    "c1": {"cycle_name": "7.1 Экстренное торможение", "cycle_key": "k1"},
+                }
+            }
+        }
+        catalog = _build_scenario_group_catalog(report_data)
+        meta = {}
+        analytics = _empty_defect_analytics()
+        analytics["bug_linked_scenarios"] = {
+            "CSD-1": ["7.1 Экстренное торможение (cloned)", "7.1 Экстренное торможение"],
+        }
+        names = _defect_scenario_names_list(
+            "CSD-1",
+            meta,
+            analytics,
+            scenario_group_catalog=catalog,
+        )
+        self.assertEqual(len(names), 1)
+        self.assertEqual(names[0], catalog[0]["7"])
 
 
 if __name__ == "__main__":

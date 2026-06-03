@@ -24,6 +24,9 @@ from bug_duplicate_detection import (  # noqa: E402
     write_duplicate_candidates_debug,
 )
 from zephyr_weekly_report import (  # noqa: E402
+    _bugs_rollup_snapshot_path,
+    _defect_scenario_names_list,
+    _enrich_defect_meta_zephyr_traceability,
     _fetch_jira_bug_metadata,
     _jira_bug_metadata_auth_headers,
     _resolve_weekly_jira_metadata_base,
@@ -60,13 +63,37 @@ def main() -> int:
     base_url = _resolve_weekly_jira_metadata_base(
         os.getenv("ZEPHYR_BASE_URL", "https://jira.navio.auto")
     )
+    zephyr_base_url = (os.getenv("ZEPHYR_BASE_URL") or base_url or "").strip()
     token = (os.getenv("ZEPHYR_JIRA_API_TOKEN") or os.getenv("ZEPHYR_API_TOKEN") or "").strip()
     headers = _jira_bug_metadata_auth_headers(
         build_headers("Authorization", "Bearer", token)
     ) or build_headers("Authorization", "Bearer", token)
+    zephyr_headers = build_headers("Authorization", "Bearer", token)
 
     print(f"Fetching Jira metadata for {len(keys)} keys...")
     meta = _fetch_jira_bug_metadata(keys, base_url=base_url, auth_headers=headers)
+    _enrich_defect_meta_zephyr_traceability(
+        meta,
+        keys,
+        zephyr_base_url=zephyr_base_url,
+        zephyr_headers=zephyr_headers,
+    )
+
+    analytics: dict[str, object] = {}
+    snapshot_path = Path(_bugs_rollup_snapshot_path(rollup_dir))
+    if snapshot_path.is_file():
+        try:
+            with snapshot_path.open(encoding="utf-8") as fh:
+                snapshot = json.load(fh)
+            if isinstance(snapshot, dict):
+                analytics = snapshot
+        except (OSError, json.JSONDecodeError):
+            pass
+
+    scenarios_by_key = {
+        k: _defect_scenario_names_list(k, meta, analytics)
+        for k in keys
+    }
 
     filled_exp = sum(1 for k in keys if (meta.get(k, {}).get("expected_result") or "").strip())
     filled_act = sum(1 for k in keys if (meta.get(k, {}).get("actual_result") or "").strip())
@@ -99,6 +126,7 @@ def main() -> int:
         meta,
         embedding_cache=load_embedding_cache(cache_path),
         overrides=load_duplicate_overrides(overrides_path),
+        scenarios_by_key=scenarios_by_key,
     )
     write_duplicate_candidates_debug(
         str(Path(rollup_dir) / "duplicate_candidates.json"),

@@ -5313,6 +5313,152 @@ def _jira_bug_metadata_auth_headers(
     return zephyr_headers
 
 
+_ZEPHYR_ISSUELINK_NAMES_CACHE: dict[str, tuple[str, ...]] = {}
+
+
+def _zephyr_traceability_fetch_enabled() -> bool:
+    return _parse_bool_env(os.getenv("ZEPHYR_BUGS_TRACEABILITY_FETCH", "true"))
+
+
+def _zephyr_issuelink_endpoint() -> str:
+    raw = (
+        os.getenv("ZEPHYR_BUGS_TRACEABILITY_ISSUELINK_ENDPOINT")
+        or "rest/tests/1.0/issuelink"
+    ).strip()
+    return raw.lstrip("/")
+
+
+def _parse_zephyr_issuelink_test_case_names(payload: Any) -> list[str]:
+    """Extract test case display names from Zephyr Scale ``issuelink`` JSON."""
+    names: list[str] = []
+    seen_lower: set[str] = set()
+
+    def _add(raw_name: Any) -> None:
+        clean = _normalize_linked_scenario_name(str(raw_name or "").strip())
+        if not clean:
+            return
+        norm = clean.lower()
+        if norm in seen_lower:
+            return
+        seen_lower.add(norm)
+        names.append(clean)
+
+    def _add_testcase_dict(tc: dict[str, Any]) -> None:
+        for field in ("name", "summary", "testCaseName"):
+            val = tc.get(field)
+            if isinstance(val, str) and val.strip():
+                _add(val)
+                return
+        key_val = str(tc.get("key") or "").strip()
+        if key_val and not re.fullmatch(r"[A-Z][A-Z0-9]*-\d+", key_val, re.IGNORECASE):
+            _add(key_val)
+
+    def _walk(obj: Any, depth: int = 0) -> None:
+        if depth > 10 or obj is None:
+            return
+        if isinstance(obj, list):
+            for item in obj:
+                _walk(item, depth + 1)
+            return
+        if not isinstance(obj, dict):
+            return
+        for tc_key in ("testCase", "testcase", "sourceTestCase", "targetTestCase"):
+            nested = obj.get(tc_key)
+            if isinstance(nested, dict):
+                _add_testcase_dict(nested)
+        if "name" in obj and (
+            "testCaseId" in obj
+            or "testcaseId" in obj
+            or "issueCount" in obj
+            or str(obj.get("type") or "").lower().find("test") >= 0
+        ):
+            _add_testcase_dict(obj)
+        for container_key in (
+            "testCases",
+            "testcases",
+            "values",
+            "results",
+            "issueLinks",
+            "links",
+            "data",
+            "entities",
+        ):
+            child = obj.get(container_key)
+            if child is not None:
+                _walk(child, depth + 1)
+
+    _walk(payload)
+    return names
+
+
+def _fetch_zephyr_issuelink_scenario_names(
+    issue_key: str,
+    *,
+    zephyr_base_url: str,
+    zephyr_headers: dict[str, str] | None,
+) -> list[str]:
+    """Scenario names from Zephyr Scale Traceability panel (``issuelink`` REST)."""
+    key = str(issue_key or "").strip()
+    if not key or not zephyr_base_url or not zephyr_headers:
+        return []
+    if not _zephyr_traceability_fetch_enabled():
+        return []
+    cache_key = key.upper()
+    if cache_key in _ZEPHYR_ISSUELINK_NAMES_CACHE:
+        return list(_ZEPHYR_ISSUELINK_NAMES_CACHE[cache_key])
+    endpoint = _zephyr_issuelink_endpoint()
+    names: list[str] = []
+    try:
+        payload = request_json(
+            zephyr_base_url,
+            endpoint,
+            zephyr_headers,
+            params={"issueKey": key},
+        )
+        names = _parse_zephyr_issuelink_test_case_names(payload)
+    except Exception:
+        names = []
+    _ZEPHYR_ISSUELINK_NAMES_CACHE[cache_key] = tuple(names)
+    return names
+
+
+def _enrich_defect_meta_zephyr_traceability(
+    meta: dict[str, dict[str, str]],
+    keys: list[str],
+    *,
+    zephyr_base_url: str,
+    zephyr_headers: dict[str, str] | None,
+) -> None:
+    """Fill ``traceability_scenarios`` from Zephyr Scale Traceability (not Jira description)."""
+    if not meta or not keys or not zephyr_base_url or not zephyr_headers:
+        return
+    if not _zephyr_traceability_fetch_enabled():
+        return
+    seen_upper: set[str] = set()
+    for raw_key in keys:
+        key = str(raw_key or "").strip()
+        if not key:
+            continue
+        up = key.upper()
+        if up in seen_upper:
+            continue
+        seen_upper.add(up)
+        names = _fetch_zephyr_issuelink_scenario_names(
+            key,
+            zephyr_base_url=zephyr_base_url,
+            zephyr_headers=zephyr_headers,
+        )
+        if not names:
+            continue
+        joined = "; ".join(names)
+        entry = meta.setdefault(key, {})
+        entry["traceability_scenarios"] = joined
+        for alias in keys:
+            alias_clean = str(alias or "").strip()
+            if alias_clean.upper() == up and alias_clean != key:
+                meta.setdefault(alias_clean, {}).update(entry)
+
+
 def _fetch_jira_bug_metadata(
     keys: list[str],
     *,
@@ -5373,6 +5519,8 @@ def _fetch_jira_bug_metadata(
             "expected_result": str(desc_fields.get("expected_result") or "").strip(),
             "actual_result": str(desc_fields.get("actual_result") or "").strip(),
             "preconditions": str(desc_fields.get("preconditions") or "").strip(),
+            # Zephyr Scale Traceability panel — via _enrich_defect_meta_zephyr_traceability.
+            "traceability_scenarios": "",
         }
         return key, entry
 
@@ -6668,6 +6816,170 @@ def _iter_cases_in_cycles(cycles: dict[str, Any]):
                 yield case
 
 
+_SCENARIO_ITERATION_SUFFIX_RE = re.compile(
+    r"\s*\.\s*Итерация\s+\d+\s*$",
+    re.IGNORECASE | re.UNICODE,
+)
+
+
+def _normalize_linked_scenario_name(name: str) -> str:
+    """Drop «. Итерация N» and «(cloned)» so rollup lists unique scenarios."""
+    cleaned = str(name or "").strip()
+    if not cleaned:
+        return ""
+    without_iter = _SCENARIO_ITERATION_SUFFIX_RE.sub("", cleaned).strip()
+    if not without_iter:
+        return ""
+    normalized, _ = _normalize_weekly_cycle_label(without_iter)
+    return normalized or without_iter
+
+
+def _bugs_scenarios_grouped_enabled() -> bool:
+    return _parse_bool_env(os.getenv("ZEPHYR_BUGS_SCENARIOS_GROUPED", "true"))
+
+
+def _strip_scenario_index_prefix(label: str) -> str:
+    return re.sub(r"^\s*\d+\.\d+\s*", "", str(label or "").strip()).strip()
+
+
+def _register_scenario_group_alias(
+    alias_to_gid: dict[str, str],
+    alias: str,
+    gid: str,
+) -> None:
+    key = str(alias or "").strip().lower()
+    if key and gid:
+        alias_to_gid.setdefault(key, gid)
+
+
+def _build_scenario_group_catalog(
+    report_data: dict[tuple[str, str], dict[str, Any]] | None,
+) -> tuple[dict[str, str], dict[str, str]]:
+    """Build group titles (1–9) and alias index from Zephyr cycles in report_data."""
+    labels_by_gid: dict[str, list[str]] = defaultdict(list)
+    alias_to_gid: dict[str, str] = {}
+
+    for payload in (report_data or {}).values():
+        cycles = payload.get("cycles") or {}
+        if not isinstance(cycles, dict):
+            continue
+        for cycle in cycles.values():
+            if not isinstance(cycle, dict):
+                continue
+            cycle_index = _extract_cycle_index(cycle)
+            row = {
+                "cycle_index": cycle_index,
+                "cycle_title": str(cycle.get("cycle_name") or ""),
+                "cycle_key": str(cycle.get("cycle_key") or ""),
+            }
+            label = _build_summary_cycle_label(row)
+            if not label:
+                continue
+            gid = _summary_scenario_group(row)
+            if not gid:
+                parsed = _parse_cycle_group_id(cycle)
+                gid = parsed if str(parsed).isdigit() else ""
+            if not gid:
+                continue
+            labels_by_gid[gid].append(label)
+            for alias in (
+                label,
+                _strip_scenario_index_prefix(label),
+                _normalize_linked_scenario_name(label),
+            ):
+                norm_weekly, _ = _normalize_weekly_cycle_label(alias)
+                _register_scenario_group_alias(alias_to_gid, alias, gid)
+                if norm_weekly:
+                    _register_scenario_group_alias(alias_to_gid, norm_weekly, gid)
+
+    titles_by_gid: dict[str, str] = {}
+    for gid, labels in labels_by_gid.items():
+        titles_by_gid[gid] = _summary_group_title_from_labels(labels, fallback_group=gid)
+    return titles_by_gid, alias_to_gid
+
+
+def _scenario_name_to_group_id(
+    name: str,
+    alias_to_gid: dict[str, str],
+) -> str | None:
+    normalized = _normalize_linked_scenario_name(name)
+    if not normalized:
+        return None
+    norm_weekly, _ = _normalize_weekly_cycle_label(normalized)
+    if norm_weekly:
+        normalized = norm_weekly
+
+    cycle_index = _extract_cycle_index({"cycle_name": normalized})
+    match = re.match(r"^(\d+)\.\d+$", cycle_index)
+    if match:
+        return match.group(1)
+
+    for candidate in (normalized, _strip_scenario_index_prefix(normalized)):
+        gid = alias_to_gid.get(candidate.lower())
+        if gid:
+            return gid
+    return None
+
+
+def _defect_scenario_group_names_list(
+    raw_names: list[str],
+    catalog: tuple[dict[str, str], dict[str, str]],
+) -> list[str]:
+    """Collapse sub-scenario labels to weekly-style group titles (1–9); keep unmapped raw names."""
+    titles_by_gid, alias_to_gid = catalog
+    grouped: list[tuple[int, str]] = []
+    unmapped: list[str] = []
+    seen_lower: set[str] = set()
+
+    for raw in raw_names:
+        clean = _normalize_linked_scenario_name(raw)
+        if not clean:
+            continue
+        norm_weekly, _ = _normalize_weekly_cycle_label(clean)
+        display_raw = norm_weekly or clean
+        gid = _scenario_name_to_group_id(raw, alias_to_gid)
+        if gid and gid in titles_by_gid:
+            title = titles_by_gid[gid]
+            norm = title.lower()
+            if norm in seen_lower:
+                continue
+            seen_lower.add(norm)
+            sort_key = int(gid) if gid.isdigit() else 999
+            grouped.append((sort_key, title))
+        else:
+            norm = display_raw.lower()
+            if norm in seen_lower:
+                continue
+            seen_lower.add(norm)
+            unmapped.append(display_raw)
+
+    grouped.sort(key=lambda item: (item[0], item[1].lower()))
+    return [title for _, title in grouped] + unmapped
+
+
+def _linked_scenario_label_from_cycle_case(
+    cycle: dict[str, Any],
+    case: dict[str, Any],
+) -> str:
+    """Prefer weekly-style cycle label (X.Y …), else normalized test case / cycle folder name."""
+    cycle_label = _build_summary_cycle_label(
+        {
+            "cycle_index": _extract_cycle_index(cycle),
+            "cycle_title": str(cycle.get("cycle_name") or ""),
+            "cycle_key": str(cycle.get("cycle_key") or ""),
+        }
+    )
+    if _is_weekly_scenario_cycle_label(cycle_label):
+        return cycle_label
+    case_name = _normalize_linked_scenario_name(str(case.get("test_case_name") or ""))
+    if case_name:
+        return case_name
+    cycle_name = _normalize_linked_scenario_name(str(cycle.get("cycle_name") or ""))
+    if cycle_name and not re.fullmatch(r"QA-[A-Z]\d+", cycle_name, re.IGNORECASE):
+        return cycle_name
+    return ""
+
+
 def _empty_defect_analytics() -> dict[str, Any]:
     return {
         "keys_ordered": [],
@@ -6679,6 +6991,7 @@ def _empty_defect_analytics() -> dict[str, Any]:
         "failed_cases_without_bug_by_build": {},
         "bug_total_cases": {},
         "bug_builds_count": {},
+        "bug_linked_scenarios": {},
         "hot_bugs": [],
     }
 
@@ -6716,7 +7029,7 @@ def _compute_weekly_defect_analytics(
       keys_ordered, matrix, totals_by_build,
       cases_with_bug_by_build / cases_without_bug_by_build,
       failed_cases_with_bug_by_build / failed_cases_without_bug_by_build,
-      bug_total_cases, bug_builds_count, hot_bugs.
+      bug_total_cases, bug_builds_count, bug_linked_scenarios, hot_bugs.
     """
     matrix: dict[str, dict[str, int]] = {}
     cases_with_bug_by_build: dict[str, int] = {label: 0 for label in column_labels}
@@ -6724,46 +7037,67 @@ def _compute_weekly_defect_analytics(
     failed_with_bug_by_build: dict[str, int] = {label: 0 for label in column_labels}
     failed_without_bug_by_build: dict[str, int] = {label: 0 for label in column_labels}
     bug_total_cases: dict[str, int] = {}
+    bug_linked_scenarios: dict[str, list[str]] = {}
     bug_appears_in_label: dict[str, set[str]] = {}
     keys_first_seen_order: list[str] = []
+
+    def _append_linked_scenario(bug_key: str, scenario_name: str) -> None:
+        name = _normalize_linked_scenario_name(scenario_name)
+        if not name:
+            return
+        existing = bug_linked_scenarios.setdefault(bug_key, [])
+        norm = name.lower()
+        if any(item.lower() == norm for item in existing):
+            return
+        existing.append(name)
 
     label_by_day = dict(zip(ordered_days, column_labels))
     for day, build_label in label_by_day.items():
         for cycles_dict in cycles_by_day.get(day, []):
-            for case in _iter_cases_in_cycles(cycles_dict):
-                tasks_raw = str(case.get("tasks") or "")
-                bug_keys = _DEFECT_KEY_PATTERN.findall(tasks_raw) if tasks_raw else []
-                seen_per_case: set[str] = set()
-                is_failed = _is_failed_execution_status(case.get("executionStatus"))
-                if bug_keys:
-                    cases_with_bug_by_build[build_label] = (
-                        cases_with_bug_by_build.get(build_label, 0) + 1
-                    )
-                    if is_failed:
-                        failed_with_bug_by_build[build_label] = (
-                            failed_with_bug_by_build.get(build_label, 0) + 1
-                        )
-                else:
-                    cases_without_bug_by_build[build_label] = (
-                        cases_without_bug_by_build.get(build_label, 0) + 1
-                    )
-                    if is_failed:
-                        failed_without_bug_by_build[build_label] = (
-                            failed_without_bug_by_build.get(build_label, 0) + 1
-                        )
-                for raw_key in bug_keys:
-                    key = raw_key.strip()
-                    if not key or key in seen_per_case:
+            if not isinstance(cycles_dict, dict):
+                continue
+            for cycle in cycles_dict.values():
+                if not isinstance(cycle, dict):
+                    continue
+                for case in cycle.get("cases", {}).values():
+                    if not isinstance(case, dict):
                         continue
-                    seen_per_case.add(key)
-                    if key not in matrix:
-                        matrix[key] = {label: 0 for label in column_labels}
-                        keys_first_seen_order.append(key)
-                        bug_total_cases[key] = 0
-                        bug_appears_in_label[key] = set()
-                    matrix[key][build_label] = matrix[key].get(build_label, 0) + 1
-                    bug_total_cases[key] += 1
-                    bug_appears_in_label[key].add(build_label)
+                    tasks_raw = str(case.get("tasks") or "")
+                    bug_keys = _DEFECT_KEY_PATTERN.findall(tasks_raw) if tasks_raw else []
+                    seen_per_case: set[str] = set()
+                    is_failed = _is_failed_execution_status(case.get("executionStatus"))
+                    if bug_keys:
+                        cases_with_bug_by_build[build_label] = (
+                            cases_with_bug_by_build.get(build_label, 0) + 1
+                        )
+                        if is_failed:
+                            failed_with_bug_by_build[build_label] = (
+                                failed_with_bug_by_build.get(build_label, 0) + 1
+                            )
+                    else:
+                        cases_without_bug_by_build[build_label] = (
+                            cases_without_bug_by_build.get(build_label, 0) + 1
+                        )
+                        if is_failed:
+                            failed_without_bug_by_build[build_label] = (
+                                failed_without_bug_by_build.get(build_label, 0) + 1
+                            )
+                    for raw_key in bug_keys:
+                        key = raw_key.strip()
+                        if not key or key in seen_per_case:
+                            continue
+                        seen_per_case.add(key)
+                        if key not in matrix:
+                            matrix[key] = {label: 0 for label in column_labels}
+                            keys_first_seen_order.append(key)
+                            bug_total_cases[key] = 0
+                            bug_appears_in_label[key] = set()
+                        matrix[key][build_label] = matrix[key].get(build_label, 0) + 1
+                        bug_total_cases[key] += 1
+                        bug_appears_in_label[key].add(build_label)
+                        _append_linked_scenario(
+                            key, _linked_scenario_label_from_cycle_case(cycle, case)
+                        )
 
     bug_builds_count = {key: len(labels) for key, labels in bug_appears_in_label.items()}
     totals_by_build = {
@@ -6805,6 +7139,7 @@ def _compute_weekly_defect_analytics(
         "failed_cases_without_bug_by_build": failed_without_bug_by_build,
         "bug_total_cases": bug_total_cases,
         "bug_builds_count": bug_builds_count,
+        "bug_linked_scenarios": bug_linked_scenarios,
         "hot_bugs": hot_bugs,
     }
 
@@ -7992,6 +8327,78 @@ def _defect_summary_wiki(entry: dict[str, str] | None) -> str:
     return _wiki_escape(text) if text else "—"
 
 
+def _defect_scenario_names_list(
+    key: str,
+    defect_meta: dict[str, dict[str, str]] | None,
+    defect_analytics: dict[str, Any] | None,
+    *,
+    scenario_group_catalog: tuple[dict[str, str], dict[str, str]] | None = None,
+) -> list[str]:
+    """Zephyr Scale Traceability panel first, then names from test runs (unique, ordered)."""
+    names: list[str] = []
+    seen_lower: set[str] = set()
+
+    def _add(candidate: str) -> None:
+        clean = str(candidate or "").strip()
+        if not clean:
+            return
+        norm = clean.lower()
+        if norm in seen_lower:
+            return
+        seen_lower.add(norm)
+        names.append(clean)
+
+    entry = (defect_meta or {}).get(key) or {}
+    jira_raw = str(entry.get("traceability_scenarios") or "").strip()
+    if jira_raw:
+        for part in re.split(r"\s*;\s*", jira_raw):
+            _add(part)
+
+    analytics = defect_analytics or {}
+    for name in (analytics.get("bug_linked_scenarios") or {}).get(key) or []:
+        _add(str(name))
+
+    if scenario_group_catalog and _bugs_scenarios_grouped_enabled():
+        return _defect_scenario_group_names_list(names, scenario_group_catalog)
+    return names
+
+
+def _defect_scenarios_html(
+    key: str,
+    defect_meta: dict[str, dict[str, str]] | None,
+    defect_analytics: dict[str, Any] | None,
+    *,
+    scenario_group_catalog: tuple[dict[str, str], dict[str, str]] | None = None,
+) -> str:
+    names = _defect_scenario_names_list(
+        key,
+        defect_meta,
+        defect_analytics,
+        scenario_group_catalog=scenario_group_catalog,
+    )
+    if not names:
+        return "—"
+    return html.escape("; ".join(names))
+
+
+def _defect_scenarios_wiki(
+    key: str,
+    defect_meta: dict[str, dict[str, str]] | None,
+    defect_analytics: dict[str, Any] | None,
+    *,
+    scenario_group_catalog: tuple[dict[str, str], dict[str, str]] | None = None,
+) -> str:
+    names = _defect_scenario_names_list(
+        key,
+        defect_meta,
+        defect_analytics,
+        scenario_group_catalog=scenario_group_catalog,
+    )
+    if not names:
+        return "—"
+    return _wiki_escape("; ".join(names))
+
+
 def _weekly_defects_html_block(defect_keys: list[str]) -> str:
     if not defect_keys:
         return "<p><em>В процессе написания</em></p>"
@@ -8344,6 +8751,8 @@ def _weekly_defect_analytics_html(
     defect_meta: dict[str, dict[str, str]] | None,
     column_labels: list[str],
     duplicate_candidates: dict[str, DuplicateCandidate | None] | None = None,
+    *,
+    scenario_group_catalog: tuple[dict[str, str], dict[str, str]] | None = None,
 ) -> str:
     analytics = defect_analytics or {}
     keys_ordered = list(analytics.get("keys_ordered") or [])
@@ -8399,7 +8808,7 @@ def _weekly_defect_analytics_html(
         parts.append("<table class='weekly-defects-table weekly-defects-top'>")
         parts.append(
             "<thead><tr>"
-            "<th>Ключ</th><th>Summary</th><th>Priority</th><th>Status</th>"
+            "<th>Ключ</th><th>Summary</th><th>Сценарии</th><th>Priority</th><th>Status</th>"
             "<th>Кейсов</th><th>Билдов</th>"
             f"{dup_header}"
             "</tr></thead><tbody>"
@@ -8410,6 +8819,7 @@ def _weekly_defect_analytics_html(
                 "<tr>"
                 f"<td class='weekly-jira-key-cell'>{_weekly_jira_key_span_html(key)}</td>"
                 f"<td>{_defect_summary_html(entry)}</td>"
+                f"<td>{_defect_scenarios_html(key, meta, analytics, scenario_group_catalog=scenario_group_catalog)}</td>"
                 f"<td>{_jira_priority_lozenge_html(entry.get('priority', ''))}</td>"
                 f"<td>{_jira_status_lozenge_html(entry.get('status', ''))}</td>"
                 f"<td style='text-align:center;'>{int(bug_total_cases.get(key, 0))}</td>"
@@ -8478,7 +8888,7 @@ def _weekly_defect_analytics_html(
     parts.append("<table class='weekly-defects-table weekly-defects-all'>")
     parts.append(
         "<thead><tr>"
-        "<th>Ключ</th><th>Summary</th><th>Priority</th><th>Status</th>"
+        "<th>Ключ</th><th>Summary</th><th>Сценарии</th><th>Priority</th><th>Status</th>"
         "<th>Кейсов</th><th>Билдов</th>"
         f"{dup_header}"
         "</tr></thead><tbody>"
@@ -8489,6 +8899,7 @@ def _weekly_defect_analytics_html(
             "<tr>"
             f"<td class='weekly-jira-key-cell'>{_weekly_jira_key_span_html(key)}</td>"
             f"<td>{_defect_summary_html(entry)}</td>"
+            f"<td>{_defect_scenarios_html(key, meta, analytics, scenario_group_catalog=scenario_group_catalog)}</td>"
             f"<td>{_jira_priority_lozenge_html(entry.get('priority', ''))}</td>"
             f"<td>{_jira_status_lozenge_html(entry.get('status', ''))}</td>"
             f"<td style='text-align:center;'>{int(bug_total_cases.get(key, 0))}</td>"
@@ -8507,6 +8918,8 @@ def _weekly_defect_analytics_wiki(
     defect_meta: dict[str, dict[str, str]] | None,
     column_labels: list[str],
     duplicate_candidates: dict[str, DuplicateCandidate | None] | None = None,
+    *,
+    scenario_group_catalog: tuple[dict[str, str], dict[str, str]] | None = None,
 ) -> str:
     analytics = defect_analytics or {}
     keys_ordered = list(analytics.get("keys_ordered") or [])
@@ -8550,7 +8963,7 @@ def _weekly_defect_analytics_wiki(
         # 2. Топ
         parts.append(f"h4. Топ багов (до {_DEFECT_TOP_LIMIT})")
         parts.append(
-            "|| Ключ || Summary || Priority || Status || Кейсов || Билдов"
+            "|| Ключ || Summary || Сценарии || Priority || Status || Кейсов || Билдов"
             f"{dup_header_wiki} ||"
         )
         for key in keys_ordered[:_DEFECT_TOP_LIMIT]:
@@ -8558,6 +8971,12 @@ def _weekly_defect_analytics_wiki(
             cells = [
                 _weekly_jira_key_wiki(key),
                 _defect_summary_wiki(entry),
+                _defect_scenarios_wiki(
+                    key,
+                    meta,
+                    analytics,
+                    scenario_group_catalog=scenario_group_catalog,
+                ),
                 _wiki_escape(entry.get("priority", "")) or " ",
                 _wiki_escape(entry.get("status", "")) or " ",
                 str(int(bug_total_cases.get(key, 0))),
@@ -8599,7 +9018,7 @@ def _weekly_defect_analytics_wiki(
         parts.append("")
     parts.append("h4. Все баги")
     parts.append(
-        "|| Ключ || Summary || Priority || Status || Кейсов || Билдов"
+        "|| Ключ || Summary || Сценарии || Priority || Status || Кейсов || Билдов"
         f"{dup_header_wiki} ||"
     )
     for key in keys_ordered:
@@ -8607,6 +9026,12 @@ def _weekly_defect_analytics_wiki(
         cells = [
             _weekly_jira_key_wiki(key),
             _defect_summary_wiki(entry),
+            _defect_scenarios_wiki(
+                key,
+                meta,
+                analytics,
+                scenario_group_catalog=scenario_group_catalog,
+            ),
             _wiki_escape(entry.get("priority", "")) or " ",
             _wiki_escape(entry.get("status", "")) or " ",
             str(int(bug_total_cases.get(key, 0))),
@@ -8946,6 +9371,27 @@ def _merge_defect_analytics(
             hot_seen.add(k)
             hot_bugs.append(k)
     merged["hot_bugs"] = hot_bugs
+
+    base_scenarios = dict(base.get("bug_linked_scenarios") or {})
+    incoming_scenarios = dict(incoming.get("bug_linked_scenarios") or {})
+    merged_scenarios: dict[str, list[str]] = {}
+    for key in keys_ordered:
+        combined: list[str] = []
+        seen_names: set[str] = set()
+        for source in (base_scenarios, incoming_scenarios):
+            for name in source.get(key) or []:
+                clean = str(name or "").strip()
+                if not clean:
+                    continue
+                norm = clean.lower()
+                if norm in seen_names:
+                    continue
+                seen_names.add(norm)
+                combined.append(clean)
+        if combined:
+            merged_scenarios[key] = combined
+    merged["bug_linked_scenarios"] = merged_scenarios
+
     merged["keys_ordered"] = _recompute_defect_keys_order(merged)
     return merged, merged_labels
 
@@ -9172,6 +9618,7 @@ def _bugs_rollup_html_section(
     week_keys: list[date],
     duplicate_candidates: dict[str, DuplicateCandidate | None] | None = None,
     total_build_columns: int | None = None,
+    scenario_group_catalog: tuple[dict[str, str], dict[str, str]] | None = None,
 ) -> list[str]:
     blocks = [f"<h2><strong>{html.escape(section_title)}</strong></h2>"]
     subtitle = _bugs_rollup_section_subtitle(
@@ -9187,6 +9634,7 @@ def _bugs_rollup_html_section(
                 defect_meta,
                 column_labels,
                 duplicate_candidates,
+                scenario_group_catalog=scenario_group_catalog,
             )
         )
     else:
@@ -9206,6 +9654,7 @@ def render_bugs_rollup_html_report(
     last_weeks_duplicates: dict[str, DuplicateCandidate | None] | None = None,
     all_duplicates: dict[str, DuplicateCandidate | None] | None = None,
     all_total_build_columns: int | None = None,
+    scenario_group_catalog: tuple[dict[str, str], dict[str, str]] | None = None,
 ) -> str:
     sections = [
         "<!doctype html>",
@@ -9223,6 +9672,7 @@ def render_bugs_rollup_html_report(
             column_labels=last_weeks_labels,
             week_keys=last_weeks_keys,
             duplicate_candidates=last_weeks_duplicates,
+            scenario_group_catalog=scenario_group_catalog,
         )
     )
     sections.extend(
@@ -9234,6 +9684,7 @@ def render_bugs_rollup_html_report(
             week_keys=all_week_keys,
             duplicate_candidates=all_duplicates,
             total_build_columns=all_total_build_columns,
+            scenario_group_catalog=scenario_group_catalog,
         )
     )
     sections.append("</body></html>")
@@ -9249,6 +9700,7 @@ def _bugs_rollup_wiki_section(
     week_keys: list[date],
     duplicate_candidates: dict[str, DuplicateCandidate | None] | None = None,
     total_build_columns: int | None = None,
+    scenario_group_catalog: tuple[dict[str, str], dict[str, str]] | None = None,
 ) -> list[str]:
     lines = [f"h2. {section_title}", ""]
     subtitle = _bugs_rollup_section_subtitle(
@@ -9265,6 +9717,7 @@ def _bugs_rollup_wiki_section(
                 defect_meta,
                 column_labels,
                 duplicate_candidates,
+                scenario_group_catalog=scenario_group_catalog,
             )
         )
     else:
@@ -9285,6 +9738,7 @@ def render_bugs_rollup_wiki_report(
     last_weeks_duplicates: dict[str, DuplicateCandidate | None] | None = None,
     all_duplicates: dict[str, DuplicateCandidate | None] | None = None,
     all_total_build_columns: int | None = None,
+    scenario_group_catalog: tuple[dict[str, str], dict[str, str]] | None = None,
 ) -> str:
     lines = [f"h1. {BUGS_ROLLUP_DISPLAY_TITLE}", ""]
     lines.extend(
@@ -9295,6 +9749,7 @@ def render_bugs_rollup_wiki_report(
             column_labels=last_weeks_labels,
             week_keys=last_weeks_keys,
             duplicate_candidates=last_weeks_duplicates,
+            scenario_group_catalog=scenario_group_catalog,
         )
     )
     lines.extend(
@@ -9306,6 +9761,7 @@ def render_bugs_rollup_wiki_report(
             week_keys=all_week_keys,
             duplicate_candidates=all_duplicates,
             total_build_columns=all_total_build_columns,
+            scenario_group_catalog=scenario_group_catalog,
         )
     )
     return "\n".join(lines).rstrip() + "\n"
@@ -9317,6 +9773,7 @@ def _bugs_rollup_duplicate_candidates_for_analytics(
     *,
     embedding_cache: dict[str, Any] | None,
     overrides: dict[str, Any] | None,
+    scenario_group_catalog: tuple[dict[str, str], dict[str, str]] | None = None,
 ) -> dict[str, DuplicateCandidate | None] | None:
     from bug_duplicate_detection import bugs_duplicate_detect_enabled
 
@@ -9329,11 +9786,21 @@ def _bugs_rollup_duplicate_candidates_for_analytics(
     ]
     if not keys:
         return None
+    scenarios_by_key = {
+        k: _defect_scenario_names_list(
+            k,
+            defect_meta,
+            analytics,
+            scenario_group_catalog=scenario_group_catalog,
+        )
+        for k in keys
+    }
     return find_duplicate_candidates(
         keys,
         defect_meta or {},
         embedding_cache=embedding_cache,
         overrides=overrides,
+        scenarios_by_key=scenarios_by_key,
     )
 
 
@@ -9360,14 +9827,25 @@ def write_bugs_rollup_reports(
     all_labels_display = _display_build_column_labels(
         all_labels, _bugs_rollup_all_time_max_build_columns()
     )
+    scenario_group_catalog: tuple[dict[str, str], dict[str, str]] | None = None
+    if _bugs_scenarios_grouped_enabled():
+        scenario_group_catalog = _build_scenario_group_catalog(report_data)
     cache_path, overrides_path = resolve_paths_for_rollup_dir(output_dir)
     embedding_cache = load_embedding_cache(cache_path)
     overrides = load_duplicate_overrides(overrides_path)
     last_duplicates = _bugs_rollup_duplicate_candidates_for_analytics(
-        last_analytics, defect_meta, embedding_cache=embedding_cache, overrides=overrides
+        last_analytics,
+        defect_meta,
+        embedding_cache=embedding_cache,
+        overrides=overrides,
+        scenario_group_catalog=scenario_group_catalog,
     )
     all_duplicates = _bugs_rollup_duplicate_candidates_for_analytics(
-        all_analytics, defect_meta, embedding_cache=embedding_cache, overrides=overrides
+        all_analytics,
+        defect_meta,
+        embedding_cache=embedding_cache,
+        overrides=overrides,
+        scenario_group_catalog=scenario_group_catalog,
     )
     debug_merged: dict[str, DuplicateCandidate | None] = {}
     if last_duplicates:
@@ -9431,6 +9909,7 @@ def write_bugs_rollup_reports(
             all_total_build_columns=(
                 len(all_labels) if len(all_labels) != len(all_labels_display) else None
             ),
+            scenario_group_catalog=scenario_group_catalog,
         )
         _write_text_always(html_path, body)
         written.append(html_path)
@@ -9449,6 +9928,7 @@ def write_bugs_rollup_reports(
             all_total_build_columns=(
                 len(all_labels) if len(all_labels) != len(all_labels_display) else None
             ),
+            scenario_group_catalog=scenario_group_catalog,
         )
         _write_text_always(wiki_path, body)
         written.append(wiki_path)
@@ -13732,6 +14212,12 @@ def run_once(args: argparse.Namespace) -> int:
                     rollup_keys,
                     base_url=jira_meta_base,
                     auth_headers=jira_meta_headers,
+                )
+                _enrich_defect_meta_zephyr_traceability(
+                    rollup_defect_meta,
+                    rollup_keys,
+                    zephyr_base_url=args.base_url,
+                    zephyr_headers=headers,
                 )
                 with timed_step(timings, "write bugs rollup index reports"):
                     bugs_rollup_report_paths = write_bugs_rollup_reports(

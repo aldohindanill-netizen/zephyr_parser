@@ -14,6 +14,7 @@ from bug_duplicate_detection import (
     find_duplicate_candidates,
     load_embedding_cache,
     parse_jira_description_fields,
+    parse_traceability_scenario_names,
     results_hash,
     summary_hash,
     text_similarity,
@@ -62,6 +63,22 @@ class ParseDescriptionFieldsTests(unittest.TestCase):
         self.assertIn("конусы", fields["actual_result"].lower())
         self.assertIn("останавливается", fields["expected_result"].lower())
         self.assertIn("Мишень", fields["preconditions"])
+
+    def test_parses_traceability_table_row(self) -> None:
+        table = (
+            "|*Traceability:*|"
+            "[Сценарий A|https://jira.example/browse/QA-T1], "
+            "[Сценарий B|https://jira.example/browse/QA-T2]|"
+        )
+        fields = parse_jira_description_fields(table)
+        self.assertIn("Сценарий A", fields["traceability"])
+        names = parse_traceability_scenario_names(fields["traceability"])
+        self.assertEqual(names, ["Сценарий A", "Сценарий B"])
+
+    def test_traceability_dedupes_case_insensitive(self) -> None:
+        raw = "[Сценарий A|url1], сценарий a; Сценарий B"
+        names = parse_traceability_scenario_names(raw)
+        self.assertEqual(names, ["Сценарий A", "Сценарий B"])
 
 
 class NormalizeSummaryTests(unittest.TestCase):
@@ -346,6 +363,159 @@ class FindDuplicateCandidatesTests(unittest.TestCase):
         assert result["CSD-47279"] is not None
         self.assertEqual(result["CSD-47279"].method, "text_expected_actual_soft")
         self.assertEqual(result["CSD-47279"].confidence, "high")
+
+    def test_scenario_conflict_blocks_despite_matching_results(self) -> None:
+        shared_expected = "При приближении к мишени, ВАТС останавливается"
+        shared_actual = "ВАТС не останавливается и едет в конусы"
+        meta = self._meta(
+            [
+                (
+                    "CSD-A",
+                    {
+                        "summary": "A",
+                        "expected_result": shared_expected,
+                        "actual_result": shared_actual,
+                    },
+                ),
+                (
+                    "CSD-B",
+                    {
+                        "summary": "B",
+                        "expected_result": shared_expected,
+                        "actual_result": shared_actual,
+                    },
+                ),
+            ]
+        )
+        scenarios_by_key = {
+            "CSD-A": ["1. Сценарий объезда"],
+            "CSD-B": ["2. Сценарий пешехода"],
+        }
+        result = find_duplicate_candidates(
+            ["CSD-A", "CSD-B"],
+            meta,
+            scenarios_by_key=scenarios_by_key,
+            text_threshold=0.78,
+            use_embeddings=False,
+        )
+        self.assertIsNone(result["CSD-A"])
+        self.assertIsNone(result["CSD-B"])
+
+    def test_scenario_match_allows_duplicate(self) -> None:
+        shared_expected = "При приближении к мишени, ВАТС останавливается"
+        shared_actual = "ВАТС не останавливается и едет в конусы"
+        meta = self._meta(
+            [
+                (
+                    "CSD-A",
+                    {
+                        "summary": "A",
+                        "expected_result": shared_expected,
+                        "actual_result": shared_actual,
+                    },
+                ),
+                (
+                    "CSD-B",
+                    {
+                        "summary": "B",
+                        "expected_result": shared_expected,
+                        "actual_result": shared_actual,
+                    },
+                ),
+            ]
+        )
+        scenarios_by_key = {
+            "CSD-A": ["1. Сценарий объезда", "2. Другой"],
+            "CSD-B": ["1. Сценарий объезда"],
+        }
+        result = find_duplicate_candidates(
+            ["CSD-A", "CSD-B"],
+            meta,
+            scenarios_by_key=scenarios_by_key,
+            text_threshold=0.78,
+            use_embeddings=False,
+        )
+        self.assertIsNotNone(result["CSD-A"])
+        assert result["CSD-A"] is not None
+        self.assertEqual(result["CSD-A"].other_key, "CSD-B")
+        self.assertTrue(result["CSD-A"].scenario_match)
+
+    def test_scenario_unknown_when_both_empty(self) -> None:
+        shared_expected = "При приближении к мишени, ВАТС останавливается"
+        shared_actual = "ВАТС не останавливается и едет в конусы"
+        meta = self._meta(
+            [
+                (
+                    "CSD-A",
+                    {
+                        "summary": "A",
+                        "expected_result": shared_expected,
+                        "actual_result": shared_actual,
+                    },
+                ),
+                (
+                    "CSD-B",
+                    {
+                        "summary": "B",
+                        "expected_result": shared_expected,
+                        "actual_result": shared_actual,
+                    },
+                ),
+            ]
+        )
+        result = find_duplicate_candidates(
+            ["CSD-A", "CSD-B"],
+            meta,
+            scenarios_by_key={"CSD-A": [], "CSD-B": []},
+            text_threshold=0.78,
+            use_embeddings=False,
+        )
+        self.assertIsNotNone(result["CSD-A"])
+
+    def test_scenario_gate_disabled_allows_conflict(self) -> None:
+        shared_expected = "При приближении к мишени, ВАТС останавливается"
+        shared_actual = "ВАТС не останавливается и едет в конусы"
+        meta = self._meta(
+            [
+                (
+                    "CSD-A",
+                    {
+                        "summary": "A",
+                        "expected_result": shared_expected,
+                        "actual_result": shared_actual,
+                    },
+                ),
+                (
+                    "CSD-B",
+                    {
+                        "summary": "B",
+                        "expected_result": shared_expected,
+                        "actual_result": shared_actual,
+                    },
+                ),
+            ]
+        )
+        scenarios_by_key = {
+            "CSD-A": ["1. Сценарий объезда"],
+            "CSD-B": ["2. Сценарий пешехода"],
+        }
+        env_key = "ZEPHYR_BUGS_DUPLICATE_SCENARIO_GATE"
+        prev = os.environ.get(env_key)
+        try:
+            os.environ[env_key] = "false"
+            result = find_duplicate_candidates(
+                ["CSD-A", "CSD-B"],
+                meta,
+                scenarios_by_key=scenarios_by_key,
+                text_threshold=0.78,
+                use_embeddings=False,
+            )
+        finally:
+            if prev is None:
+                os.environ.pop(env_key, None)
+            else:
+                os.environ[env_key] = prev
+        self.assertIsNotNone(result["CSD-A"])
 
 
 class CacheAndDebugTests(unittest.TestCase):
