@@ -9076,16 +9076,36 @@ _WEEKLY_HTML_DEFECT_STYLES = (
 )
 
 
+def _bugs_rollup_regenerate_iso_weeks() -> int | None:
+    """ISO-week cap implied by ``ZEPHYR_REGENERATE_LAST_N_DAYS`` (14 days → 2 weeks)."""
+    n_days = _zephyr_regenerate_last_n_days_from_environment()
+    if n_days <= 0:
+        return None
+    return max(1, (n_days + 6) // 7)
+
+
 def _bugs_rollup_last_weeks_count() -> int:
-    raw = (os.getenv("ZEPHYR_BUGS_ROLLUP_LAST_WEEKS") or "4").strip()
-    try:
-        return max(1, int(raw))
-    except ValueError:
-        return 2
+    raw = _env_prefers_repo_dotenv("ZEPHYR_BUGS_ROLLUP_LAST_WEEKS", "")
+    explicit: int | None = None
+    if raw:
+        try:
+            explicit = max(1, int(raw))
+        except ValueError:
+            explicit = None
+    regen_weeks = _bugs_rollup_regenerate_iso_weeks()
+    if explicit is not None and regen_weeks is not None:
+        return min(explicit, regen_weeks)
+    if explicit is not None:
+        return explicit
+    if regen_weeks is not None:
+        return regen_weeks
+    return 2
 
 
-def _bugs_rollup_section_last_weeks_title() -> str:
+def _bugs_rollup_section_last_weeks_title(week_keys: list[date] | None = None) -> str:
     n = _bugs_rollup_last_weeks_count()
+    if week_keys:
+        n = min(n, len(week_keys))
     return f"Баги за последние {n} нед."
 
 
@@ -9666,7 +9686,7 @@ def render_bugs_rollup_html_report(
     ]
     sections.extend(
         _bugs_rollup_html_section(
-            _bugs_rollup_section_last_weeks_title(),
+            _bugs_rollup_section_last_weeks_title(last_weeks_keys),
             defect_analytics=last_weeks_analytics,
             defect_meta=defect_meta,
             column_labels=last_weeks_labels,
@@ -9743,7 +9763,7 @@ def render_bugs_rollup_wiki_report(
     lines = [f"h1. {BUGS_ROLLUP_DISPLAY_TITLE}", ""]
     lines.extend(
         _bugs_rollup_wiki_section(
-            _bugs_rollup_section_last_weeks_title(),
+            _bugs_rollup_section_last_weeks_title(last_weeks_keys),
             defect_analytics=last_weeks_analytics,
             defect_meta=defect_meta,
             column_labels=last_weeks_labels,

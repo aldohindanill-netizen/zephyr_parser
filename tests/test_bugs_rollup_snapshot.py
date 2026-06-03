@@ -6,6 +6,7 @@ import tempfile
 import unittest
 from datetime import date
 from pathlib import Path
+from unittest.mock import patch
 
 from zephyr_weekly_report import (
     _append_jira_defect_keys,
@@ -25,6 +26,8 @@ from zephyr_weekly_report import (
     _refresh_bugs_rollup_all_time_snapshot,
     _save_bugs_rollup_snapshot,
     _sort_build_column_labels_chronologically,
+    _bugs_rollup_last_weeks_count,
+    _bugs_rollup_section_last_weeks_title,
 )
 
 
@@ -374,6 +377,29 @@ class BugsRollupSnapshotTests(unittest.TestCase):
         )
         self.assertEqual(len(names), 1)
         self.assertEqual(names[0], catalog[0]["7"])
+
+
+class BugsRollupLastWeeksTests(unittest.TestCase):
+    def test_last_weeks_capped_by_regenerate_window(self) -> None:
+        with patch(
+            "zephyr_weekly_report._env_prefers_repo_dotenv", return_value="4"
+        ), patch(
+            "zephyr_weekly_report._zephyr_regenerate_last_n_days_from_environment",
+            return_value=14,
+        ):
+            self.assertEqual(_bugs_rollup_last_weeks_count(), 2)
+
+    def test_section_title_uses_capped_week_count(self) -> None:
+        with patch(
+            "zephyr_weekly_report._env_prefers_repo_dotenv", return_value="4"
+        ), patch(
+            "zephyr_weekly_report._zephyr_regenerate_last_n_days_from_environment",
+            return_value=14,
+        ):
+            title = _bugs_rollup_section_last_weeks_title(
+                [date(2026, 5, 19), date(2026, 5, 26), date(2026, 6, 2), date(2026, 6, 9)]
+            )
+            self.assertEqual(title, "Баги за последние 2 нед.")
 
 
 if __name__ == "__main__":
