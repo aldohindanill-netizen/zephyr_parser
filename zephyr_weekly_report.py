@@ -2598,6 +2598,18 @@ def _publish_single_html_to_confluence(
         primary_title, legacy_title = _confluence_resolve_publish_titles(
             html_path, raw_html, cfg
         )
+        issue_key = _issue_key_from_build_log_filename(base_name) or ""
+        if issue_key:
+            summary_from_html = _jira_issue_build_log_summary_from_heading(
+                _extract_html_title(raw_html), issue_key
+            )
+            old_style_title = _jira_issue_build_log_legacy_confluence_title(
+                issue_key, summary_from_html
+            )
+            if old_style_title:
+                old_style_title = _confluence_publish_title(old_style_title, cfg)
+                if old_style_title != primary_title:
+                    legacy_title = old_style_title
         page_id, action = _upsert_audited(
             primary_title,
             body_html,
@@ -5057,22 +5069,50 @@ def _gather_jira_issue_build_log_pages(
     return out
 
 
+def _jira_issue_build_log_page_heading(issue_key: str, summary: str) -> str:
+    """Заголовок страницы build-log: ключ Jira, затем summary."""
+    key = str(issue_key or "").strip()
+    text = str(summary or "").strip()
+    if key and text:
+        return f"{key} — {text}"
+    return key or text
+
+
+def _jira_issue_build_log_legacy_confluence_title(issue_key: str, summary: str) -> str | None:
+    """Заголовок Confluence до рефактора: summary (KEY); для поиска существующей страницы."""
+    key = str(issue_key or "").strip()
+    text = str(summary or "").strip()
+    if key and text:
+        return f"{text} ({key})"
+    return None
+
+
+def _jira_issue_build_log_summary_from_heading(heading: str, issue_key: str) -> str:
+    """Извлечь summary из заголовка «KEY — summary» (без префикса Confluence)."""
+    key = str(issue_key or "").strip()
+    text = str(heading or "").strip()
+    if not key or not text:
+        return ""
+    marker = f"{key} — "
+    if text.startswith(marker):
+        return text[len(marker) :].strip()
+    return ""
+
+
 def render_jira_issue_build_log_html(
     issue_key: str,
     summary: str,
     blocks: list[tuple[str, date | None, list[str]]],
 ) -> str:
     """Сформировать HTML/wiki: jira issue build log html."""
-    page_heading = summary.strip() if summary.strip() else issue_key
-    doc_title = f"{page_heading} ({issue_key})" if summary.strip() else issue_key
+    page_heading = _jira_issue_build_log_page_heading(issue_key, summary)
     parts: list[str] = [
         "<!doctype html>",
         "<html><head><meta charset='utf-8'>",
-        f"<title>{html.escape(doc_title)}</title>",
+        f"<title>{html.escape(page_heading)}</title>",
         (
             "<style>"
             "body{font-family:Arial,sans-serif;margin:24px;line-height:1.45;}"
-            ".issue-key{color:#666;font-size:0.95rem;margin:-8px 0 20px;}"
             ".blk{margin:20px 0 28px;}"
             "ul{margin:8px 0;padding-left:22px;}"
             "li{margin:4px 0;}"
@@ -5082,8 +5122,6 @@ def render_jira_issue_build_log_html(
         "</head><body>",
         f"<h1>{html.escape(page_heading)}</h1>",
     ]
-    if summary.strip():
-        parts.append(f"<p class='issue-key'>{html.escape(issue_key)}</p>")
     for build_display, _sd, urls in blocks:
         line = f"Воспроизводится на {build_display}:"
         parts.append("<div class='blk'>")
@@ -5106,11 +5144,8 @@ def render_jira_issue_build_log_wiki(
     blocks: list[tuple[str, date | None, list[str]]],
 ) -> str:
     """Сформировать HTML/wiki: jira issue build log wiki."""
-    page_heading = summary.strip() if summary.strip() else issue_key
-    lines: list[str] = [f"h1. {_wiki_escape(page_heading)}"]
-    if summary.strip():
-        lines.append(_wiki_escape(issue_key))
-        lines.append("")
+    page_heading = _jira_issue_build_log_page_heading(issue_key, summary)
+    lines: list[str] = [f"h1. {_wiki_escape(page_heading)}", ""]
     for build_display, _sd, urls in blocks:
         line = f"Воспроизводится на {build_display}:"
         lines.append(f"*{_wiki_escape(line)}*")
