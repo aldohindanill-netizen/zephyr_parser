@@ -1,0 +1,169 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Универсальные отчёты</title>
+  <link rel="stylesheet" href="/static/style.css?v=20260609d">
+</head>
+<body>
+  <header>
+    <h1>Универсальные отчёты</h1>
+    <p>Шаблон как daily: разделы 1–2 вручную, 3–4 автоматически</p>
+  </header>
+
+  <main>
+    <section id="home-view" class="card">
+      <h2>Черновики</h2>
+      <div class="btn-row">
+        <button class="primary" id="btn-new-draft">Новый отчёт</button>
+        <button id="btn-refresh-drafts">Обновить список</button>
+      </div>
+      <table class="list-table" id="drafts-table">
+        <thead>
+          <tr>
+            <th>Название</th>
+            <th>Дата</th>
+            <th>Сборка</th>
+            <th>Обновлён</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody id="drafts-body"></tbody>
+      </table>
+    </section>
+
+    <section id="editor-view" class="hidden">
+      <div class="steps" id="step-pills"></div>
+
+      <div class="card step-panel" data-step="1">
+        <h2>Шаг 1. Общие сведения</h2>
+        <div class="grid-2">
+          <div>
+            <label for="meta-title">Заголовок отчёта</label>
+            <input id="meta-title" type="text">
+          </div>
+          <div>
+            <label for="meta-date">Дата отчёта</label>
+            <input id="meta-date" type="date">
+          </div>
+          <div>
+            <label for="meta-build">Имя сборки (для разделов 1 и 4)</label>
+            <input id="meta-build" type="text">
+          </div>
+        </div>
+      </div>
+
+      <div class="card step-panel hidden" data-step="2">
+        <h2>Шаг 2. Разделы 1–2 (объект и окружение)</h2>
+        <div>
+          <label for="s12-prefix">Префикс описания объекта</label>
+          <input id="s12-prefix" type="text">
+        </div>
+        <div style="margin-top:12px">
+          <label for="s12-build">Имя сборки в тексте</label>
+          <input id="s12-build" type="text">
+        </div>
+        <div class="list-section">
+          <label>Ссылки на документы</label>
+          <div id="doc-links" class="chip-list"></div>
+          <div class="list-add-row">
+            <button type="button" class="primary" id="btn-add-doc-link">Добавить ссылку</button>
+          </div>
+        </div>
+        <div class="list-section">
+          <label>Инфраструктура (полигоны)</label>
+          <div id="infra-list" class="chip-list"></div>
+          <div class="list-add-row">
+            <button type="button" class="primary" id="btn-add-infra">Добавить пункт</button>
+          </div>
+        </div>
+        <div class="list-section">
+          <label>Оборудование</label>
+          <div id="equip-list" class="chip-list"></div>
+          <div class="list-add-row">
+            <button type="button" class="primary" id="btn-add-equip">Добавить пункт</button>
+          </div>
+        </div>
+        <div style="margin-top:12px">
+          <label for="s12-speed">Скорость ВАТС (км/ч)</label>
+          <input id="s12-speed" type="number" min="0" step="1">
+        </div>
+      </div>
+
+      <div class="card step-panel hidden" data-step="3">
+        <h2>Шаг 3. Результаты тестирования</h2>
+        <div id="zephyr-tree-loading" class="zephyr-loading hidden" aria-live="polite">
+          <div class="zephyr-loading-bar" aria-hidden="true"></div>
+          <span id="zephyr-tree-loading-text">Загрузка...</span>
+        </div>
+        <div class="btn-row">
+          <button type="button" data-mode="manual" class="mode-btn primary">Вручную</button>
+          <button type="button" data-mode="zephyr" class="mode-btn">Из Zephyr</button>
+        </div>
+
+        <div id="zephyr-panel" class="hidden" style="margin-top:12px">
+          <div style="margin-top:8px">
+            <label>Дерево папок Zephyr</label>
+            <div class="folder-tree-panel">
+              <div class="folder-tree-toolbar">
+                <input
+                  id="zephyr-folder-filter"
+                  type="search"
+                  class="folder-tree-search"
+                  placeholder="Фильтр по названию, например: 2026.06 или Cargo"
+                  autocomplete="off"
+                >
+                <button type="button" id="btn-clear-folder-filter" class="folder-tree-clear" title="Сбросить фильтр">×</button>
+              </div>
+              <p id="zephyr-folder-filter-hint" class="folder-tree-hint hidden"></p>
+              <div class="folder-tree-body-wrap">
+                <div id="zephyr-folder-tree-overlay" class="folder-tree-overlay hidden" aria-live="polite">
+                  <div class="zephyr-loading-bar" aria-hidden="true"></div>
+                  <span id="zephyr-folder-tree-overlay-text">Загрузка...</span>
+                </div>
+                <div id="zephyr-folder-tree" class="folder-tree-body">
+                  <p class="folder-tree-hint">Загрузка дерева папок...</p>
+                </div>
+              </div>
+            </div>
+          </div>
+          <p id="zephyr-folder-selected" class="folder-selected-label">Папка или цикл не выбраны</p>
+          <p class="folder-tree-hint">Папка — импорт всех циклов. Циклы — отметьте несколько чекбоксами.</p>
+
+          <div class="btn-row" style="margin-top:12px">
+            <button type="button" class="primary" id="btn-import-zephyr">Загрузить из Zephyr</button>
+          </div>
+        </div>
+
+        <div id="cycles-panel" style="margin-top:12px">
+          <div class="btn-row">
+            <button type="button" class="primary" id="btn-add-cycle">Добавить тестовый цикл</button>
+          </div>
+          <div id="cycles-root"></div>
+        </div>
+      </div>
+
+      <div class="card step-panel hidden" data-step="4">
+        <h2>Шаг 4. Предпросмотр и публикация</h2>
+        <div class="btn-row">
+          <button type="button" id="btn-preview">Обновить предпросмотр</button>
+          <button type="button" class="primary" id="btn-save">Сохранить черновик</button>
+          <button type="button" class="primary" id="btn-build">Собрать HTML/wiki</button>
+          <button type="button" id="btn-publish">Опубликовать в Confluence</button>
+        </div>
+        <iframe id="preview-frame" class="preview-frame" title="Предпросмотр отчёта"></iframe>
+      </div>
+
+      <div class="btn-row">
+        <button type="button" id="btn-back-home">К списку черновиков</button>
+        <button type="button" id="btn-prev-step">Назад</button>
+        <button type="button" class="primary" id="btn-next-step">Далее</button>
+      </div>
+      <div id="status-box" class="status hidden"></div>
+    </section>
+  </main>
+
+  <script src="/static/app.js?v=20260609l"></script>
+</body>
+</html>

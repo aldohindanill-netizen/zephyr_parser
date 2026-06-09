@@ -1342,8 +1342,20 @@ def _load_repo_dotenv_if_absent() -> None:
     repo_env.load_repo_env(overlay_local=False)
 
 
+def _load_confluence_connection_config() -> ConfluencePublishConfig | None:
+    """Load Confluence REST credentials (no pipeline publish-flag gate)."""
+    return _build_confluence_publish_config(require_publish_enabled=False)
+
+
 def _load_confluence_publish_config() -> ConfluencePublishConfig | None:
     """Загрузить: confluence publish config."""
+    return _build_confluence_publish_config(require_publish_enabled=True)
+
+
+def _build_confluence_publish_config(
+    *,
+    require_publish_enabled: bool,
+) -> ConfluencePublishConfig | None:
     base_url = (os.getenv("ZEPHYR_CONFLUENCE_BASE_URL") or "").strip().rstrip("/")
     user = (os.getenv("ZEPHYR_CONFLUENCE_USER") or "").strip()
     api_token = (os.getenv("ZEPHYR_CONFLUENCE_API_TOKEN") or "").strip()
@@ -1377,7 +1389,11 @@ def _load_confluence_publish_config() -> ConfluencePublishConfig | None:
         )
         or "Week {year}-w{week:02d}"
     )
-    if not (publish_daily or publish_weekly or publish_bugs or publish_weekly_analytics):
+    if require_publish_enabled and not (
+        publish_daily or publish_weekly or publish_bugs or publish_weekly_analytics
+    ):
+        return None
+    if not (base_url or api_token or space_key):
         return None
     if auth_scheme not in {"basic", "bearer"}:
         raise ValueError(
@@ -1392,9 +1408,12 @@ def _load_confluence_publish_config() -> ConfluencePublishConfig | None:
         required.append(("ZEPHYR_CONFLUENCE_USER", user))
     missing = [name for name, val in required if not val]
     if missing:
-        raise ValueError(
-            "Confluence publishing enabled but missing env vars: " + ", ".join(missing)
+        scope = (
+            "Confluence publishing enabled but missing env vars"
+            if require_publish_enabled
+            else "Confluence connection incomplete; missing env vars"
         )
+        raise ValueError(f"{scope}: " + ", ".join(missing))
     return ConfluencePublishConfig(
         base_url=base_url,
         user=user,
@@ -13046,17 +13065,23 @@ def render_daily_html_report(
     *,
     folder_id: str,
     template_dir: str | None = None,
+    preamble_html: str | None = None,
+    document_title: str | None = None,
+    conclusion_score_label: str | None = None,
 ) -> str:
     """Сформировать HTML/wiki: daily html report."""
-    doc_title = _daily_document_title(folder_name)
-    preamble = _format_readable_html_preamble(
-        template_dir,
-        "daily",
-        folder_id,
-        folder_id,
-        folder_name,
-        None,
-    )
+    doc_title = document_title or _daily_document_title(folder_name)
+    if preamble_html is not None:
+        preamble = preamble_html
+    else:
+        preamble = _format_readable_html_preamble(
+            template_dir,
+            "daily",
+            folder_id,
+            folder_id,
+            folder_name,
+            None,
+        )
     sorted_cycles = sorted(cycles.values(), key=_cycle_sort_key)
     status_counts = _daily_aggregate_case_status_counts(cycles)
     toc_html = _daily_render_html_toc(sorted_cycles)
@@ -13245,10 +13270,11 @@ def render_daily_html_report(
     total_x, total_y = _daily_global_passed_total(cycles)
     status_summary_lines = _daily_status_summary_lines(status_counts)
     scenario_lines = _daily_scenario_group_lines(progress_rows)
+    score_label = conclusion_score_label or f"nightly-dev-{folder_name}"
     sections.append("<h2 id='conclusion'><strong>4. Заключение</strong></h2>")
     sections.append(
         "<p class='daily-conclusion-score'>"
-        f"Итоговый score nightly-dev-{html.escape(folder_name)}, {total_x}/{total_y}</p>"
+        f"Итоговый score {html.escape(score_label)}, {total_x}/{total_y}</p>"
     )
     _counts_json = html.escape(
         json.dumps(status_counts, ensure_ascii=True, sort_keys=True)
@@ -13286,6 +13312,8 @@ def render_daily_wiki_report(
     *,
     folder_id: str,
     template_dir: str | None = None,
+    preamble_wiki: str | None = None,
+    conclusion_score_label: str | None = None,
 ) -> str:
     """Сформировать HTML/wiki: daily wiki report."""
     sorted_cycles = sorted(cycles.values(), key=_cycle_sort_key)
@@ -13305,14 +13333,17 @@ def render_daily_wiki_report(
     lines.extend(toc_lines)
     lines.append("")
     lines.append("\t")
-    wiki_pre = _format_readable_wiki_preamble(
-        template_dir,
-        "daily",
-        folder_id,
-        folder_id,
-        folder_name,
-        None,
-    )
+    if preamble_wiki is not None:
+        wiki_pre = preamble_wiki
+    else:
+        wiki_pre = _format_readable_wiki_preamble(
+            template_dir,
+            "daily",
+            folder_id,
+            folder_id,
+            folder_name,
+            None,
+        )
     if wiki_pre:
         lines.extend(wiki_pre.splitlines())
         lines.append("")
@@ -13397,12 +13428,12 @@ def render_daily_wiki_report(
     status_summary_lines = _daily_status_summary_lines(status_counts)
     scenario_lines = _daily_scenario_group_lines(progress_rows)
     macro_body = _render_daily_confluence_execution_macro(template_dir, folder_name, cycles)
+    score_label = conclusion_score_label or f"nightly-dev-{folder_name}"
     lines.append("{anchor:conclusion}")
     lines.append("h2. 4. Заключение")
     lines.append("")
     lines.append(
-# --- Zephyr API write (test results) ---
-        f"*Итоговый score nightly-dev-{_wiki_escape(folder_name)}, {total_x}/{total_y}*"
+        f"*Итоговый score {_wiki_escape(score_label)}, {total_x}/{total_y}*"
     )
     if macro_body:
         lines.append("")
